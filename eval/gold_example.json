@@ -1,0 +1,8 @@
+{
+  "_about": "Example gold set with three invented questions. Its documents are imaginary: copy the file and write your own questions for your folders.",
+  "queries": [
+    {"q": "invoice from Acme for March 2025", "expect": ["Invoices/2025-03_invoice_acme"], "collection": "work"},
+    {"q": "when does the office lease end", "expect": ["Housing/lease_2025"], "collection": "work"},
+    {"q": "notes from the migration meeting", "expect": ["Meetings/2026-02-11_migration"], "collection": "work"}
+  ]
+}

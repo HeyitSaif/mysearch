@@ -1,0 +1,82 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "mysearch",
+  "title": "MySearch",
+  "description": "Search your own folders with the local MySearch engine: documents, scanned PDFs, mail, images, audio and video, in English and German.",
+  "icon": "icon.png",
+  "author": "HeyitSaif",
+  "categories": [
+    "Productivity",
+    "Documentation"
+  ],
+  "license": "MIT",
+  "private": true,
+  "commands": [
+    {
+      "name": "search-files",
+      "title": "Search Files",
+      "subtitle": "MySearch",
+      "description": "Search your indexed folders by keyword and meaning, with a preview of the matching passage.",
+      "mode": "view"
+    },
+    {
+      "name": "search-images",
+      "title": "Search Images",
+      "subtitle": "MySearch",
+      "description": "Find pictures and scanned pages in a thumbnail grid.",
+      "mode": "view"
+    },
+    {
+      "name": "ask",
+      "title": "Ask MySearch",
+      "subtitle": "MySearch",
+      "description": "Ask a question and get an answer, with sources, from your folders. Needs Ask switched on in MySearch.",
+      "mode": "view"
+    },
+    {
+      "name": "sync-now",
+      "title": "Sync Now",
+      "subtitle": "MySearch",
+      "description": "Ask MySearch to check every folder for changes now.",
+      "mode": "no-view"
+    },
+    {
+      "name": "status",
+      "title": "MySearch Status",
+      "subtitle": "MySearch",
+      "description": "Indexing, queue and memory of the MySearch service in the menu bar.",
+      "mode": "menu-bar",
+      "interval": "1m"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "dataDir",
+      "title": "MySearch Data Folder",
+      "description": "The folder that holds MySearch's config.json (port and access token). Leave empty for the default.",
+      "type": "textfield",
+      "required": false,
+      "default": "",
+      "placeholder": "~/Library/Application Support/MySearch"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "1.104.25",
+    "@raycast/utils": "2.3.2"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "2.2.0",
+    "@types/node": "22.19.17",
+    "@types/react": "19.0.10",
+    "eslint": "10.11.0",
+    "prettier": "3.9.9",
+    "typescript": "5.9.3"
+  },
+  "scripts": {
+    "dev": "ray develop",
+    "build": "ray build",
+    "lint": "ray lint",
+    "fix-lint": "ray lint --fix",
+    "prepublishOnly": "echo \"This extension is private: do not publish it to npm or the Raycast Store.\" && exit 1"
+  }
+}

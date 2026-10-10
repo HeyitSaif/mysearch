@@ -1,0 +1,11 @@
+{
+  "Archive": {
+    "description": "Example preset for a folder named Archive: scanned records and private notes.",
+    "exclude": ["tmp/", "*.zip"],
+    "metadata_only": ["Payroll/"],
+    "contexts": {
+      "Invoices/": "Supplier invoices, one folder per year.",
+      "Payroll/": "Metadata only: file names are searchable, contents are never read."
+    }
+  }
+}

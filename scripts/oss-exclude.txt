@@ -1,0 +1,7 @@
+# Paths that are never exported (scripts/export_public.sh). A trailing / excludes a whole folder.
+eval/private/
+app/legacy/
+scripts/sign.local.env
+.oss-private/
+mse/legacy_providers.py
+tests/test_legacy_providers.py

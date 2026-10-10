@@ -1,0 +1,37 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+build/
+
+# Runtime data, databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Local models (never commit weights)
+models/
+
+# Raycast extension build output and dependencies
+integrations/raycast/node_modules/
+integrations/raycast/dist/
+*.dmg
+*.db-shm
+*.db-wal
+
+# Public-release tooling: private denylist/allowlist, the locally kept signing values, private gold sets
+.oss-private/
+scripts/sign.local.env
+eval/private/
+*.local.json
+
+# Agent and editor configuration (local to one machine; can carry keys, paths and approvals) and environment files
+.mcp.json
+.cursor/
+.claude/
+.codex/
+.grok/
+opencode.json
+.env
+.env.*

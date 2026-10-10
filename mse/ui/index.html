@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="mse-token" content="{{TOKEN}}">
+<meta name="mse-ui" content="{{UI}}">
+<meta name="mse-version" content="{{VERSION}}">
+<meta name="color-scheme" content="light dark">
+<title>MySearch</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css?v={{UI}}">
+</head>
+<body>
+<div class="app" id="app">
+
+  <header class="top" id="top">
+    <div class="brand" aria-label="MySearch">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><use href="/static/icon.svg#mark"/></svg>
+      <span>MySearch</span>
+    </div>
+    <div class="mode-switch" id="mode-switch" role="tablist" aria-label="Search or ask" data-nodrag>
+      <button type="button" role="tab" data-mode="search" aria-selected="true" title="Search your folders (⌘J switches)">Search</button>
+      <button type="button" role="tab" data-mode="ask" aria-selected="false" title="Ask questions about your documents and get answers with references (⌘J)">Ask</button>
+    </div>
+    <nav class="scopes" id="scopes" aria-label="Where to search" data-nodrag></nav>
+    <button type="button" class="scope-pick" id="scope-pick" aria-haspopup="dialog" aria-expanded="false" data-nodrag
+            title="Choose folders and groups: tick several folders, pick a group">
+      <svg class="sp-ico" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.75 4.25c0-.7.55-1.25 1.25-1.25h3l1.5 1.5H13c.7 0 1.25.55 1.25 1.25v6.25c0 .7-.55 1.25-1.25 1.25H3c-.7 0-1.25-.55-1.25-1.25z"/></svg>
+      <span class="sp-label">Folders</span><span class="sp-more"></span>
+      <svg class="chev" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5 6 7.5 9 4.5"/></svg>
+    </button>
+    <div class="scope-multi" id="scope-multi" data-nodrag hidden></div>
+    <div class="top-actions" data-nodrag>
+      <button class="icon-btn" id="btn-help" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2.5"/><path d="M7 10h.01M10 10h.01M13 10h.01M16 10h.01M7 14h.01M17 14h.01M10 14h4"/></svg>
+      </button>
+      <button class="icon-btn" id="btn-settings" title="Folders &amp; settings (⌘,)" aria-label="Folders and settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ===================== search ===================== -->
+  <main id="view-search" class="view">
+    <div class="query-bar">
+      <label class="query" for="q">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
+        <span class="q-field">
+          <span class="q-mirror" id="q-mirror" aria-hidden="true"></span>
+          <input id="q" type="search" autocomplete="off" spellcheck="false"
+                 placeholder="Search for a name, a number, a phrase or a question" aria-label="Search"
+                 aria-autocomplete="list" aria-controls="q-suggest" aria-expanded="false">
+        </span>
+        <button type="button" class="q-chip" id="q-chip" hidden></button>
+        <kbd>⌘K</kbd>
+      </label>
+      <div class="q-suggest" id="q-suggest" role="listbox" aria-label="Folders and groups" hidden></div>
+      <div class="refine">
+        <div class="refine-selects">
+          <select id="f-type" aria-label="File type">
+            <option value="">Any type</option>
+            <option value="pdf">PDF</option>
+            <option value="office">Word, Excel, slides</option>
+            <option value="text">Notes &amp; text</option>
+            <option value="email">E-mail</option>
+            <option value="image">Images</option>
+            <option value="audio">Audio</option>
+            <option value="video">Video</option>
+          </select>
+          <select id="f-date" aria-label="Date">
+            <option value="">Any date</option>
+            <option value="7">Past week</option>
+            <option value="31">Past month</option>
+            <option value="92">Past 3 months</option>
+            <option value="year">This year</option>
+          </select>
+          <select id="f-mode" aria-label="Search method">
+            <option value="hybrid">Words + meaning</option>
+            <option value="keyword">Exact words only</option>
+            <option value="semantic">Meaning only</option>
+          </select>
+        </div>
+        <div class="refine-globs">
+          <input id="f-include" class="glob" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="files to include" title="Only these files — comma-separated, e.g. .jpg, *.pdf or Invoices/"
+                 aria-label="Files to include">
+          <input id="f-exclude" class="glob" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="files to exclude" title="Skip these files — comma-separated, e.g. .md, *.eml, backups/"
+                 aria-label="Files to exclude">
+        </div>
+        <p class="bridge" id="bridge" hidden></p>
+      </div>
+    </div>
+
+    <div class="panes" id="panes">
+      <section class="results" aria-label="Results">
+        <div class="results-head" hidden>
+          <span id="count" class="count"></span>
+          <button class="pin" id="btn-pin" hidden title="Pin this search to the start page">☆ Pin</button>
+          <span class="legend" title="Each result's left edge is notched for every way it matched">
+            <i class="lg"></i>words <i class="lg"></i>meaning <i class="lg"></i>translated <i class="lg"></i>visual <i class="lg"></i>audio
+          </span>
+        </div>
+        <div class="results-body" id="results-body">
+          <div id="ask" class="ask" hidden aria-live="polite"></div>
+          <div class="facets" id="facets" hidden></div>
+          <div id="empty" class="empty"></div>
+          <ol id="results" class="result-list" role="listbox" aria-label="Search results"></ol>
+        </div>
+      </section>
+
+      <section class="chat" id="chat" aria-label="Ask" hidden>
+        <div class="chat-grid">
+          <aside class="chat-rail" id="chat-rail" aria-label="Chats"></aside>
+          <div class="chat-main">
+            <div class="chat-top">
+              <header class="chat-head" id="chat-head"></header>
+            </div>
+            <div class="chat-thread" id="chat-thread" aria-live="polite"></div>
+            <form class="composer" id="composer" autocomplete="off">
+              <div class="q-suggest ask-suggest" id="ask-suggest" role="listbox" aria-label="Folders and groups" hidden></div>
+              <div class="at-pop" id="at-pop" role="listbox" aria-label="Folders to mention" hidden></div>
+              <div class="term">
+                <div class="term-row">
+                  <span class="term-prompt" aria-hidden="true">&gt;</span>
+                  <textarea id="ask-q" rows="1" spellcheck="true" placeholder="Ask about your documents" aria-label="Your question"
+                            aria-autocomplete="list" aria-controls="ask-suggest" aria-expanded="false"></textarea>
+                  <button type="submit" class="btn primary send" id="ask-send">Ask</button>
+                </div>
+                <div class="term-bar">
+                  <button type="button" class="folder-chip" id="folder-chip" aria-haspopup="dialog" aria-expanded="false" title="Choose the folder this chat reads">
+                    <svg class="fc-glyph" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.8 4.2c0-.7.6-1.3 1.3-1.3h3l1.4 1.5h5.4c.7 0 1.3.6 1.3 1.3v5.6c0 .7-.6 1.3-1.3 1.3H3.1c-.7 0-1.3-.6-1.3-1.3z"/></svg>
+                    <span class="fc-label" id="folder-label">All folders</span><span class="fc-caret" aria-hidden="true"></span>
+                  </button>
+                  <button type="button" class="q-chip" id="ask-chip" hidden></button>
+                  <div class="term-right" id="ask-tools">
+                    <div class="ask-menu" id="ask-menu"></div>
+                    <div class="route-pick" id="ask-route" role="radiogroup" aria-label="Where this chat is answered" hidden>
+                      <button type="button" role="radio" data-route="cloud" aria-checked="true">Cloud</button>
+                      <button type="button" role="radio" data-route="local" aria-checked="false">Local</button>
+                    </div>
+                  </div>
+                </div>
+                <p class="ask-quiet" id="ask-quiet" hidden>No cloud model connected · <button type="button" class="linklike" id="ask-quiet-link">Set up in Settings › Ask</button></p>
+              </div>
+              <p class="composer-note" id="composer-note"></p>
+            </form>
+          </div>
+        </div>
+      </section>
+
+      <section class="preview" id="preview" aria-label="Preview" aria-live="polite"></section>
+    </div>
+  </main>
+
+  <!-- ===================== settings ===================== -->
+  <main id="view-settings" class="view settings" hidden>
+    <aside class="set-side">
+      <button class="set-back" id="btn-back" title="Back to search (Esc)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6"/></svg>Search
+      </button>
+      <nav class="set-nav" id="set-nav" aria-label="Settings sections">
+        <button data-sec="folders">Folders<span class="n" id="nav-n-folders"></span></button>
+        <button data-sec="search">Search</button>
+        <button data-sec="wholemac">Whole-Mac search</button>
+        <button data-sec="ask" hidden>Ask</button>
+        <button data-sec="schedule">Schedule &amp; engine</button>
+        <button data-sec="favourites">Favourites<span class="n" id="nav-n-favourites"></span></button>
+        <button data-sec="agents">Agents</button>
+        <button data-sec="privacy">Privacy</button>
+        <button data-sec="app" hidden>Mac app</button>
+        <button data-sec="about">About</button>
+      </nav>
+    </aside>
+
+    <div class="set-body" id="set-body">
+
+      <!-- folders -->
+      <section class="set-sec" data-sec="folders" aria-labelledby="h-folders">
+        <header class="sec-head">
+          <h1 id="h-folders">Folders</h1>
+          <div class="sec-actions">
+            <button class="btn" id="btn-sync-all">Sync all now</button>
+            <button class="btn primary" id="btn-add">Add folder…</button>
+          </div>
+        </header>
+        <p class="lede">Each folder has its own index. <b>All</b> searches every folder marked <em>Include in All</em>; a folder's own tab searches only that folder. Your files are only read, never changed.</p>
+        <div id="activity" class="activity"></div>
+        <div id="collections" class="collections"></div>
+        <div class="groups-head">
+          <h2 class="sub">Groups</h2>
+          <button class="btn small" id="btn-new-group" type="button">New group…</button>
+        </div>
+        <p class="sub-lede">A group searches several folders together and gets its own tab, like a folder; switch <b>Tab</b> off to keep it in the <b>Folders ▾</b> menu only. ⌘-click folder tabs to try a combination first. Folders and groups can have short names (aliases): type <code>w: invoice</code> or <code>invoice in:w</code> to search there, whichever tab is selected.</p>
+        <div id="groups" class="groups"></div>
+      </section>
+
+      <!-- search -->
+      <section class="set-sec" data-sec="search" aria-labelledby="h-search" hidden>
+        <header class="sec-head"><h1 id="h-search">Search</h1></header>
+        <p class="lede">How results are found and ordered. Changes apply to the next search, in the app, the CLI and for agents.</p>
+        <form id="search-form" class="panel rows">
+          <div class="row">
+            <div class="row-label"><label for="s-limit">Results per search</label>
+              <small>What agents and <code>mse search</code> get unless they ask for more. The app lists up to 40.</small></div>
+            <div class="row-ctl"><input id="s-limit" name="limit" type="number" min="1" max="100" step="1"></div>
+          </div>
+          <div class="row">
+            <div class="row-label"><label for="s-bridge">Translate between English and German</label>
+              <small>Each folder's own vocabulary bridges the languages, so <i>invoice</i> also finds <mark class="tr">Rechnung</mark>. Words found this way are marked in mint.</small></div>
+            <div class="row-ctl"><input id="s-bridge" name="bridge" type="checkbox" class="switch" role="switch"></div>
+          </div>
+          <div class="row">
+            <div class="row-label"><label for="s-rerank">Re-check close calls</label>
+              <small>When the top results are near-ties, a small local re-ranker reads them again (about 0.3 s). The app shows results at once and re-orders a moment later.</small></div>
+            <div class="row-ctl"><input id="s-rerank" name="rerank_enabled" type="checkbox" class="switch" role="switch"></div>
+          </div>
+          <div class="row">
+            <div class="row-label"><label for="s-hub">Overview files rank lower</label>
+              <small>SUMMARY, README, INDEX, TODO, CHANGELOG, MANIFEST and OVERVIEW files describe other documents. Lowering them puts the documents themselves first. ×1.00 leaves them alone.</small></div>
+            <div class="row-ctl range"><input id="s-hub" name="hub_penalty" type="range" min="0.3" max="1" step="0.05"><output id="s-hub-out" for="s-hub" class="mono"></output></div>
+          </div>
+          <div class="form-actions"><button class="btn primary" type="submit">Save</button><span class="saved" role="status"></span></div>
+        </form>
+      </section>
+
+      <!-- whole-Mac search: where the file-name search looks and what it skips -->
+      <section class="set-sec" data-sec="wholemac" aria-labelledby="h-wholemac" hidden>
+        <header class="sec-head">
+          <h1 id="h-wholemac">Whole-Mac search</h1>
+          <div class="sec-actions"><button class="btn" id="wm-rescan" type="button">Rescan now</button></div>
+        </header>
+        <p class="lede">Finds files by name anywhere on this Mac, not only in your folders above. Only names are kept, never what is inside a file. Choose where it looks and what it skips.</p>
+        <div class="wm-notice" id="wm-notice" role="status" hidden></div>
+        <dl class="panel facts wm-facts" id="wm-status"></dl>
+
+        <div class="sub-head"><h2 class="sub" id="h-wm-roots">Where it looks</h2><button class="btn small" id="wm-root-add" type="button">Add folder…</button></div>
+        <p class="sub-lede">Every file name below these folders is searchable, except what is skipped further down. Your home folder is the usual choice.</p>
+        <ul class="panel wm-list" id="wm-roots" aria-labelledby="h-wm-roots"></ul>
+
+        <div class="sub-head"><h2 class="sub" id="h-wm-skip">Skipped folders</h2><button class="btn small" id="wm-skip-add" type="button">Add folder…</button></div>
+        <p class="sub-lede">Names inside these folders are not searched. A folder path such as <code>~/Music</code> skips everything below it. A name or pattern without a slash, such as <code>node_modules</code> or <code>*.tmp</code>, skips matching names anywhere. A search folder listed above stays searched even when it sits inside a skipped folder.</p>
+        <ul class="panel wm-list" id="wm-skips" aria-labelledby="h-wm-skip"></ul>
+        <form class="wm-add" id="wm-skip-form" autocomplete="off">
+          <label class="sr-only" for="wm-skip-input">Folder path or name to skip</label>
+          <input id="wm-skip-input" type="text" placeholder="Folder path or name, for example ~/Music or node_modules" spellcheck="false" autocapitalize="off">
+          <button class="btn" type="submit">Skip</button>
+        </form>
+
+        <h2 class="sub">Always skipped</h2>
+        <div class="panel prose">
+          <p>These are never indexed, not even as names, and nothing here can switch them off. They cover credentials, keys, mail, browser profiles, caches and system folders.</p>
+          <div class="wm-hard" id="wm-hard"></div>
+        </div>
+
+        <h2 class="sub">Folders macOS protects</h2>
+        <div class="panel rows wm-protect">
+          <div class="row">
+            <div class="row-label"><label for="wm-skip-protected">Skip them until Full Disk Access is granted</label>
+              <small id="wm-protect-note"></small></div>
+            <div class="row-ctl"><input id="wm-skip-protected" type="checkbox" class="switch" role="switch"></div>
+          </div>
+          <div class="row wide" id="wm-fda" hidden></div>
+        </div>
+      </section>
+
+      <!-- ask -->
+      <section class="set-sec" data-sec="ask" aria-labelledby="h-ask" hidden>
+        <header class="sec-head"><h1 id="h-ask">Ask</h1></header>
+        <p class="lede" id="ask-lede">Type a question and get a short answer written from your top results, with numbered references to the documents it used. A small language model runs on this Mac: nothing goes to the internet.</p>
+        <!-- one model menu, grouped by connected keys; then the route; then the keys. Shown only when the service has GET /api/ask/providers -->
+        <div id="ask-menu-sec" hidden>
+          <div class="sub-head"><h2 class="sub" id="h-model">Model</h2><span class="saved" id="menu-saved" role="status"></span></div>
+          <p class="sub-lede">Pick the model that writes the answers. The menu lists only the providers you have connected, grouped by provider and family; the model on this Mac is last and is loaded only when you choose it.</p>
+          <div class="panel menu-panel"><div id="ask-menu-settings" class="ask-menu"></div><p class="menu-sel" id="menu-sel"></p></div>
+        </div>
+        <div id="ask-route-sec" hidden>
+          <div class="sub-head"><h2 class="sub">Where answers are written</h2><span class="saved" id="route-saved" role="status"></span><span class="net" id="ask-online"></span></div>
+          <form id="route-form" class="panel rows" autocomplete="off">
+            <div class="row">
+              <div class="row-label"><label id="route-label">Where answers are written</label>
+                <small id="route-desc"></small>
+                <small class="next" id="route-next"></small></div>
+              <div class="row-ctl"><div class="seg route-seg" id="route-seg" role="radiogroup" aria-labelledby="route-label"></div></div>
+            </div>
+            <div class="row">
+              <div class="row-label"><label for="a-fallback">Use the local model when no cloud model is reachable</label>
+                <small>Off by default. While it is off, the model on this Mac is never loaded unless you choose Local (for a chat, in the menu or here) or a folder keeps its answers on this Mac; if the cloud cannot answer you get a message instead. On: it answers (about 2.5 GB while loaded) when the cloud model cannot.</small></div>
+              <div class="row-ctl"><input id="a-fallback" name="local_fallback" type="checkbox" class="switch" role="switch"></div>
+            </div>
+            <div class="row">
+              <div class="row-label"><label for="a-redact">Mask personal identifiers before sending to cloud models</label>
+                <small>A cloud answer sends three things off this Mac: your question, the top passages from your documents and the last turns of the chat. Masking replaces the identifiers listed under <a href="#privacy" data-goto="privacy">Privacy</a> (IBANs, passport, ID and tax numbers, dates of birth) before they leave.</small></div>
+              <div class="row-ctl"><input id="a-redact" name="cloud_redact" type="checkbox" class="switch" role="switch"></div>
+            </div>
+          </form>
+        </div>
+        <div id="ask-cloud" hidden>
+          <div class="sub-head"><h2 class="sub" id="h-cloud">Cloud models</h2><button class="btn small" id="btn-add-provider" type="button">Add provider…</button></div>
+          <p class="sub-lede">Paste your API key into a card below and press <b>Save key</b>, or give a provider the file that holds its key. Keys are kept in the macOS Keychain and never shown again. <b>Refresh list</b> on a card fetches every model the provider offers. <b>Add provider</b> takes any OpenAI-compatible service: DeepSeek, OpenRouter, or a model server on this Mac such as LM Studio or Ollama.</p>
+          <p class="cloud-active" id="cloud-active"></p>
+          <div id="providers" class="providers"></div>
+        </div>
+        <h2 class="sub" id="h-answers" hidden>Answers</h2>
+        <form id="ask-form" class="panel rows">
+          <div class="row">
+            <div class="row-label"><label for="a-enabled">Answer questions</label>
+              <small id="ask-state"></small></div>
+            <div class="row-ctl"><input id="a-enabled" name="enabled" type="checkbox" class="switch" role="switch"></div>
+          </div>
+          <div class="row">
+            <div class="row-label"><label id="ask-model-label">Model</label><small id="ask-model-note">Runs offline. It reads only the few documents your search found.</small></div>
+            <div class="row-ctl"><span class="mono" id="ask-model">—</span><div id="ask-local-picker" hidden></div></div>
+          </div>
+          <div class="form-actions"><span class="saved" role="status"></span></div>
+        </form>
+        <h2 class="sub">How to ask</h2>
+        <div class="panel prose">
+          <p>Choose <b>Ask</b> next to the logo (or press <kbd>⌘</kbd><kbd>J</kbd>) and type your question; follow-up questions remember the last three exchanges. From a search, <kbd>⌥</kbd><kbd>↵</kbd> asks it there. The folder tabs, <b>Folders ▾</b> and a shortcut such as <code>w: …</code> at the start of the question limit what it reads.</p>
+          <p>Each claim carries a reference such as <button class="cite" type="button" tabindex="-1">1</button>; click it to open that document at the page it came from. A small model can misread or leave things out, so treat the answer as a pointer and check the sources.</p>
+        </div>
+      </section>
+
+      <!-- schedule & engine -->
+      <section class="set-sec" data-sec="schedule" aria-labelledby="h-schedule" hidden>
+        <header class="sec-head"><h1 id="h-schedule">Schedule &amp; engine</h1></header>
+        <p class="lede">Changed files are indexed within seconds. Heavy work (OCR, page images, audio, video and new embeddings) waits for the night run or for <b>Sync now</b>.</p>
+        <form id="settings-form" class="panel rows">
+          <div class="row">
+            <div class="row-label"><label for="nightly_at">Night run</label><small>OCR, PDF page images, audio, video and new embeddings.</small></div>
+            <div class="row-ctl"><input id="nightly_at" type="time" name="nightly_at"> <label class="check"><input type="checkbox" name="nightly_enabled" class="switch" role="switch" aria-label="Night run on"></label></div>
+          </div>
+          <div class="row">
+            <div class="row-label"><label for="only_on_ac_power">Only when plugged in</label><small>The night run waits for power so it never drains the battery.</small></div>
+            <div class="row-ctl"><input id="only_on_ac_power" type="checkbox" name="only_on_ac_power" class="switch" role="switch"></div>
+          </div>
+          <div class="row">
+            <div class="row-label"><label for="scan_every_min">Check folders for changes every</label><small>A safety net; file events already index changes within seconds.</small></div>
+            <div class="row-ctl"><input id="scan_every_min" type="number" name="scan_every_min" min="2" max="240"> <span class="unit">minutes</span></div>
+          </div>
+          <div class="row">
+            <div class="row-label"><label for="live_embed_limit">Embed right away when fewer than</label><small>Larger batches wait for the night run.</small></div>
+            <div class="row-ctl"><input id="live_embed_limit" type="number" name="live_embed_limit" min="0" max="5000"> <span class="unit">pieces changed</span></div>
+          </div>
+          <div class="row">
+            <div class="row-label"><label for="idle_unload_min">Unload the models after</label><small>Frees their memory; the next search reloads the text model in about a second.</small></div>
+            <div class="row-ctl"><input id="idle_unload_min" type="number" name="idle_unload_min" min="1" max="240"> <span class="unit">idle minutes</span></div>
+          </div>
+          <div class="form-actions"><button class="btn primary" type="submit">Save</button><span class="saved" id="settings-saved" role="status"></span></div>
+        </form>
+        <h2 class="sub">Engine</h2>
+        <div id="engine" class="panel engine"></div>
+      </section>
+
+      <!-- favourites -->
+      <section class="set-sec" data-sec="favourites" aria-labelledby="h-fav" hidden>
+        <header class="sec-head"><h1 id="h-fav">Favourites</h1>
+          <div class="sec-actions"><input id="fav-filter" class="filter" type="search" placeholder="Filter" aria-label="Filter favourites" spellcheck="false"></div>
+        </header>
+        <p class="lede">Results you starred as <b>best for a search</b> come first the next time you, or an agent, search for it, and also lift similar searches. Results marked <b>not relevant</b> stay out of that search.</p>
+        <div id="fav-list" class="fav-list"></div>
+      </section>
+
+      <!-- agents -->
+      <section class="set-sec" data-sec="agents" aria-labelledby="h-agents" hidden>
+        <header class="sec-head"><h1 id="h-agents">Agents</h1></header>
+        <p class="lede">AI agents search through MCP with the tools <code>search</code>, <code>get</code>, <code>multi_get</code>, <code>similar</code>, <code>collections</code> and <code>sync</code>. They search the folder they work in unless they ask for <code>all</code>, and what they receive is filtered by your <a href="#privacy" data-goto="privacy">privacy</a> settings.</p>
+        <div class="agents" id="agents-global"></div>
+        <div class="agents" id="agents"></div>
+      </section>
+
+      <!-- privacy -->
+      <section class="set-sec" data-sec="privacy" aria-labelledby="h-privacy" hidden>
+        <header class="sec-head"><h1 id="h-privacy">Privacy</h1></header>
+        <p class="lede" id="privacy-lede">Everything stays on this Mac: indexes, models and searches. Nothing is uploaded, and searches are not logged.</p>
+        <form id="privacy-form" class="panel rows">
+          <div class="row">
+            <div class="row-label"><label for="p-redact">Mask personal identifiers for agents</label>
+              <small>Applies to MCP and to <code>mse</code> output piped into another program. This app and your own terminal always show everything.</small></div>
+            <div class="row-ctl"><input id="p-redact" name="redact" type="checkbox" class="switch" role="switch"></div>
+          </div>
+          <div class="row wide"><div class="row-label"><small>Masked: IBANs (kept as <code>DE•••• 1234</code>), passport, ID-card and residence-permit numbers, personal tax IDs, social-security numbers, UAE national ID and CNIC numbers, passport machine-readable lines and dates of birth. Company identifiers such as the commercial register number, company tax number and VAT ID stay readable.</small></div></div>
+          <div class="form-actions"><button class="btn primary" type="submit">Save</button><span class="saved" role="status"></span></div>
+        </form>
+        <h2 class="sub">File names only</h2>
+        <div class="panel prose">
+          <p>A folder rule can mark paths as <b>file names only</b>: their contents are never read, indexed or shown, and the preview offers only Open and Show in Finder. With masking on, agents see such names with long numbers replaced by <code>[id]</code>.</p>
+          <ul class="name-only" id="name-only"></ul>
+        </div>
+        <h2 class="sub">Always skipped</h2>
+        <div class="panel prose">
+          <p>Credentials and secrets are never read or listed, in any folder, whatever its rules say. Hidden folders are skipped too.</p>
+          <div class="chips mono" id="secret-patterns"></div>
+        </div>
+      </section>
+
+      <!-- mac app (only inside MySearch.app) -->
+      <section class="set-sec" data-sec="app" aria-labelledby="h-app" hidden>
+        <header class="sec-head"><h1 id="h-app">Mac app</h1></header>
+        <p class="lede">Quick Search is a small panel that opens over any app, even full-screen ones. The menu-bar icon opens it too, along with this window and Sync now.</p>
+        <form id="app-form" class="panel rows">
+          <div class="row">
+            <div class="row-label"><label>Quick Search shortcut</label>
+              <small>Works everywhere. The default, ⌥Space, avoids ⌘Space (your Raycast), ⌃Space and ⌃⌥Space (input sources) and ⌥⌘Space (Finder search).</small>
+              <small class="saved" id="app-key-out" role="status"></small></div>
+            <div class="row-ctl"><kbd class="quick-key big">—</kbd><button type="button" class="btn small" id="app-key-change">Change…</button><button type="button" class="btn small ghost" id="app-key-reset">Reset</button></div>
+          </div>
+          <div class="row">
+            <div class="row-label"><label>Main window shortcut</label><small>Shows or hides this window.</small></div>
+            <div class="row-ctl"><kbd class="big" id="app-main-key">⌃⌥Space</kbd></div>
+          </div>
+          <div class="row">
+            <div class="row-label"><label for="app-login">Open at login</label><small id="app-login-note"></small></div>
+            <div class="row-ctl"><input id="app-login" name="login" type="checkbox" class="switch" role="switch"></div>
+          </div>
+        </form>
+        <h2 class="sub">In Quick Search</h2>
+        <div class="panel keys-mini">
+          <dl>
+            <dt><kbd>↑</kbd><kbd>↓</kbd></dt><dd>Move</dd>
+            <dt><kbd>↵</kbd></dt><dd>Open the file</dd>
+            <dt><kbd>⌘</kbd><kbd>↵</kbd></dt><dd>Show it in Finder</dd>
+            <dt><kbd>⌘</kbd><kbd>Y</kbd></dt><dd>Quick Look</dd>
+            <dt><kbd>⌘</kbd><kbd>C</kbd></dt><dd>Copy its path</dd>
+            <dt><kbd>⌘</kbd><kbd>D</kbd></dt><dd>Best result for this search</dd>
+            <dt><kbd>⇥</kbd> or <kbd>⌘</kbd><kbd>O</kbd></dt><dd>Continue in this window</dd>
+            <dt><kbd>⌥</kbd><kbd>↵</kbd></dt><dd>Ask (when Ask is on)</dd>
+            <dt><kbd>⌘</kbd><kbd>1</kbd>…<kbd>9</kbd></dt><dd>Switch folder</dd>
+            <dt><code>w: …</code></dt><dd>Search one folder or group</dd>
+            <dt><kbd>⌘</kbd><kbd>F</kbd></dt><dd>Folders and groups menu</dd>
+            <dt><kbd>esc</kbd></dt><dd>Clear, then close</dd>
+          </dl>
+        </div>
+      </section>
+
+      <!-- about -->
+      <section class="set-sec" data-sec="about" aria-labelledby="h-about" hidden>
+        <header class="sec-head"><h1 id="h-about">About</h1></header>
+        <div class="about-card panel">
+          <svg viewBox="0 0 24 24" aria-hidden="true" class="about-mark"><use href="/static/icon.svg#mark"/></svg>
+          <div>
+            <h2>MySearch</h2>
+            <p>A private search engine for your own folders, running entirely on this Mac. Words, meaning, English ↔ German, pictures and recordings.</p>
+          </div>
+        </div>
+        <dl class="panel facts" id="about"></dl>
+        <p class="sec-foot"><button class="linklike" type="button" id="btn-about-keys">Keyboard shortcuts</button></p>
+      </section>
+    </div>
+  </main>
+
+  <footer class="status" id="status" aria-live="polite"></footer>
+</div>
+
+<div class="drop" id="drop" hidden><p>Drop an image to search by picture</p></div>
+
+<div class="overlay" id="help" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="help-title">
+    <header><h2 id="help-title">Keyboard shortcuts</h2><button class="icon-btn" data-close aria-label="Close">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></header>
+    <div class="keys">
+      <section>
+        <h3>Search</h3>
+        <dl>
+          <dt><kbd>⌘</kbd><kbd>K</kbd>, or <kbd>/</kbd> in the browser</dt><dd>Go to the search field</dd>
+          <dt><kbd>⌘</kbd><kbd>J</kbd></dt><dd>Switch between Search and Ask</dd>
+          <dt><kbd>↑</kbd><kbd>↓</kbd></dt><dd>Move through the results</dd>
+          <dt><kbd>↵</kbd></dt><dd>Open the selected file</dd>
+          <dt><kbd>⌘</kbd><kbd>↵</kbd></dt><dd>Show it in Finder</dd>
+          <dt><kbd>⌘</kbd><kbd>D</kbd> in the browser</dt><dd>Best result for this search</dd>
+          <dt><kbd>⌥</kbd><kbd>↵</kbd></dt><dd>Ask the search as a question, in Ask</dd>
+          <dt><kbd>esc</kbd></dt><dd>Clear the search; in Ask, stop the answer</dd>
+        </dl>
+      </section>
+      <section>
+        <h3>Anywhere</h3>
+        <dl>
+          <dt class="app-only"><kbd class="quick-key">⌥Space</kbd></dt><dd class="app-only">Quick Search, from any app</dd>
+          <dt class="app-only"><kbd>⌃</kbd><kbd>⌥</kbd><kbd>Space</kbd></dt><dd class="app-only">Show or hide this window</dd>
+          <dt><kbd>⌘</kbd><kbd>,</kbd></dt><dd>Folders &amp; settings</dd>
+          <dt><kbd>?</kbd></dt><dd>These shortcuts</dd>
+          <dt>Right-click</dt><dd>More actions for a result</dd>
+          <dt>Drop an image</dt><dd>Search by picture</dd>
+        </dl>
+      </section>
+      <section class="wide">
+        <h3>Where to search</h3>
+        <dl>
+          <dt><code>work: invoice</code></dt><dd>Only in the folder or group <i>work</i>, by its name or a short alias, whichever tab is selected</dd>
+          <dt><code>w,notes: invoice</code></dt><dd>In several at once</dd>
+          <dt><code>invoice in:work</code></dt><dd>The same, anywhere in the query</dd>
+          <dt><code>wo</code> then <kbd>:</kbd></dt><dd>Suggests the names that fit; <kbd>⇥</kbd> or <kbd>↵</kbd> takes one</dd>
+          <dt><kbd>⌘</kbd>-click a tab</dt><dd>Add a folder to the search, or take it out</dd>
+          <dt><b>Folders ▾</b></dt><dd>Tick several folders, pick a group, or find one by name</dd>
+        </dl>
+      </section>
+      <section class="wide app-only">
+        <h3>Mac app: files and windows</h3>
+        <dl>
+          <dt><kbd>⌘</kbd><kbd>P</kbd></dt><dd>Command palette: run a command, or open a file or folder</dd>
+          <dt><kbd>⌘</kbd><kbd>T</kbd></dt><dd>New tab (<kbd>⌘</kbd><kbd>N</kbd> opens a new window)</dd>
+          <dt><kbd>⌘</kbd><kbd>⌥</kbd><kbd>\</kbd></dt><dd>Split the window into two panes; <kbd>⇥</kbd> switches pane, <kbd>F5</kbd> copies and <kbd>F6</kbd> moves to the other pane</dd>
+          <dt><kbd>/</kbd> or <kbd>⌘</kbd><kbd>⌥</kbd><kbd>F</kbd></dt><dd>Filter this folder (in a folder view)</dd>
+          <dt><kbd>⌘</kbd><kbd>1</kbd> <kbd>⌘</kbd><kbd>2</kbd> <kbd>⌘</kbd><kbd>3</kbd></dt><dd>Icons, List, Columns</dd>
+          <dt><kbd>⌘</kbd><kbd>C</kbd> <kbd>⌘</kbd><kbd>X</kbd> <kbd>⌘</kbd><kbd>V</kbd></dt><dd>Copy, cut and paste files; a taken name gets " 2", nothing is overwritten</dd>
+          <dt><kbd>⇧</kbd><kbd>⌘</kbd><kbd>N</kbd></dt><dd>New folder</dd>
+          <dt><kbd>↩</kbd></dt><dd>Rename the selected item</dd>
+          <dt><kbd>⌘</kbd><kbd>D</kbd></dt><dd>Duplicate the selected item (in a folder view)</dd>
+          <dt><kbd>⌘</kbd><kbd>⌫</kbd> or <kbd>⌥</kbd><kbd>⌘</kbd><kbd>⌫</kbd></dt><dd>Move to Trash, or delete immediately</dd>
+          <dt><kbd>⌘</kbd><kbd>Z</kbd> <kbd>⇧</kbd><kbd>⌘</kbd><kbd>Z</kbd></dt><dd>Undo and redo file operations</dd>
+          <dt><kbd>⌘</kbd><kbd>⌥</kbd><kbd>O</kbd></dt><dd>Open the selected file in the editor</dd>
+          <dt><kbd>⌘</kbd><kbd>I</kbd> <kbd>⌘</kbd><kbd>Y</kbd></dt><dd>Get Info, Quick Look</dd>
+          <dt><kbd>⌃</kbd><kbd>1</kbd> <kbd>⌃</kbd><kbd>2</kbd> <kbd>⌃</kbd><kbd>3</kbd></dt><dd>In search results: jump to the file names, the content matches, the filters</dd>
+        </dl>
+      </section>
+    </div>
+    <section class="notch-key">
+      <h3>How a result was found</h3>
+      <p>Each card's left edge is notched open for every method that found it:</p>
+      <ol class="notch-legend">
+        <li><i class="on"></i>words you typed</li>
+        <li><i class="on"></i>meaning</li>
+        <li><i class="on"></i>translated, English ↔ German</li>
+        <li><i class="on"></i>visual, pictures and page images</li>
+        <li><i class="on"></i>audio, recordings and video</li>
+      </ol>
+      <p class="marks">Highlights: <mark>words you typed</mark> <mark class="tr">words found through translation</mark></p>
+    </section>
+  </div>
+</div>
+
+<template id="tpl-collection">
+  <article class="coll">
+    <div class="coll-head">
+      <button type="button" class="coll-summary" aria-expanded="false">
+        <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        <span class="coll-id">
+          <span class="coll-name"></span>
+          <span class="coll-path mono"></span>
+        </span>
+        <span class="coll-quick mono"></span>
+      </button>
+      <span class="coll-flags">
+        <button type="button" class="flag" data-flag="in_global" aria-pressed="true"></button>
+        <button type="button" class="flag" data-flag="enabled" aria-pressed="true"></button>
+      </span>
+      <span class="pill coll-state"></span>
+    </div>
+    <div class="coll-detail" hidden>
+      <div class="coll-bar">
+        <p class="coll-stats mono"></p>
+        <div class="coll-actions">
+          <button class="btn small" data-act="sync">Sync now</button>
+          <button class="btn small danger-ghost" data-act="remove">Remove…</button>
+        </div>
+      </div>
+      <div class="health"><button type="button" class="linklike" data-act="health" aria-expanded="false"></button><div class="health-body" hidden></div></div>
+      <div class="coll-agents" hidden>
+        <div class="ca-head">
+          <b>AI agents</b>
+          <span class="ca-pills"></span>
+          <span class="ca-actions">
+            <button type="button" class="btn small" data-act="agents-connect">Connect</button>
+            <button type="button" class="btn small ghost" data-act="agents-disconnect">Disconnect</button>
+          </span>
+        </div>
+        <p class="ca-note"></p>
+      </div>
+      <div class="coll-cloud" hidden>
+        <label class="check-line"><input type="checkbox" class="switch" role="switch" data-act="ask-cloud"> Allow cloud answers</label>
+        <p class="cc-note">Off: Ask answers questions about this folder with the model on this Mac only, whatever Settings › Ask says. Nothing from it is sent to a cloud model.</p>
+      </div>
+      <form class="coll-form">
+        <label class="wide">Description <small>shown to agents with every result</small>
+          <input name="description" type="text">
+        </label>
+        <label class="wide">Short names <small>aliases for the search box and <code>-c</code>: <code>w</code> lets you type <code>w: invoice</code> or <code>invoice in:w</code>; separate several with commas</small>
+          <input name="aliases" type="text" spellcheck="false" autocomplete="off" placeholder="e.g. w">
+        </label>
+        <div class="checks">
+          <label class="check-line"><input type="checkbox" name="in_global" class="switch" role="switch"> Include in All</label>
+          <label class="check-line"><input type="checkbox" name="enabled" class="switch" role="switch"> Enabled</label>
+        </div>
+        <fieldset class="media">
+          <legend>Read from files</legend>
+          <label class="check-line"><input type="checkbox" name="images"> Images (OCR + picture search)</label>
+          <label class="check-line"><input type="checkbox" name="audio"> Audio</label>
+          <label class="check-line"><input type="checkbox" name="video"> Video</label>
+          <label class="inline">PDF page images
+            <select name="pdf_pages"><option value="smart">Scanned pages + first page</option><option value="all">All pages</option><option value="off">Off</option></select>
+          </label>
+        </fieldset>
+        <label>Skip these paths <small>one pattern per line, e.g. <code>backups/</code> or <code>*.zip</code></small>
+          <textarea name="exclude" rows="4" spellcheck="false"></textarea>
+          <small class="rule-test" data-for="exclude" aria-live="polite"></small>
+        </label>
+        <label>File names only <small>contents are never read, e.g. <code>Payroll/</code></small>
+          <textarea name="metadata_only" rows="4" spellcheck="false"></textarea>
+          <small class="rule-test" data-for="metadata_only" aria-live="polite"></small>
+        </label>
+        <label class="wide">Context for agents <small><code>path/prefix/: what this part contains</code>, one per line</small>
+          <textarea name="contexts" rows="4" spellcheck="false"></textarea>
+        </label>
+        <div class="form-actions wide"><button class="btn primary" type="submit">Save changes</button><span class="saved" role="status"></span></div>
+      </form>
+    </div>
+  </article>
+</template>
+
+<script src="/static/app.js?v={{UI}}"></script>
+<script src="/static/mini.js?v={{UI}}"></script>
+</body>
+</html>
