@@ -923,6 +923,15 @@ uv sync --frozen
 `./scripts/build_helper.sh <dir>` builds the helper into another folder (to try a build without replacing the installed
 one). A rebuilt helper is a new binary to the Keychain: store Ask's provider keys again afterwards (`mse providers set-key`).
 
+## Development
+
+Tests and builds run on your Mac, not on GitHub Actions (the two workflows in `.github/workflows/` are manual-only and
+are never triggered by a push). `scripts/install_hooks.sh` (run by `scripts/setup.sh`) links `scripts/hooks/pre-push`
+into `.git/hooks`: before every push it runs the test suite headless in a fresh sandbox, the golden snapshots when `app/`
+or `tests/golden/` changed, the public-release audit when the remote is the public repository, and for a `v*` tag the
+ad-hoc DMG build, printing the image's path and sha256 for the upload. `MSE_SKIP_HOOKS=1 git push` bypasses it once.
+The same commands by hand are in [docs/RELEASING.md](docs/RELEASING.md), "Checks before a push".
+
 ## Credits
 
 MySearch builds on open models, research and other people's projects: fsearch and Everything for instant file-name search, FinderFlow (MIT) for adapted file-operation code, EmbeddingGemma 2, Qwen3 and Whisper for the models, MLX and sqlite-vec for the engine, and reciprocal rank fusion and LoRA from the research literature. The full list, with links and what each is used for, is in [docs/CREDITS.md](docs/CREDITS.md).

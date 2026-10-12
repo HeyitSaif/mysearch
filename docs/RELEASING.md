@@ -3,6 +3,28 @@
 This page is about what a release must carry. How the app and the disk image are built and signed is in
 [INSTALL.md](INSTALL.md), "Building the app and the disk image yourself".
 
+## Checks before a push (local; GitHub Actions is not used)
+
+Nothing is tested or built on GitHub Actions. The two workflows in `.github/workflows/` (`ci.yml`, `release.yml`) are
+`workflow_dispatch`-only: they never run on a push or a tag and cost nothing unless someone starts one by hand. Every check
+runs on the Mac that pushes, through the git hook `scripts/hooks/pre-push`, which `scripts/install_hooks.sh` links into
+`.git/hooks` (`scripts/setup.sh` calls it; run it once by hand in an older clone). The hook stops the push on the first
+failure, creates folders only under `mktemp`, and deletes nothing. `MSE_SKIP_HOOKS=1 git push ...` bypasses it once and
+says so.
+
+What the hook runs, and the same commands by hand:
+
+| Step | When | By hand |
+|---|---|---|
+| Unit tests, headless, in a fresh sandbox (no real data folder, Keychain item or service is touched) | every push | `s=$(mktemp -d); mkdir "$s/home" "$s/tmp" "$s/mse"; HOME="$s/home" TMPDIR="$s/tmp" MSE_HOME="$s/mse" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python -m unittest discover -s tests -t .` |
+| Golden snapshots of the app's views | `app/` or `tests/golden/` changed in the pushed commits | `scripts/snapshot_check.sh` (needs `swiftc`) |
+| Public-release audit, on a clean export of the pushed commit | the remote is the public repository `HeyitSaif/mysearch` | `python3 scripts/oss_audit.py <clean export>`; in the development repository the audit is part of `scripts/export_public.sh` |
+| Ad-hoc DMG build; the hook prints the image's path and sha256 | a `v*` tag is pushed | `scripts/build_dmg.sh --adhoc --out "$(mktemp -d)"` then `shasum -a 256 <dir>/MySearch.dmg` |
+
+The release itself is made from the Mac: after the tag is pushed, upload the image (and, for a self-contained image, its
+source archive — see below) with `gh release create v<version> ... <files>`, as the steps below describe. The hook's output
+ends with that command, filled in with the image it built.
+
 ## The rule
 
 There are two kinds of disk image, and only one of them needs more than the `.dmg`:

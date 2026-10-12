@@ -1,18 +1,24 @@
 name: Release
 
-# On a pushed version tag, the same checks and build as CI, then a DRAFT release with the DMG and its SHA-256.
-# Releases stay drafts: a maintainer reviews the draft and publishes it by hand.
+# Manual only (workflow_dispatch): this project does not use GitHub Actions minutes. A release is tested, built and
+# uploaded from a Mac by the maintainer — the local pre-push hook (scripts/hooks/pre-push) runs the tests and, for a
+# version tag, the ad-hoc DMG build; docs/RELEASING.md has the steps. Nothing here runs on a push or a tag.
+# When dispatched by hand for an existing tag, it runs the same checks and build and creates a DRAFT release with the
+# DMG and its SHA-256, unless a release for that tag already exists. Releases stay drafts: a maintainer publishes them.
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to build (for example v0.1.3)"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -28,6 +34,7 @@ jobs:
       - name: Check out the tagged code
         uses: actions/checkout@v7.0.1
         with:
+          ref: ${{ inputs.tag }}
           persist-credentials: false
 
       - name: Public-release audit (generic checks)
@@ -54,12 +61,16 @@ jobs:
           shasum -a 256 MySearch.dmg > MySearch.dmg.sha256
           cat MySearch.dmg.sha256
 
-      - name: Create the draft release
+      - name: Create the draft release (skipped when a release for the tag already exists)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag }}
           REPO: ${{ github.repository }}
         run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "A release for $TAG already exists; nothing is created or changed. The DMG is in build/release."
+            exit 0
+          fi
           sha="$(cut -d ' ' -f 1 build/release/MySearch.dmg.sha256)"
           gh release create "$TAG" \
             --repo "$REPO" \

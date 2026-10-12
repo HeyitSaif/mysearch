@@ -1,0 +1,119 @@
+#!/bin/bash
+# Git pre-push hook: the checks that this project does NOT run on GitHub Actions (no Actions minutes are used).
+# Installed by scripts/install_hooks.sh (a symlink in .git/hooks). Git calls it with the remote name and URL as arguments and
+# one line per ref on stdin: "<local ref> <local sha> <remote ref> <remote sha>". Any failing step stops the push.
+#   (a) the Python test suite, headless, in a fresh sandbox: HOME, TMPDIR and MSE_HOME point into a new mktemp folder, so no
+#       real data folder, Keychain item or service is touched;
+#   (b) scripts/snapshot_check.sh, when app/ or tests/golden/ changed in the commits being pushed;
+#   (c) scripts/oss_audit.py on a clean export of the pushed commit, when the remote is the public repository
+#       (HeyitSaif/mysearch) — the private development repository skips this, its audit runs in scripts/export_public.sh;
+#   (d) for a version tag (refs/tags/v*): scripts/build_dmg.sh --adhoc into a new mktemp folder, then the DMG path and its
+#       sha256 are printed so the maintainer uploads it by hand (gh release create ... <dmg>), see docs/RELEASING.md.
+# MSE_SKIP_HOOKS=1 bypasses every step (printed). The hook only creates folders under mktemp; it never deletes anything.
+set -u
+
+remote_name="${1:-}"
+remote_url="${2:-}"
+
+if [ "${MSE_SKIP_HOOKS:-}" = "1" ]; then
+  echo "pre-push: bypassed (MSE_SKIP_HOOKS=1). No test, audit or build ran." >&2
+  exit 0
+fi
+
+repo="$(git rev-parse --show-toplevel)" || exit 1
+cd "$repo" || exit 1
+
+fail() { printf 'pre-push: FAILED — %s\n' "$*" >&2; exit 1; }
+step() { printf '\npre-push: %s\n' "$*" >&2; }
+
+# Read what is being pushed. Deleted refs (local sha all zeros) are ignored: nothing new reaches the remote.
+zero="0000000000000000000000000000000000000000"
+pushed_shas=()
+tag_push=""
+changed_files=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${local_ref:-}" ] || continue
+  [ "$local_sha" != "$zero" ] || continue
+  pushed_shas+=("$local_sha")
+  case "$local_ref" in refs/tags/v*) tag_push="${local_ref#refs/tags/}" ;; esac
+  # The commits that are new to the remote: <remote sha>..<local sha> when the remote tip is known here, otherwise every
+  # commit of the pushed ref that no ref of this remote already has.
+  if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
+    range_files="$(git diff --name-only "$remote_sha" "$local_sha" 2>/dev/null || true)"
+  else
+    range_files="$(git rev-list "$local_sha" --not --remotes="$remote_name" 2>/dev/null \
+      | xargs -n 1 git diff-tree --no-commit-id --name-only -r 2>/dev/null || true)"
+  fi
+  changed_files="$changed_files
+$range_files"
+done
+
+if [ "${#pushed_shas[@]}" -eq 0 ]; then
+  echo "pre-push: only deletions are being pushed; nothing to check." >&2
+  exit 0
+fi
+
+# The Python of this clone: the project's virtual environment, else uv.
+if [ -x "$repo/.venv/bin/python" ]; then
+  py=("$repo/.venv/bin/python")
+elif command -v uv >/dev/null 2>&1; then
+  py=(uv run python)
+else
+  fail "no .venv/bin/python and no uv; run scripts/setup.sh first"
+fi
+
+# (a) Tests, headless, in a sandbox that is new for this run.
+sandbox="$(mktemp -d "${TMPDIR:-/tmp}/mse-prepush-XXXXXX")" || fail "mktemp failed"
+mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/mse" || fail "could not create the sandbox under $sandbox"
+step "unit tests (sandbox: $sandbox)"
+if ! env HOME="$sandbox/home" TMPDIR="$sandbox/tmp" MSE_HOME="$sandbox/mse" \
+     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+     "${py[@]}" -m unittest discover -s tests -t . ; then
+  fail "the test suite did not pass. Fix the tests, or bypass once with MSE_SKIP_HOOKS=1 git push ..."
+fi
+
+# (b) Golden snapshots, only when the app or the goldens changed in what is being pushed.
+if printf '%s\n' "$changed_files" | grep -q -E '^(app/|tests/golden/)'; then
+  step "snapshot check (app/ or tests/golden/ changed in the pushed commits)"
+  command -v swiftc >/dev/null 2>&1 || fail "swiftc is needed for scripts/snapshot_check.sh (xcode-select --install)"
+  ./scripts/snapshot_check.sh || fail "the golden snapshots differ (scripts/snapshot_check.sh). Look at the renders before updating a golden."
+else
+  echo "pre-push: snapshot check skipped (no change under app/ or tests/golden/ in the pushed commits)." >&2
+fi
+
+# (c) Public-release audit, only for the public repository, on a clean export of the pushed commit (no .venv, no build/).
+case "$remote_url" in
+  *HeyitSaif/mysearch|*HeyitSaif/mysearch.git|*HeyitSaif/mysearch/|*HeyitSaif/mysearch.git/)
+    for sha in "${pushed_shas[@]}"; do
+      export_dir="$(mktemp -d "${TMPDIR:-/tmp}/mse-prepush-audit-XXXXXX")" || fail "mktemp failed"
+      step "public-release audit of ${sha:0:12} (export: $export_dir)"
+      git archive --format=tar "$sha" | tar -x -C "$export_dir" || fail "could not export $sha for the audit"
+      python3 scripts/oss_audit.py "$export_dir" || fail "the public-release audit found hits in $sha; nothing may be pushed to the public repository with hits"
+    done ;;
+  *)
+    echo "pre-push: public-release audit skipped (remote is not HeyitSaif/mysearch; scripts/export_public.sh audits the export)." >&2 ;;
+esac
+
+# (d) A version tag: build the ad-hoc DMG and print what the maintainer uploads.
+if [ -n "$tag_push" ]; then
+  out="$(mktemp -d "${TMPDIR:-/tmp}/mse-prepush-dmg-XXXXXX")" || fail "mktemp failed"
+  step "ad-hoc DMG build for $tag_push (output: $out)"
+  ./scripts/build_dmg.sh --adhoc --out "$out" || fail "scripts/build_dmg.sh --adhoc failed for $tag_push"
+  dmg="$(find "$out" -maxdepth 1 -name '*.dmg' | head -n 1)"
+  [ -n "$dmg" ] || fail "the build finished but no .dmg is in $out"
+  sum="$(shasum -a 256 "$dmg" | cut -d ' ' -f 1)"
+  printf '%s  %s\n' "$sum" "$(basename "$dmg")" > "$dmg.sha256"
+  cat >&2 <<EOF
+
+pre-push: DMG for $tag_push
+    $dmg
+    sha256 $sum  (also in $dmg.sha256)
+    This is an ad-hoc build. Upload it (or a signed and notarized image built the same way) yourself after the push:
+      gh release create $tag_push --title "MySearch $tag_push" --notes-file <notes.md> "$dmg" "$dmg.sha256"
+    A --bundle-runtime image needs its source archive next to it: docs/RELEASING.md.
+EOF
+fi
+
+echo >&2
+echo "pre-push: all checks passed." >&2
+exit 0

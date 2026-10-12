@@ -74,6 +74,11 @@ fi
 say "Python packages (uv sync --frozen)"
 uv sync --frozen
 
+say "Git hooks"
+# Tests and builds run here, not on GitHub Actions: scripts/hooks/pre-push runs before every push (docs/RELEASING.md).
+# A foreign hook of the same name is reported and left in place; that is not an error for the setup.
+scripts/install_hooks.sh || warn "a hook was not installed (see above); the push checks will not run until it is"
+
 say "Models"
 if [ -z "$TIER" ]; then
   if interactive; then

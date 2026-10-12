@@ -1,11 +1,11 @@
 name: CI
 
-# Unit tests and an ad-hoc build of the helper and the app, on every push and pull request.
+# Manual only (workflow_dispatch): this project does not use GitHub Actions minutes. Tests, the audit and the DMG build run
+# locally before every push — see docs/RELEASING.md, "Checks before a push". Nothing here runs on push or pull request.
 # Nothing here needs a model, a secret or a network address other than the package indexes and GitHub.
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
