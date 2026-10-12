@@ -261,6 +261,9 @@ def _load_file(coll: dict, row, ok, exclude) -> dict | None:
         if f is None:
             return None
         f = dict(f)
+        # marked missing (schema 3): not shown, as in search.py. Without the column there is nothing to check.
+        if f.get("missing_since") is not None:
+            return None
         f["_collection"] = coll["name"]
         if not (Path(coll["path"]) / f["path"]).exists():
             return None

@@ -39,6 +39,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var item: NSStatusItem!
     private(set) var quickMenuItems: [NSMenuItem] = []
     private var statusLine: NSMenuItem!
+    private var updateItem: NSMenuItem!
+    private var updateSeparator: NSMenuItem!
+    private var classicItem: NSMenuItem?
     private var indexWatch: Task<Void, Never>?
 
     var onQuick: (() -> Void)?
@@ -46,6 +49,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     var onSync: (() -> Void)?
     var onSettings: (() -> Void)?
     var onClassic: (() -> Void)?
+    var onUpdate: (() -> Void)?
 
     func install(quickKey: HotKey) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -54,12 +58,24 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
         menu.delegate = self
+        // "Update available — 0.x.y" (Updater.swift): hidden until a newer release is known, opens its page
+        updateItem = NSMenuItem(title: "Update available", action: #selector(updateAction), keyEquivalent: "")
+        updateItem.image = NSImage(systemSymbolName: "arrow.down.circle.fill", accessibilityDescription: "Update available")
+        updateItem.isHidden = true
+        updateSeparator = NSMenuItem.separator()
+        updateSeparator.isHidden = true
+        menu.addItem(updateItem)
+        menu.addItem(updateSeparator)
         let quick = NSMenuItem(title: "Quick Search", action: #selector(quickAction), keyEquivalent: "")
         quickMenuItems.append(quick)
         menu.addItem(quick)
         menu.addItem(withTitle: "Open MySearch", action: #selector(openAction), keyEquivalent: "")
         menu.addItem(withTitle: "Sync Now", action: #selector(syncAction), keyEquivalent: "")
-        menu.addItem(withTitle: "Open Classic MySearch", action: #selector(classicAction), keyEquivalent: "")
+        classicItem = menu.addItem(withTitle: "Open Classic MySearch", action: #selector(classicAction), keyEquivalent: "")
+        classicItem?.isHidden = !ClassicUI.isEnabled          // hidden while the Classic interface is off (ClassicUI.swift)
+        NotificationCenter.default.addObserver(forName: ClassicUI.didChange, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.classicItem?.isHidden = !ClassicUI.isEnabled }
+        }
         menu.addItem(.separator())
         statusLine = NSMenuItem(title: "Checking the search service…", action: nil, keyEquivalent: "")
         statusLine.isEnabled = false
@@ -109,6 +125,15 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     @objc private func syncAction() { onSync?() }
     @objc private func settingsAction() { onSettings?() }
     @objc private func classicAction() { onClassic?() }
+    @objc private func updateAction() { onUpdate?() }
+
+    /// Shows "Update available — <version>" at the top of the menu, or hides it when `version` is nil.
+    func setUpdate(_ version: String?) {
+        guard let updateItem else { return }
+        updateItem.title = version.map { "Update available — \($0)" } ?? "Update available"
+        updateItem.isHidden = version == nil
+        updateSeparator.isHidden = version == nil
+    }
 
     func menuWillOpen(_ menu: NSMenu) {
         Task {

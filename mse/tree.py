@@ -6,9 +6,10 @@ block is never shown, not even by name. Symbolic links are not followed and `..`
 
 import os
 import stat as S
+from pathlib import Path
 
 from . import config, macindex
-from .indexer import matchers
+from .indexer import _nokey_matcher, _secret_excluded, matchers
 
 MAX_FOLDERS = 2000
 
@@ -33,11 +34,13 @@ def folders(collection: str, rel: str = "") -> dict:
         raise NotFound(f"no collection named '{collection}'")
     parts = _clean(rel)
     exclude, _ = matchers(coll)
+    nokey = _nokey_matcher(coll)
     priv = macindex.manager().excluder()
     root = coll["path"].rstrip("/")
 
     def allowed(relpath: str, abspath: str) -> bool:
-        return not exclude.match(relpath + "/") and not priv.blocked(abspath, soft=False)
+        # the collection's own rule (a Keynote deck is one folder, nothing inside it is listed; a private key is not)
+        return not _secret_excluded(relpath, exclude, nokey, Path(root)) and not priv.blocked(abspath, soft=False)
 
     cur = root
     for i, part in enumerate(parts):                 # every step must be a real folder, never a link

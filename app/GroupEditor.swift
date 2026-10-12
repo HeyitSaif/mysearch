@@ -381,7 +381,7 @@ func runGroupEditorSnapshot(_ o: SnapshotOptions) {
         let bounds = frameView.bounds
         guard let rep = frameView.bitmapImageRepForCachingDisplay(in: bounds) else { snapshotFail("could not create a bitmap") }
         window.effectiveAppearance.performAsCurrentDrawingAppearance { frameView.cacheDisplay(in: bounds, to: rep) }
-        guard let data = rep.representation(using: .png, properties: [:]) else { snapshotFail("PNG encoding failed") }
+        guard let data = snapshotPNGData(rep) else { snapshotFail("PNG encoding failed") }   // sRGB, no profile, no metadata (SnapshotPNG.swift)
         let url = URL(fileURLWithPath: o.output)
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         do { try data.write(to: url) } catch { snapshotFail("could not write \(o.output)") }

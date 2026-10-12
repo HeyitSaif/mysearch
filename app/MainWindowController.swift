@@ -96,7 +96,10 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate 
         sidebar.onLibrary = { [weak self] lib in self?.libraryArrived(lib) }
         content.onPathClick = { [weak self] url in self?.openFolder(url) }
         sidebar.onIndexedSelection = { [weak self] names in self?.indexedSelectionChanged(names) }
-        search.onStatus = { [weak self] text in self?.content.setStatus(text) }
+        search.onStatus = { [weak self] text in
+            self?.content.setStatus(text)
+            self?.refreshSubtitle()                 // the count in the subtitle follows the results
+        }
         search.onOpenFolder = { [weak self] url in self?.openFolder(url) }
         search.onRevealFolder = { [weak self] url in self?.revealInFolderView(url) }
         search.onRequestQuery = { [weak self] text in self?.setSearchText(text) }
@@ -474,13 +477,16 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate 
         content.collapsesEmptyFooter = false
         content.show(search)
         content.setPath(nil)
+        // The window title is the scope, short and fixed ("Mac", "Indexed", "Ask", "Preview": 15 characters at most). It never
+        // carries the query or the collection names; those are the subtitle (refreshSubtitle).
         if mode == .indexed {
             search.configure(scope: .indexed, names: indexedSelection)
-            window.title = indexedSelection.isEmpty ? "Indexed" : indexedSelection.joined(separator: ", ")
+            window.title = "Indexed"
         } else {
             search.configure(scope: .mac, names: [])
-            window.title = "Search"
+            window.title = "Mac"
         }
+        refreshSubtitle()
         search.run(searchQuery)
     }
 
@@ -514,7 +520,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate 
 
     /// Every keystroke in the toolbar field lands here: a query shows the search view, an empty one leaves it.
     @objc private func searchFieldChanged(_ sender: NSSearchField?) {
-        defer { refreshSearchTitle() }          // the tab reads "Search: <query>"
+        defer { refreshSubtitle() }             // the subtitle follows the typing
         let text = sender?.stringValue ?? ""
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if mode == .ask && !trimmed.isEmpty { setMode(.mac); return }
@@ -553,6 +559,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate 
         content.setPath(nil)
         content.setStatus("")
         window.title = "Ask"
+        refreshSubtitle()
         ask.activate()
     }
 
@@ -570,7 +577,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate 
         content.show(webHost)
         content.setPath(nil)
         content.setStatus("")
-        window.title = "Indexed · Preview"
+        window.title = "Preview"
         updateChrome()
     }
 
@@ -634,16 +641,45 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate 
         backForward?.setEnabled(navigator.canGoForward, forSegment: 1)
         viewControl?.selectedSegment = viewStyle.rawValue
         modeControl?.selectedSegment = tagListShowing ? -1 : mode.rawValue     // no mode is selected while Tags shows
-        refreshSearchTitle()
+        refreshSubtitle()
         refreshPaneOutlines()
         if !snapshot { NotificationCenter.default.post(name: .mainTabsChanged, object: self) }   // the open tabs are saved
     }
 
-    /// The tab's title while a search has a query: "Search: <query>". Folders, Ask and the Indexed picker keep theirs.
-    private func refreshSearchTitle() {
-        guard searchShown, !webSearchShown else { return }
+    /// The window subtitle (NSWindow.subtitle) is the context of the scope in the title: what the search found and WHERE it looks,
+    /// never the query (the search field has that). "12 matches · work + notes" in Indexed mode, "1,234 results · on this Mac"
+    /// in Mac mode, "No matches · <place>" when nothing matched; while a search is still on its way, or its count is not known,
+    /// the place alone. The place is, for Mac, "on this Mac"; for Indexed, the folders picked in the sidebar, "work + notes"
+    /// (three at most, then "+ 2 more"; a picked group counts as its members), or "all indexed folders" when none is picked.
+    /// It shows only while the native results show with a search text. Ask, folders, tags, the Indexed picker (no text, nothing
+    /// searched yet) and the Preview page have none: the Preview page searches the scope its own link or Quick Search sent,
+    /// which can differ from the sidebar selection, so a place there could be false. It is recomputed from state each time,
+    /// so it is never left over from the last view, and it follows the search view's status (search.onStatus), which is
+    /// called each time the results or their count change.
+    private func refreshSubtitle() {
         let q = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !q.isEmpty { window.title = "Search: \(q)" }
+        guard searchShown && !q.isEmpty else { window.subtitle = ""; return }
+        let indexed = mode == .indexed
+        let place = indexed ? Self.indexedPlace(indexedSelection) : "on this Mac"
+        window.subtitle = Self.countText(search.resultCount, indexed: indexed).map { $0 + " · " + place } ?? place
+    }
+
+    private static let subtitleCounts: NumberFormatter = { let f = NumberFormatter(); f.numberStyle = .decimal; return f }()
+
+    /// "12 matches" (Indexed), "1 result" (Mac), "No matches" for zero; nil when the count is not known.
+    private static func countText(_ count: Int?, indexed: Bool) -> String? {
+        guard let count else { return nil }
+        if count == 0 { return "No matches" }
+        let n = subtitleCounts.string(from: NSNumber(value: count)) ?? "\(count)"
+        return n + " " + (indexed ? (count == 1 ? "match" : "matches") : (count == 1 ? "result" : "results"))
+    }
+
+    /// The Indexed place for the subtitle: the picked folders joined with " + ", at most three.
+    private static func indexedPlace(_ names: [String]) -> String {
+        let named = names.filter { !$0.isEmpty }
+        guard !named.isEmpty else { return "all indexed folders" }
+        let shown = named.prefix(3).joined(separator: " + ")
+        return named.count > 3 ? "\(shown) + \(named.count - 3) more" : shown
     }
 
     // MARK: launchers (Launchers.swift)
@@ -755,6 +791,7 @@ final class MainWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate 
             item.visibilityPriority = .low
             return item
         case Item.classic:
+            guard ClassicUI.isEnabled else { return nil }      // off: no Classic item (ClassicUI.swift; AppDelegate keeps open windows in step)
             // Only the overflow menu matters here: the item is hidden first when the toolbar is narrow, and its menu
             // form is the same "Open Classic MySearch" entry. The action goes up the responder chain to AppDelegate.
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)

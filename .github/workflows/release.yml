@@ -1,0 +1,71 @@
+name: Release
+
+# On a pushed version tag, the same checks and build as CI, then a DRAFT release with the DMG and its SHA-256.
+# Releases stay drafts: a maintainer reviews the draft and publishes it by hand.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-draft:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    permissions:
+      contents: write                  # only this job may write: it creates the draft release, with GITHUB_TOKEN
+    steps:
+      - name: Check out the tagged code
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Public-release audit (generic checks)
+        run: python3 scripts/oss_audit.py .
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.4"
+          enable-cache: false
+
+      - name: Install the locked environment (no models are downloaded)
+        run: uv sync --frozen
+
+      - name: Unit tests
+        run: uv run python -m unittest discover -s tests -t .
+
+      - name: Build the helper and the app (ad hoc, no signing identity)
+        run: ./scripts/build_dmg.sh --adhoc --out build/release
+
+      - name: Checksum the DMG
+        run: |
+          cd build/release
+          shasum -a 256 MySearch.dmg > MySearch.dmg.sha256
+          cat MySearch.dmg.sha256
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          sha="$(cut -d ' ' -f 1 build/release/MySearch.dmg.sha256)"
+          gh release create "$TAG" \
+            --repo "$REPO" \
+            --verify-tag \
+            --draft \
+            --title "MySearch $TAG" \
+            --notes "Draft for review. SHA-256 of MySearch.dmg: $sha" \
+            build/release/MySearch.dmg \
+            build/release/MySearch.dmg.sha256

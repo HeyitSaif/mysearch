@@ -1,7 +1,8 @@
 // The native search results view, Everything-style: a name search over the whole Mac (scope=mac) or over the
 // Indexed folders and groups the user picked in the sidebar (scope=indexed). Results arrive as the user types
-// (40 ms debounce, every older request cancelled). Indexed mode adds a second section, "Content matches" (meaning
-// and keywords from /api/search), which loads after the names and never blocks typing.
+// (the first keystroke searches at once, the next ones are debounced 40 ms, a re: query waits 250 ms; every older request
+// is cancelled). The names come in two pages (50, then up to 150 more). Indexed mode adds a second section, "Content
+// matches" (meaning and keywords from /api/search), which loads after the names and never blocks typing.
 //
 // The main window owns the toolbar search field and calls run(_:) with its text; this controller owns the table,
 // the scope bar, the banner and the keys. Endpoints: GET /api/files/search, /api/files/status, /api/search (see
@@ -10,8 +11,82 @@
 
 import Cocoa
 import Quartz
+import SwiftUI
+
+// MARK: - Design tokens
+
+/// The values the native views share, defined once. AskColors (AskModel.swift) and SidebarColors (Sidebar.swift) stay what
+/// they are: palettes of one view each. Later steps refine these values; use the token, not a literal.
+enum MSEStyle {
+    /// A colour of two fixed values, one for light and one for dark mode, chosen each time it is drawn. It is built from
+    /// opaque values on purpose: a colour made with withAlphaComponent is fixed in the appearance that was current when it
+    /// was made, so a token built that way would stay light or dark. bestMatch (not a name check) also sends the vibrant and
+    /// high-contrast variants to the right side.
+    private static func dynamic(light: UInt32, dark: UInt32) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let rgb = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+            return NSColor(srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255, green: CGFloat((rgb >> 8) & 0xFF) / 255,
+                           blue: CGFloat(rgb & 0xFF) / 255, alpha: 1)
+        }
+    }
+    /// The one secondary text colour (captions, counts, hints, snippets, the Folder column, section headers). At least 4.5:1
+    /// on the white row (#FFFFFF / #1E1E1E), the window and footer, the sidebar (#E4E4E4 / #3A3A3A) and a selected row of an
+    /// inactive window (#DCDCDC / #464646), light and dark. The system secondary label colour is about 3.7 to 3.95:1 in light.
+    static let secondary: NSColor = dynamic(light: 0x595959, dark: 0xB8B8B8)
+    /// The text of the document badge, on the quiet pill it sits on (its fill is darker than the row in light, lighter in
+    /// dark, so the badge needs a stronger value than MSEStyle.secondary to keep 4.5:1, selected row of an inactive window included).
+    static let badgeText: NSColor = dynamic(light: 0x484848, dark: 0xE0E0E0)
+    /// Secondary text in a cell, for the cell's background style: a selected row (the accent colour, .emphasized) takes white,
+    /// because only the system label colours are swapped for white there by AppKit; a custom colour is not.
+    static func secondary(on style: NSView.BackgroundStyle) -> NSColor {
+        style == .emphasized ? .alternateSelectedControlTextColor : secondary
+    }
+    /// The header of a section ("File names", "Content matches").
+    static let sectionHeaderFont: NSFont = .systemFont(ofSize: 12, weight: .semibold)
+    /// The ONE SF Symbol configuration: every symbol in a view is made with it.
+    static let symbolConfig: NSImage.SymbolConfiguration = .init(pointSize: 13, weight: .regular)
+    /// The side inset of a content view.
+    static let contentInset: CGFloat = 24
+    /// The width of a line of the Ask answer, in characters.
+    static let askMeasure: Int = 70
+    /// The height of a result row.
+    static let rowHeight: CGFloat = 60
+    /// The side of a file icon in a result row.
+    static let iconSize: CGFloat = 32
+}
 
 enum SearchScope { case mac, indexed }
+
+// BEGIN SearchDebounce (Foundation only: scratch checks compile this block on its own)
+/// When the request for a keystroke goes out. Leading edge: a keystroke that comes after a quiet spell (at least `quiet`
+/// since the call before it) searches at once; a keystroke inside a burst waits `quiet`, so a burst sends its first
+/// keystroke and then one request after its last. A `re:` query is trailing only and waits `regexQuiet`: a regular
+/// expression that is half typed can be invalid, so it is never sent on the leading edge. Older requests are cancelled
+/// by the caller, as before; this only answers "how long to wait".
+struct SearchDebounce {
+    static let quiet: UInt64 = 40_000_000           // ns
+    static let regexQuiet: UInt64 = 250_000_000     // ns
+    private var lastCall: UInt64?
+
+    /// A word of the text that starts with re: (after an optional ! or -), in any case.
+    static func isRegexQuery(_ text: String) -> Bool {
+        text.split(whereSeparator: { $0.isWhitespace }).contains { token in
+            var t = Substring(token)
+            if let f = t.first, f == "!" || f == "-" { t = t.dropFirst() }
+            return t.lowercased().hasPrefix("re:")
+        }
+    }
+
+    /// The wait before the request for `text`, in ns; nil = send it at once. `now` is a monotonic clock in ns. Every call
+    /// counts as a keystroke, so call it once per run of the search.
+    mutating func delay(for text: String, now: UInt64) -> UInt64? {
+        defer { lastCall = now }
+        if SearchDebounce.isRegexQuery(text) { return SearchDebounce.regexQuiet }
+        if let last = lastCall, now >= last, now - last < SearchDebounce.quiet { return SearchDebounce.quiet }
+        return nil
+    }
+}
+// END SearchDebounce
 
 /// One name match, from /api/files/search (or a hybrid hit in the fallback). `match` holds character ranges in name.
 struct SearchItem {
@@ -55,6 +130,44 @@ struct SearchItem {
     }
 }
 
+/// What a document is, as /api/search says it (the `meta` of a result, or nil): the type, its date, amount and currency,
+/// the counterparty and the reference (mse/docmeta.py).
+struct DocMeta {
+    let doctype: DocType?
+    let docDate: String?          // "2025-03-14", "2025-03" or "2025"
+    let amount: Double?
+    let currency: String?
+    let counterparty: String?
+    let reference: String?
+
+    init?(_ d: Any?) {
+        guard let obj = d as? [String: Any] else { return nil }
+        let type = (obj["doctype"] as? String).flatMap { DocType(rawValue: $0) }
+        let raw = obj["doctype"] as? String
+        // a result with a document type that this build does not know is still shown, without a badge name it lacks
+        guard type != nil || raw != nil else { return nil }
+        doctype = type
+        docDate = obj["doc_date"] as? String
+        amount = (obj["amount"] as? NSNumber)?.doubleValue
+        currency = (obj["currency"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        counterparty = (obj["counterparty"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        reference = (obj["reference"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// The amount with its currency, locale-formatted ("€1,234.50"); the plain number when the currency is unknown.
+    var amountText: String? {
+        guard let amount else { return nil }
+        guard let currency else { return DocMeta.number.string(from: NSNumber(value: amount)) }
+        let f = NumberFormatter()
+        f.numberStyle = .currency
+        f.currencyCode = currency
+        f.locale = Locale.current
+        return f.string(from: NSNumber(value: amount)) ?? "\(amount) \(currency)"
+    }
+
+    private static let number: NumberFormatter = { let f = NumberFormatter(); f.numberStyle = .decimal; return f }()
+}
+
 /// One content match (/api/search): the first matching passage of a file, with its <mark> highlights.
 struct ContentHit {
     let path: String
@@ -69,6 +182,7 @@ struct ContentHit {
     let dateText: String?            // the document date as the service wrote it ("2025-03")
     let why: [String]                // how it matched: keyword, meaning, translated, visual, audio
     let relevance: Int?              // 0 to 100, against the best match
+    let meta: DocMeta?               // what the document is, when it is classified (nil for a note or an unclassified file)
 
     var url: URL { URL(fileURLWithPath: path) }
 
@@ -85,7 +199,8 @@ struct ContentHit {
                           collection: d["collection"] as? String, relPath: d["path"] as? String,
                           dateText: SearchDates.display(d["date"]),
                           why: ((d["why"] as? [Any]) ?? []).compactMap { $0 as? String },
-                          relevance: (d["relevance"] as? NSNumber)?.intValue)
+                          relevance: (d["relevance"] as? NSNumber)?.intValue,
+                          meta: DocMeta(d["meta"]))
     }
 
     /// Why this file is in the list, in the words of the web UI's channels ("name" is the keyword channel there too):
@@ -161,9 +276,19 @@ enum SearchDates {
 /// matched words are semibold on a soft yellow. A passage the service did not mark (a match by meaning) gets the
 /// query's own words highlighted, so the eye finds what to read.
 enum SnippetText {
-    private static let base: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11)]
+    /// The snippet is one line, 12 pt. The paragraph style carries the line break: a cell given an attributed string
+    /// takes its truncation from the string, so without it a long snippet is clipped at the column edge, mid-word,
+    /// with no ellipsis. The colour is left to the field (MSEStyle.secondary), so a selected row can recolour it.
+    private static var oneLine: NSParagraphStyle {
+        let p = NSMutableParagraphStyle()
+        p.lineBreakMode = .byTruncatingTail
+        return p
+    }
+    private static var base: [NSAttributedString.Key: Any] {
+        [.font: NSFont.systemFont(ofSize: 12), .paragraphStyle: oneLine]
+    }
     private static var marked: [NSAttributedString.Key: Any] {
-        [.font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+        [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .paragraphStyle: oneLine,
          .backgroundColor: NSColor.systemYellow.withAlphaComponent(0.28)]
     }
 
@@ -194,6 +319,34 @@ enum SnippetText {
             }
         }
         return out
+    }
+
+    /// `s` cut to fit `width` points on one line, ending in a plain "…". AppKit's own tail truncation gives the ellipsis the
+    /// attributes of the character where the cut falls, so a cut inside a highlighted word left a yellow, semibold "…".
+    /// Here the visible text keeps its runs (the highlight stays on the words that can be seen) and the ellipsis is plain.
+    /// A string that fits is returned as it is.
+    static func fitted(_ s: NSAttributedString, width: CGFloat) -> NSAttributedString {
+        guard s.length > 0, s.size().width > width else { return s }
+        let ellipsis = NSAttributedString(string: "\u{2026}", attributes: base)
+        func candidate(_ end: Int) -> NSAttributedString {
+            guard end > 0 else { return ellipsis }
+            let cut = min((s.string as NSString).rangeOfComposedCharacterSequence(at: end - 1).upperBound, s.length)
+            var head = s.attributedSubstring(from: NSRange(location: 0, length: cut))
+            // no space or newline before the ellipsis
+            var trimmed = head.length
+            let ns = head.string as NSString
+            while trimmed > 0, let u = Unicode.Scalar(ns.character(at: trimmed - 1)), CharacterSet.whitespacesAndNewlines.contains(u) { trimmed -= 1 }
+            if trimmed != head.length { head = head.attributedSubstring(from: NSRange(location: 0, length: trimmed)) }
+            let out = NSMutableAttributedString(attributedString: head)
+            out.append(ellipsis)
+            return out
+        }
+        var lo = 0, hi = s.length                       // the longest prefix (in UTF-16 units) whose cut string fits
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if candidate(mid).size().width <= width { lo = mid } else { hi = mid - 1 }
+        }
+        return candidate(lo)
     }
 
     /// The words of a query worth highlighting: no operators (word:value), no negations, no quotes, three letters or more.
@@ -263,12 +416,64 @@ final class ScopeToken: NSView {
     }
 }
 
-/// A name cell: icon, title and an optional second line (the snippet of a content match).
+/// The document type of a result as a small neutral pill: the label on a quiet fill, readable in light and dark mode.
+final class DocBadge: NSView {
+    let label = NSTextField(labelWithString: "")
+
+    init() {
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 4
+        label.font = .systemFont(ofSize: 10, weight: .medium)
+        label.textColor = MSEStyle.badgeText
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
+            label.topAnchor.constraint(equalTo: topAnchor, constant: 1),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -1),
+        ])
+        setContentHuggingPriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.secondaryLabelColor.withAlphaComponent(0.14).cgColor
+    }
+
+    /// On a selected row (the accent colour) the label is white; otherwise the badge's own colour.
+    func setEmphasized(_ on: Bool) {
+        label.textColor = on ? .alternateSelectedControlTextColor : MSEStyle.badgeText
+    }
+}
+
+/// A name cell: icon and title; a content match adds the snippet and then the document line (NetNewsWire's order:
+/// title, one line of text, then the facts). A file-name row stays one compact line with a 16 pt icon.
 final class SearchCell: NSTableCellView {
     let title = NSTextField(labelWithString: "")
     let detail = NSTextField(labelWithString: "")
     let tagDots = NSImageView()           // the file's colour tags, after the name (TagStore.dotsImage)
     private(set) var tagDotsWidth: NSLayoutConstraint!      // the dots' width: 0 when there are none
+    /// The path whose colour tags this cell shows or waits for. Cells are reused, so a tag answer that comes late for
+    /// another path is dropped (SearchViewController.showTags).
+    var tagPath: String?
+    /// The document line of a classified result: type badge, then amount · date · counterparty. Hidden when there is none.
+    let badge = DocBadge()
+    let metaText = NSTextField(labelWithString: "")
+    private(set) var metaRow = NSStackView()
+    private var iconSide: [NSLayoutConstraint] = []         // the icon's width and height: 16, or MSEStyle.iconSize in a rich row
+    private var textGap: NSLayoutConstraint!                // icon to text
+    /// The title, snippet and document line stacked; its width is the room the snippet has.
+    private var textStack: NSStackView?
+    /// The whole snippet. What the snippet field shows is this cut to the room (layout), with a plain ellipsis.
+    private var fullSnippet: NSAttributedString?
+    /// What the snippet field was last given (compared with the next fit, so an unchanged fit assigns nothing and the
+    /// layout settles; the field's own attributedStringValue is not equal to what it was given).
+    private var shownSnippet: NSAttributedString?
 
     init(identifier: String) {
         super.init(frame: .zero)
@@ -278,12 +483,29 @@ final class SearchCell: NSTableCellView {
         icon.imageScaling = .scaleProportionallyDown
         title.lineBreakMode = .byTruncatingTail
         detail.lineBreakMode = .byTruncatingTail
-        detail.textColor = .secondaryLabelColor
-        let text = NSStackView(views: [title, detail])
+        detail.maximumNumberOfLines = 1           // a snippet is one line: a longer one ends in an ellipsis, never wraps
+        detail.cell?.usesSingleLineMode = true
+        detail.cell?.truncatesLastVisibleLine = true
+        detail.font = .systemFont(ofSize: 12)
+        detail.textColor = MSEStyle.secondary
+        metaText.font = .systemFont(ofSize: 11)
+        metaText.textColor = MSEStyle.secondary
+        metaText.lineBreakMode = .byTruncatingTail
+        metaText.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        // The snippet must give way to the column edge, as the title and the document line do: at the default
+        // resistance it kept its full width and the cell clipped it mid-word.
+        detail.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        metaRow = NSStackView(views: [badge, metaText])
+        metaRow.orientation = .horizontal
+        metaRow.alignment = .centerY
+        metaRow.spacing = 6
+        metaRow.isHidden = true
+        let text = NSStackView(views: [title, detail, metaRow])
         text.orientation = .vertical
         text.alignment = .leading
-        text.spacing = 1
+        text.spacing = 2
         text.translatesAutoresizingMaskIntoConstraints = false
+        textStack = text
         tagDots.translatesAutoresizingMaskIntoConstraints = false
         tagDots.imageScaling = .scaleNone
         tagDots.setContentHuggingPriority(.required, for: .horizontal)
@@ -294,14 +516,17 @@ final class SearchCell: NSTableCellView {
         addSubview(tagDots)
         imageView = icon
         textField = title
-        NSLayoutConstraint.activate([
+        iconSide = [icon.widthAnchor.constraint(equalToConstant: 16), icon.heightAnchor.constraint(equalToConstant: 16)]
+        textGap = text.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6)
+        NSLayoutConstraint.activate(iconSide + [
             icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             icon.centerYAnchor.constraint(equalTo: centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 16),
-            icon.heightAnchor.constraint(equalToConstant: 16),
-            text.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
+            textGap,
             text.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             text.centerYAnchor.constraint(equalTo: centerYAnchor),
+            // every line stops at the text column's edge, so a long snippet or document line truncates there
+            detail.trailingAnchor.constraint(lessThanOrEqualTo: text.trailingAnchor),
+            metaRow.trailingAnchor.constraint(lessThanOrEqualTo: text.trailingAnchor),
             tagDots.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 6),
             tagDots.centerYAnchor.constraint(equalTo: title.centerYAnchor),
             tagDots.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
@@ -310,65 +535,165 @@ final class SearchCell: NSTableCellView {
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    /// The snippet of a content match; nil hides the line (and clears a reused cell). The field shows the snippet cut to
+    /// the room: AppKit's own tail truncation puts the highlight and the semibold weight of a cut word on the ellipsis.
+    func setSnippet(_ snippet: NSAttributedString?) {
+        fullSnippet = snippet
+        shownSnippet = snippet
+        if let snippet {
+            detail.attributedStringValue = snippet
+            detail.isHidden = false
+        } else {
+            detail.stringValue = ""
+            detail.isHidden = true
+        }
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        guard let full = fullSnippet, !detail.isHidden, let stack = textStack else { return }
+        // Measured against the text column, not the snippet field: the field is as wide as the string it holds, so its own
+        // width would only ever shrink. The column's edge less the field's 2 pt padding on each side and a little to spare.
+        let room = stack.frame.width - 8
+        guard room > 40 else { return }
+        let fitted = SnippetText.fitted(full, width: room)
+        guard shownSnippet.map({ !fitted.isEqual(to: $0) }) ?? true else { return }
+        shownSnippet = fitted
+        detail.attributedStringValue = fitted
+        recolor()                                       // a new string must not lose the row's text colour (a selected row's)
+    }
+
+    /// The snippet, the document line and the badge are secondary text: a selected row (the accent colour) takes white,
+    /// every other row the token. (A custom colour is not swapped for white by AppKit, as the system label colours are.)
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet { recolor() }
+    }
+
+    private func recolor() {
+        let colour = MSEStyle.secondary(on: backgroundStyle)
+        detail.textColor = colour
+        metaText.textColor = colour
+        badge.setEmphasized(backgroundStyle == .emphasized)
+    }
+
+    /// The colour dots after the name; an empty list clears the dots of a reused cell.
+    func setTags(_ colors: [TagColor]) {
+        let dots = TagStore.dotsImage(for: colors)
+        tagDots.image = dots
+        tagDotsWidth.constant = dots?.size.width ?? 0
+    }
+
+    /// A rich row (a content match: title, snippet, document line) has the large icon, MSEStyle.iconSize, in a row of
+    /// MSEStyle.rowHeight; a file-name row keeps the compact 16 pt icon.
+    func setRich(_ rich: Bool) {
+        let side: CGFloat = rich ? MSEStyle.iconSize : 16
+        for c in iconSide { c.constant = side }
+        textGap.constant = rich ? 10 : 6
+    }
+
+    /// The document line: the type badge and the text (amount · date · counterparty); nil hides the line.
+    func setMeta(_ meta: DocMeta?, line: String?) {
+        guard let meta else {
+            metaRow.isHidden = true
+            return
+        }
+        badge.label.stringValue = meta.doctype?.title ?? "Document"
+        metaText.stringValue = line ?? ""
+        metaRow.isHidden = false
+    }
 }
 
-/// The message shown over an empty result list: what happened, and the buttons that get out of it.
-@MainActor
-final class SearchEmptyState: NSStackView {
-    private let titleLabel = NSTextField(wrappingLabelWithString: "")
-    private let detailLabel = NSTextField(wrappingLabelWithString: "")
-    private let buttons = NSStackView()
-    private var actions: [() -> Void] = []
+/// One button of an empty state: what it says and what it does.
+struct EmptyStateAction: Identifiable {
+    let id: Int
+    let title: String
+    let run: () -> Void
+}
 
-    init() {
-        super.init(frame: .zero)
-        orientation = .vertical
-        alignment = .centerX
-        spacing = 8
-        titleLabel.font = .systemFont(ofSize: 14, weight: .medium)
-        titleLabel.textColor = .labelColor
-        titleLabel.alignment = .center
-        detailLabel.font = .systemFont(ofSize: 12)
-        detailLabel.textColor = .secondaryLabelColor
-        detailLabel.alignment = .center
-        buttons.orientation = .horizontal
-        buttons.spacing = 8
-        addArrangedSubview(titleLabel)
-        addArrangedSubview(detailLabel)
-        addArrangedSubview(buttons)
+/// The SwiftUI side of the one shared empty state: an icon, a title, one line, and the buttons that get out of it.
+/// ContentUnavailableView is the system view for exactly this (macOS 14 and later, the app's floor). The icon is
+/// drawn with MSEStyle.symbolConfig and the colour is MSEStyle.secondary; the side inset is MSEStyle.contentInset.
+private struct EmptyStateContent: View {
+    var symbol = "magnifyingglass"
+    var title = ""
+    var detail: String?
+    var actions: [EmptyStateAction] = []
+
+    var body: some View {
+        ContentUnavailableView {
+            Label {
+                Text(title)
+            } icon: {
+                AskSymbol(name: symbol).foregroundStyle(Color(nsColor: MSEStyle.secondary))
+            }
+        } description: {
+            if let detail { Text(detail).foregroundStyle(Color(nsColor: MSEStyle.secondary)) }
+        } actions: {
+            ForEach(actions) { action in
+                Button(action.title) { action.run() }.buttonStyle(.bordered)
+            }
+        }
+        .padding(.horizontal, MSEStyle.contentInset)
+    }
+}
+
+/// The one empty state of the native views, for AppKit code: put it over the area that would be empty, pinned to its
+/// four edges (it centres its own content), and call show(...) with an icon, a short title, one line and the buttons.
+/// Hidden until shown; set isHidden = true to take it away. Used by the search results (SearchView) for "No matches",
+/// "Name index not ready" and the search errors.
+@MainActor
+final class EmptyStateView: NSView {
+    private let host = NSHostingView(rootView: EmptyStateContent())
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        // The view is pinned to its parent's edges, so the SwiftUI content must not ask the window for a size.
+        host.sizingOptions = []
+        host.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(host)
+        NSLayoutConstraint.activate([
+            host.topAnchor.constraint(equalTo: topAnchor),
+            host.bottomAnchor.constraint(equalTo: bottomAnchor),
+            host.leadingAnchor.constraint(equalTo: leadingAnchor),
+            host.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
         isHidden = true
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
 
-    func show(title: String, detail: String?, actions list: [(String, () -> Void)]) {
-        titleLabel.stringValue = title
-        detailLabel.stringValue = detail ?? ""
-        detailLabel.isHidden = detail == nil
-        buttons.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        actions = list.map { $0.1 }
-        for (i, item) in list.enumerated() {
-            let b = NSButton(title: item.0, target: self, action: #selector(pressed(_:)))
-            b.bezelStyle = .rounded
-            b.tag = i
-            buttons.addArrangedSubview(b)
-        }
-        buttons.isHidden = list.isEmpty
+    /// Shows the state. `symbol` is an SF Symbol name; `detail` is one line (nil for none); each action is a button.
+    func show(symbol: String, title: String, detail: String?, actions list: [(String, () -> Void)]) {
+        host.rootView = EmptyStateContent(
+            symbol: symbol, title: title, detail: detail,
+            actions: list.enumerated().map { EmptyStateAction(id: $0.offset, title: $0.element.0, run: $0.element.1) })
         isHidden = false
-    }
-
-    @objc private func pressed(_ sender: NSButton) {
-        guard sender.tag >= 0, sender.tag < actions.count else { return }
-        actions[sender.tag]()
     }
 }
 
-/// The header row of the Content matches section: a chevron, the title and what state the section is in. A click
-/// on the row, Return, or the arrow keys open and close it.
+/// A text column cell of the results table (Folder, Size, Date, Match). The Folder column is secondary text: the token,
+/// and white on a selected row (a custom colour is not swapped for white by AppKit, as the system label colours are).
+@MainActor
+private final class TextColumnCell: NSTableCellView {
+    var isSecondary = false { didSet { recolor() } }
+
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet { recolor() }
+    }
+
+    private func recolor() {
+        textField?.textColor = isSecondary ? MSEStyle.secondary(on: backgroundStyle) : nil
+    }
+}
+
+/// The header row of the Content matches section: a chevron (when the section can be closed) and one label in the
+/// same style as the File names header ("Content matches · 4", plus what state the section is in). A click on the
+/// row, Return, or the arrow keys open and close it. No band: only a selected header is highlighted.
 @MainActor
 private final class SectionHeaderCell: NSTableCellView {
     let title = NSTextField(labelWithString: "")
-    let tail = NSTextField(labelWithString: "")
     let chevron = NSImageView()
 
     override var backgroundStyle: NSView.BackgroundStyle {
@@ -377,11 +702,10 @@ private final class SectionHeaderCell: NSTableCellView {
 
     init() {
         super.init(frame: .zero)
-        title.font = .systemFont(ofSize: 10, weight: .semibold)
-        tail.font = .systemFont(ofSize: 11)
-        tail.lineBreakMode = .byTruncatingTail
+        title.font = MSEStyle.sectionHeaderFont
+        title.lineBreakMode = .byTruncatingTail
         chevron.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 9, weight: .bold)
-        for v in [chevron, title, tail] as [NSView] {
+        for v in [chevron, title] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
         }
@@ -391,12 +715,10 @@ private final class SectionHeaderCell: NSTableCellView {
             chevron.centerYAnchor.constraint(equalTo: centerYAnchor),
             chevron.widthAnchor.constraint(equalToConstant: 10),
             title.leadingAnchor.constraint(equalTo: chevron.trailingAnchor, constant: 6),
+            title.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
             title.centerYAnchor.constraint(equalTo: centerYAnchor),
-            tail.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 8),
-            tail.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
-            tail.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
-        title.setContentCompressionResistancePriority(.required, for: .horizontal)
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         recolor()
     }
 
@@ -404,8 +726,7 @@ private final class SectionHeaderCell: NSTableCellView {
 
     private func recolor() {
         let emphasized = backgroundStyle == .emphasized
-        title.textColor = emphasized ? .alternateSelectedControlTextColor : .secondaryLabelColor
-        tail.textColor = emphasized ? .alternateSelectedControlTextColor : .tertiaryLabelColor
+        title.textColor = emphasized ? .alternateSelectedControlTextColor : MSEStyle.secondary
         chevron.contentTintColor = title.textColor
     }
 }
@@ -419,6 +740,10 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         case file(SearchItem)
         case content(ContentHit)
         case pick(PickItem)
+        /// Mac mode's On this Mac section: its header, one whole-disk hit, and the "Show more" row after the last one listed.
+        case diskHeader
+        case disk(DiskHit)
+        case diskMore
     }
 
     /// Where the content matches stand: not asked for, on their way, in, or failed.
@@ -452,7 +777,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     private(set) var library: IndexedLibrary?
 
     private let banner = NSTextField(wrappingLabelWithString: "")
-    private let emptyState = SearchEmptyState()
+    private let emptyState = EmptyStateView()
     private let table = SearchTable()
     private let scroll = NSScrollView()
     private let bytes: ByteCountFormatter = { let f = ByteCountFormatter(); f.countStyle = .file; return f }()
@@ -471,9 +796,22 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
 
     private var generation = 0
     private var nameLoading = false
+    /// The second page of names is on its way (the first is on screen).
+    private var moreLoading = false
+    /// A name was dropped by the globs the operators cannot say, so the total from the service no longer counts what is listed.
+    private var namesFilteredOut = false
+    private var debounce = SearchDebounce()
+    /// The first page of names, and the most names one search lists (the first page plus one more request).
+    private static let firstPageSize = 50
+    private static let namesCap = 200
+    /// Colour tags read so far, by path. Cleared with every new search; it keeps the dots from blinking when the table reloads.
+    private var tagCache: [String: [TagColor]] = [:]
+    /// Tag reads that are still running off the main thread (the snapshot waits on them, see isLoading).
+    private var tagLoadsPending = 0
     private var contentState: ContentState = .idle
     private var contentLoadedGen = -1                // the generation the content matches on screen belong to
-    private var resultCount: Int?
+    /// The names the service counted for this search (the total, not only the page on screen). nil = not asked or unknown.
+    private var nameTotal: Int?
     private var resultMs: Int?
     private var crawling = false
     private var progress: Double = 0
@@ -488,6 +826,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     private var namesUnavailable = false
     /// Why there is nothing to list: the service did not answer (retry helps) or the text is not a complete query.
     private var errorText: String?
+    private var errorTitle = ""          // the short title that goes with errorText in the empty state
     private var errorRetry = false
 
     private var nameTask: Task<Void, Never>?
@@ -495,6 +834,19 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     private var statusTask: Task<Void, Never>?
     private var recentTask: Task<Void, Never>?
     private var aliasTask: Task<Void, Never>?
+    private var diskTask: Task<Void, Never>?
+    /// The On this Mac section (Mac mode): the whole-disk hits of the query and their paging. diskUnavailable is set when the
+    /// service has no whole-disk search; the section is then not shown, and no error is.
+    private var diskHits: [DiskHit] = []
+    private var diskState: ContentState = .idle
+    private var diskNext: Int?
+    private var diskHasMore = false
+    private var diskMoreLoading = false
+    private var diskUnavailable = false
+    private(set) var diskExpanded = true
+    private var diskObserver: NSObjectProtocol?
+    /// The hits per page of the On this Mac section ("Show more" loads the next page).
+    static let diskPageSize = 5
     private var previewURLs: [URL] = []
 
     // Where to search, and what to search for, per window.
@@ -513,6 +865,11 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     /// The filters of this window (kept per window: each main window has its own search view).
     private(set) var filters = SearchFilters()
     private let filterBar = SearchFilterBar()
+    /// The Timeline view of the Indexed scope (TimelineView.swift), shown in place of the results with the Timeline switch.
+    private let timeline = TimelineView()
+    private(set) var showingTimeline = false
+    /// Snapshot hook: the timeline is shown as soon as the next search text lands (it comes in asynchronously).
+    private var showTimelineOnRun = false
     private let facetRow = FacetRow()
     private let alsoLabel = NSTextField(labelWithString: "")
     /// The facets and bridge terms of the last content search, and whether the re-ranked list is on screen.
@@ -523,26 +880,83 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     private var refining = false
     private var dateSheet: DateRangeSheet?
 
-    /// True while a name or content request is in flight (the snapshot waits on this).
-    var isLoading: Bool { nameLoading || contentState == .loading || refining }
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        fitColumns()
+    }
+
+    /// Each column's preferred width: the width it takes when there is room. fitColumns starts every layout pass from these,
+    /// so a window that was narrowed and is then widened gives the columns their widths back. A column the user drags to a
+    /// new width takes that width as its preference (columnResized).
+    private var preferredWidths: [String: CGFloat] = [:]
+    /// fitColumns is setting widths itself (its own changes are not the user's).
+    private var fittingColumns = false
+
+    /// Fits the columns to the room, on every layout pass, from their preferred widths. With room to spare, Name takes
+    /// the rest. When the columns do not fit (in a narrow window they used to run past the right edge, Date Modified and Kind
+    /// cut off, no scroller), take the width back in this order: Folder down to its minimum, Name down to 220 pt (room for
+    /// a title and a snippet), then Date Modified, Kind and Size to their minimums, and Name last.
+    private func fitColumns() {
+        let available = scroll.contentSize.width
+        guard available > 200 else { return }
+        let cols = table.tableColumns
+        let spacing = table.intercellSpacing.width * CGFloat(cols.count)
+        var width: [String: CGFloat] = [:]
+        for c in cols {
+            let id = c.identifier.rawValue
+            width[id] = max(c.minWidth, preferredWidths[id] ?? c.width)
+        }
+        var over = width.values.reduce(spacing, +) - available
+        if over < 0 {
+            width["name", default: 0] -= over             // room to spare: Name takes it
+        } else {
+            let steps: [(String, CGFloat?)] = [("folder", nil), ("name", 220), ("date", nil), ("kind", nil), ("size", nil), ("name", nil)]
+            for (id, floor) in steps where over > 0 {
+                guard let c = table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier(id)), let w = width[id] else { continue }
+                let cut = min(over, max(0, w - max(c.minWidth, floor ?? 0)))
+                if cut > 0 { width[id] = w - cut; over -= cut }
+            }
+        }
+        fittingColumns = true
+        defer { fittingColumns = false }
+        for c in cols {
+            if let w = width[c.identifier.rawValue], abs(c.width - w) > 0.5 { c.width = w }
+        }
+    }
+
+    /// The user dragged a column's edge: that width is the column's preference from now on. AppKit's own width changes (the
+    /// table autoresizing Name, fitColumns) are not recorded: only the column whose edge is being dragged, and not our own.
+    private func columnResized(_ n: Notification) {
+        guard !fittingColumns, let header = table.headerView, header.resizedColumn >= 0,
+              header.resizedColumn < table.tableColumns.count,
+              let col = n.userInfo?["NSTableColumn"] as? NSTableColumn,
+              table.tableColumns[header.resizedColumn] === col else { return }
+        preferredWidths[col.identifier.rawValue] = col.width
+    }
+
+    /// True while a name or content request is in flight, or a colour tag is still being read (the snapshot waits on this,
+    /// so a render never catches the dots half way).
+    var isLoading: Bool { nameLoading || moreLoading || tagLoadsPending > 0 || contentState == .loading || refining || timeline.isLoading || diskState == .loading || diskMoreLoading }
 
     override func loadView() {
         view = NSView()
-        // Name and Folder are flexible (they share any extra width); Size, Date Modified and Kind keep their width.
+        // Name takes any extra width, so a title and its snippet get the room; Folder, Size, Date Modified and Kind keep
+        // theirs (fitColumns takes width back from them, Folder first, when the window is narrow, and gives it back).
         let column: (String, String, CGFloat, CGFloat, Bool) -> NSTableColumn = { id, title, width, min, sortable in
             let c = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
             c.title = title
             c.width = width
+            self.preferredWidths[id] = width
             c.minWidth = min
-            c.resizingMask = (id == "name" || id == "folder") ? [.userResizingMask, .autoresizingMask] : .userResizingMask
+            c.resizingMask = id == "name" ? [.userResizingMask, .autoresizingMask] : .userResizingMask
             if sortable { c.sortDescriptorPrototype = NSSortDescriptor(key: id, ascending: true) }
             return c
         }
-        table.addTableColumn(column("name", "Name", 340, 160, true))
-        table.addTableColumn(column("folder", "Folder", 300, 120, true))
-        table.addTableColumn(column("size", "Size", 84, 60, true))
-        table.addTableColumn(column("date", "Date Modified", 180, 120, true))
-        table.addTableColumn(column("kind", "Kind", 120, 80, true))
+        table.addTableColumn(column("name", "Name", 380, 160, true))
+        table.addTableColumn(column("folder", "Folder", 200, 100, true))
+        table.addTableColumn(column("size", "Size", 76, 60, true))
+        table.addTableColumn(column("date", "Date Modified", 160, 120, true))
+        table.addTableColumn(column("kind", "Kind", 100, 80, true))
         table.style = .fullWidth
         table.rowHeight = 20
         table.intercellSpacing = NSSize(width: 8, height: 0)
@@ -552,6 +966,9 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         table.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
         table.dataSource = self
         table.delegate = self
+        NotificationCenter.default.addObserver(forName: NSTableView.columnDidResizeNotification, object: table, queue: .main) { [weak self] n in
+            MainActor.assumeIsolated { self?.columnResized(n) }
+        }
         table.target = self
         table.doubleAction = #selector(doubleClicked(_:))
         table.onKey = { [weak self] event in self?.handleKey(event) ?? false }
@@ -568,13 +985,13 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
         banner.font = .systemFont(ofSize: 11)
-        banner.textColor = .secondaryLabelColor
+        banner.textColor = MSEStyle.secondary
         banner.isHidden = true
         banner.translatesAutoresizingMaskIntoConstraints = false
         emptyState.translatesAutoresizingMaskIntoConstraints = false
 
         alsoLabel.font = .systemFont(ofSize: 11)
-        alsoLabel.textColor = .secondaryLabelColor
+        alsoLabel.textColor = MSEStyle.secondary
         alsoLabel.lineBreakMode = .byTruncatingTail
         alsoLabel.isHidden = true
         alsoLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -583,6 +1000,15 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         filterBar.onClear = { [weak self] in self?.clearFilters() }
         filterBar.onEscape = { [weak self] in self?.onEscape?() }
         filterBar.onScopeButton = { [weak self] in self?.toggleScopePicker() }
+        filterBar.onDocChange = { [weak self] change in self?.docChanged(change) }
+        filterBar.onViewChoice = { [weak self] on in self?.setTimelineShown(on) }
+        filterBar.onSaveSearch = { [weak self] in self?.saveSearchPressed() }
+        timeline.translatesAutoresizingMaskIntoConstraints = false
+        timeline.isHidden = true
+        timeline.onRun = { [weak self] text, type in self?.timelineRan(text, type: type) }
+        NotificationCenter.default.addObserver(forName: SavedSearchStore.picked, object: nil, queue: .main) { [weak self] n in
+            MainActor.assumeIsolated { self?.savedPicked(n) }
+        }
         filterBar.onSourcesChanged = { [weak self] names, contents, fromNames in
             self?.sourcesChanged(names: names, contents: contents, fromNames: fromNames)
         }
@@ -595,6 +1021,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         header.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(header)
         view.addSubview(scroll)
+        view.addSubview(timeline)
         view.addSubview(emptyState)
         NSLayoutConstraint.activate([
             header.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
@@ -604,9 +1031,14 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
             scroll.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-            emptyState.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            emptyState.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
-            emptyState.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, constant: -48),
+            timeline.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
+            timeline.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            timeline.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            timeline.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            emptyState.topAnchor.constraint(equalTo: scroll.topAnchor),
+            emptyState.bottomAnchor.constraint(equalTo: scroll.bottomAnchor),
+            emptyState.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            emptyState.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
         ])
         refreshScopeUI()
     }
@@ -636,7 +1068,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     func snapshotOpenCustomDate() { showDateSheet() }
 
     /// The custom range sheet, for the snapshot (a separate window, composited into the main window's picture).
-    var openSheet: NSWindow? { dateSheet?.sheetPanel }
+    var openSheet: NSWindow? { filterBar.openDocSheet ?? dateSheet?.sheetPanel }
 
     /// The library (collections and groups), for the Indexed picker and the scope button.
     func setLibrary(_ lib: IndexedLibrary) {
@@ -667,21 +1099,46 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     /// Runs `text` as the query. Empty text cancels the search; in Indexed mode it shows the picker.
     func run(_ text: String) {
         query = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if diskObserver == nil {
+            // The whole-disk settings were read or saved: the section follows them (WholeDiskStore, SettingsWholeDisk.swift).
+            diskObserver = NotificationCenter.default.addObserver(forName: .wholeDiskChanged, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.wholeDiskChanged() }
+            }
+        }
+        // the document filters of the text, in their pop-ups (the answer's own filters replace them when it lands)
+        filterBar.setDocs(DocQuery.parse(query))
+        filterBar.setCanSave(!query.isEmpty)
+        // a new search that is typed while the timeline is on shows the results
+        if showingTimeline && !query.isEmpty { setTimelineShown(false) }
+        if showTimelineOnRun && !query.isEmpty { showTimelineOnRun = false; setTimelineShown(true) }
         let parsed = ScopeShortcut.parse(query, catalog: catalog)
         shortcut = parsed.found ? parsed : nil
         shortcutUnknown = parsed.unknown
         generation += 1
         let gen = generation
+        // Leading edge: nil = this keystroke searches at once (see SearchDebounce). Every call is stamped, early returns included.
+        let wait = debounce.delay(for: query, now: DispatchTime.now().uptimeNanoseconds)
         nameTask?.cancel()
         contentTask?.cancel()
         recentTask?.cancel()
         nameLoading = false
+        moreLoading = false
+        namesFilteredOut = false
+        tagCache.removeAll()
+        diskTask?.cancel()
+        diskState = .idle
+        diskHits = []
+        diskNext = nil
+        diskHasMore = false
+        diskMoreLoading = false
         contentState = .idle
         refining = false
         reranked = false
         facets = nil
+        filterBar.setDocCounts([:])
         bridgeTerms = []
         errorText = nil
+        errorTitle = ""
         errorRetry = false
         namesUnavailable = false
         facetRow.update(nil, filters: filters)
@@ -690,7 +1147,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         guard !query.isEmpty else {
             fileItems = []
             contentHits = []
-            resultCount = nil
+            nameTotal = nil
             resultMs = nil
             fallback = false
             setBanner(nil)
@@ -711,29 +1168,32 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         if let sc = shortcut, sc.rest.isEmpty {
             fileItems = []
             contentHits = []
-            resultCount = nil
+            nameTotal = nil
             resultMs = nil
             fallback = false
             setBanner(nil)
             errorText = "Searching \(catalog.description(for: shownChoice)). Now type what to look for."
+            errorTitle = "Ready to search"
             errorRetry = false
             rebuild()
             return
         }
         let q = query
+        startDisk(q, gen)
         if !contentsOpen { contentHits = [] }
         if wantNames {
             nameLoading = true
-            // The query is sent after 40 ms of quiet, so typing fast sends one request per pause.
+            // The first keystroke after a pause is sent at once; the keystrokes of a burst wait 40 ms for the next one, so
+            // typing fast sends the first and then one request after the last. A re: query only waits (250 ms).
             nameTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 40_000_000)
+                if let wait { try? await Task.sleep(nanoseconds: wait) }
                 guard let self, !Task.isCancelled, gen == self.generation else { return }
                 await self.fetchNames(q, gen)
             }
         } else {
             // Contents only: no name request at all.
             fileItems = []
-            resultCount = nil
+            nameTotal = nil
             resultMs = nil
             fallback = false
             setBanner(nil)
@@ -764,7 +1224,18 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     /// File names are searched in the Whole Mac scope always, in the indexed scope when the box is ticked.
-    private var wantNames: Bool { activeScope == .mac || namesOn }
+    private var wantNames: Bool { activeScope == .mac || (namesOn && !DocQuery.parse(query).isActive) }
+
+    /// The On this Mac section is asked for in Mac mode, while the settings turn whole-disk search on and the service has it.
+    private var wantDisk: Bool { activeScope == .mac && WholeDiskStore.shared.enabled && !diskUnavailable }
+
+    /// The hits not already listed as file names above: a file found both ways is listed once, as a name.
+    private var visibleDiskHits: [DiskHit] { diskHits.filter { !namePaths.contains($0.path) } }
+
+    /// The section is on screen: asked for, on its way, failed, or with hits to list.
+    private var diskSectionVisible: Bool {
+        wantDisk && !query.isEmpty && (diskState == .loading || diskState == .failed || !visibleDiskHits.isEmpty)
+    }
 
     /// Contents are searched in the indexed scope when the box is ticked.
     private var wantContents: Bool { activeScope == .indexed && contentsOn }
@@ -785,7 +1256,8 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         let c = shownChoice
         filterBar.setScope(title: catalog.label(for: c), symbol: catalog.symbol(for: c),
                            tooltip: "Searching " + catalog.description(for: c) + ".", fromQuery: shortcut != nil)
-        filterBar.setSources(names: namesOn, contents: contentsOn, macScope: activeScope == .mac)
+        filterBar.setSources(names: namesOn, contents: contentsOn, macScope: activeScope == .mac,
+                             namesOff: activeScope == .indexed && DocQuery.parse(query).isActive)
         if scopePopover?.isShown == true { scopePopover?.picker.update(catalog: catalog, choice: c) }
     }
 
@@ -820,7 +1292,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         refreshScopeUI()
         guard !query.isEmpty else { return }
         if n && namesWereOff { run(query); return }                   // the names were never asked for
-        if !n { nameTask?.cancel(); nameLoading = false }              // contents only from here on
+        if !n { nameTask?.cancel(); nameLoading = false; moreLoading = false }   // contents only from here on
         if !c {
             contentTask?.cancel()
             contentState = .idle
@@ -858,6 +1330,102 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         }
     }
 
+    // MARK: On this Mac (Mac mode: the whole-disk hits)
+
+    /// Asks the whole-disk service for the first page of the query of generation `gen`. Mac mode only, and only while the
+    /// settings turn it on. A newer query cancels it. A 404 means the service has no whole-disk search: the section is not
+    /// shown, and that is not an error.
+    private func startDisk(_ q: String, _ gen: Int) {
+        diskTask?.cancel()
+        diskTask = nil
+        diskMoreLoading = false
+        WholeDiskStore.shared.ensureFresh()
+        guard wantDisk, !q.isEmpty else { diskState = .idle; diskHits = []; return }
+        diskState = .loading
+        diskTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let page = try await MSEClient.shared.diskSearch(q, limit: SearchViewController.diskPageSize, offset: 0)
+                guard gen == self.generation, !Task.isCancelled else { return }
+                self.diskHits = page.items
+                self.diskHasMore = page.hasMore
+                self.diskNext = page.nextOffset
+                self.diskState = .loaded
+                self.diskTask = nil
+                self.rebuild()
+            } catch {
+                guard gen == self.generation, !Task.isCancelled else { return }
+                self.diskTask = nil
+                if let api = error as? APIError, case .http(404) = api {
+                    self.diskUnavailable = true
+                    self.diskState = .idle
+                } else {
+                    self.diskState = .failed
+                }
+                self.rebuild()
+            }
+        }
+        rebuild()
+    }
+
+    /// "Show more" in the On this Mac section: the next page, appended without the names already listed.
+    private func loadMoreDisk() {
+        guard diskHasMore, !diskMoreLoading, diskTask == nil, let next = diskNext else { return }
+        let q = query
+        let gen = generation
+        diskMoreLoading = true
+        rebuild()
+        diskTask = Task { [weak self] in
+            guard let self else { return }
+            let fetched = try? await MSEClient.shared.diskSearch(q, limit: SearchViewController.diskPageSize, offset: next)
+            guard gen == self.generation, !Task.isCancelled else { return }
+            if let page = fetched {
+                let seen = Set(self.diskHits.map { $0.path })
+                self.diskHits += page.items.filter { !seen.contains($0.path) }
+                self.diskHasMore = page.hasMore
+                self.diskNext = page.nextOffset
+            }
+            self.diskMoreLoading = false
+            self.diskTask = nil
+            self.rebuild()
+        }
+    }
+
+    /// The settings were read or saved: the section is asked again for the query on the screen.
+    private func wholeDiskChanged() {
+        diskUnavailable = false
+        guard !query.isEmpty else { return }
+        startDisk(query, generation)
+    }
+
+    /// The header of the section: a click or Return opens and closes it, and retries after a failure.
+    private func activateDiskHeader() {
+        if diskState == .failed, !query.isEmpty { startDisk(query, generation); return }
+        diskExpanded.toggle()
+        rebuild()
+    }
+
+    private var diskHeaderText: String {
+        let n = visibleDiskHits.count
+        let count = counts.string(from: NSNumber(value: n)) ?? "\(n)"
+        let tail: String
+        switch diskState {
+        case .loading: tail = "searching…"
+        case .failed: tail = "could not load · click to try again"
+        default: tail = diskExpanded ? count : (n > 0 ? count + " · click to show" : "click to show")
+        }
+        return "Contents on this Mac · " + tail
+    }
+
+    private func diskHeaderCell() -> NSView {
+        let cell = SectionHeaderCell()
+        cell.title.stringValue = diskHeaderText
+        let symbol = diskState == .failed ? "arrow.clockwise" : (diskExpanded ? "chevron.down" : "chevron.right")
+        cell.chevron.image = NSImage(systemSymbolName: symbol, accessibilityDescription: diskExpanded ? "Expanded" : "Collapsed")
+        cell.toolTip = "Click, or press Return, to show or hide the matches on this Mac. Hidden, they are not listed."
+        return cell
+    }
+
     /// The header row: open and close, or retry after a failure.
     private func activateContentHeader() {
         if contentState == .failed, !query.isEmpty {
@@ -869,9 +1437,20 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
 
     /// A click on the Content matches header row (the table asks before it selects).
     private func headerClicked(_ row: Int) -> Bool {
-        guard row >= 0, row < rows.count, case .contentHeader = rows[row] else { return false }
-        if (NSApp.currentEvent?.clickCount ?? 1) <= 1 { activateContentHeader() }
-        return true
+        guard row >= 0, row < rows.count else { return false }
+        switch rows[row] {
+        case .contentHeader:
+            if (NSApp.currentEvent?.clickCount ?? 1) <= 1 { activateContentHeader() }
+            return true
+        case .diskHeader:
+            if (NSApp.currentEvent?.clickCount ?? 1) <= 1 { activateDiskHeader() }
+            return true
+        case .diskMore:
+            loadMoreDisk()
+            return true
+        default:
+            return false
+        }
     }
 
     // MARK: jumps (⌃1, ⌃2, ⌃3)
@@ -884,6 +1463,11 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
 
     /// ⌃2: the Content matches section; it opens if it was closed.
     func jumpToContents() {
+        if diskSectionVisible {
+            if !diskExpanded { activateDiskHeader() }
+            if let i = rows.firstIndex(where: { if case .diskHeader = $0 { return true }; return false }) { select(row: i) }
+            return
+        }
         guard contentSectionVisible else { return }
         if contentsCollapsible && !contentsExpanded { setContentsExpanded(true) }
         let first = rows.firstIndex(where: { if case .content = $0 { return true }; return false })
@@ -906,7 +1490,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
 
     private func fetchNames(_ q: String, _ gen: Int) async {
         let started = Date()
-        var items = [URLQueryItem(name: "q", value: nameQuery(q)), URLQueryItem(name: "limit", value: "200"),
+        var items = [URLQueryItem(name: "q", value: nameQuery(q)), URLQueryItem(name: "limit", value: String(Self.firstPageSize)),
                      URLQueryItem(name: "scope", value: activeScope == .mac ? "mac" : "indexed")]
         if activeScope == .indexed, let c = scopeParameter {
             items.append(URLQueryItem(name: "c", value: c))
@@ -928,7 +1512,8 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
             namesUnavailable = false
             let parsed = ((dict["items"] as? [[String: Any]]) ?? []).compactMap(SearchItem.parse)
             fileItems = parsed.filter { filters.keeps(path: $0.path) }     // the globs the operators cannot say
-            resultCount = fileItems.count == parsed.count ? ((dict["total"] as? NSNumber)?.intValue ?? fileItems.count) : fileItems.count
+            namesFilteredOut = fileItems.count != parsed.count
+            nameTotal = namesFilteredOut ? fileItems.count : ((dict["total"] as? NSNumber)?.intValue ?? fileItems.count)
             resultMs = (dict["ms"] as? NSNumber)?.intValue
             fallback = false
             setBanner(nil)
@@ -939,40 +1524,77 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
             if contentsOpen { startContent(q, gen, delay: 220) }
             refreshStatus()
             scheduleRecent(gen)
+            // The rest of the list, in the same task: a newer search cancels both requests.
+            if let more = Self.nextNamesPage(dict) { await fetchMoreNames(items, more, gen) }
         } catch let APIError.http(code) where code == 404 {
             guard gen == generation, !Task.isCancelled else { return }
             await namesNotReady(q, gen, started, reason: .notInstalled)
         } catch let APIError.http(code) where code == 400 {
             // The service refuses a query it cannot read: an unfinished operator, or a name after in: it does not know.
             guard gen == generation, !Task.isCancelled else { return }
-            fail(queryProblem(), retry: false)
+            let problem = queryProblem()
+            fail(title: problem.title, message: problem.message, retry: false)
         } catch {
             guard gen == generation, !Task.isCancelled else { return }
-            fail("The search service did not answer.", retry: true)
+            fail(title: "Search unavailable", message: "The search service did not answer.", retry: true)
         }
     }
 
+    /// Whether the answer of the first page says there is more to fetch, and the page to ask for: the service's own
+    /// next_offset, and the rest of the 200 names as the limit. Nil when the list is complete, when it is already as long
+    /// as the 200, or when the first page was not the one asked for (a limit: operator in the text sets its own length).
+    private static func nextNamesPage(_ dict: [String: Any]) -> (offset: Int, limit: Int)? {
+        guard (dict["has_more"] as? Bool) == true,
+              (dict["limit"] as? NSNumber)?.intValue == firstPageSize,
+              let next = (dict["next_offset"] as? NSNumber)?.intValue, next > 0, next < namesCap else { return nil }
+        return (next, namesCap - next)
+    }
+
+    /// The second request: the names after the first page, appended to the list. The first page stays on screen whatever
+    /// happens here: a failed or cancelled request adds nothing and says nothing.
+    private func fetchMoreNames(_ first: [URLQueryItem], _ page: (offset: Int, limit: Int), _ gen: Int) async {
+        moreLoading = true
+        defer { if gen == generation { moreLoading = false } }
+        let items = first.filter { $0.name != "limit" }
+            + [URLQueryItem(name: "offset", value: String(page.offset)), URLQueryItem(name: "limit", value: String(page.limit))]
+        guard let obj = try? await MSEClient.shared.get("/api/files/search", query: items),
+              gen == generation, !Task.isCancelled,
+              let dict = obj as? [String: Any], (dict["searchable"] as? Bool) != false else { return }
+        let parsed = ((dict["items"] as? [[String: Any]]) ?? []).compactMap(SearchItem.parse)
+        let kept = parsed.filter { filters.keeps(path: $0.path) }
+        if kept.count != parsed.count { namesFilteredOut = true }
+        var seen = Set(fileItems.map { $0.path })                      // a path is listed once, whatever the service sends
+        let fresh = kept.filter { seen.insert($0.path).inserted }
+        fileItems += fresh                                             // may be empty: the count below still has to follow the filters
+        nameTotal = namesFilteredOut ? fileItems.count : ((dict["total"] as? NSNumber)?.intValue ?? fileItems.count)
+        moreLoading = false
+        rebuild()
+    }
+
     /// Nothing can be listed: say why (empty state), keep the section state honest.
-    private func fail(_ message: String, retry: Bool) {
+    private func fail(title: String, message: String, retry: Bool) {
         nameLoading = false
+        moreLoading = false
         fileItems = []
         contentHits = []
         contentState = .idle
-        resultCount = nil
+        nameTotal = nil
         resultMs = nil
         errorText = message
+        errorTitle = title
         errorRetry = retry
         setBanner(nil)
         rebuild()
     }
 
-    private func queryProblem() -> String {
+    private func queryProblem() -> (title: String, message: String) {
         if !shortcutUnknown.isEmpty {
             let known = catalog.folders.map { $0.name } + catalog.groups.map { $0.name }
             let names = shortcutUnknown.joined(separator: ", ")
-            return "No folder or group called “\(names)” after in:" + (known.isEmpty ? "." : ". Known: " + known.joined(separator: ", ") + ".")
+            return ("Unknown folder",
+                    "No folder or group called “\(names)” after in:" + (known.isEmpty ? "." : ". Known: " + known.joined(separator: ", ") + "."))
         }
-        return "The search text is not a complete query yet (an operator, or a name after in:, is unfinished)."
+        return ("Incomplete query", "An operator, or a name after in:, is not finished yet.")
     }
 
     /// The name index cannot answer now (not installed, still being built, switched off).
@@ -985,7 +1607,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         if activeScope == .indexed {
             fallback = false
             fileItems = []
-            resultCount = nil
+            nameTotal = nil
             resultMs = nil
             nameLoading = false
             namesUnavailable = true
@@ -1035,7 +1657,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
             fileItems = results.compactMap(SearchItem.fromHybrid).filter { seen.insert($0.path).inserted }
             contentHits = []
             contentState = .idle
-            resultCount = fileItems.count
+            nameTotal = fileItems.count
             resultMs = Int(Date().timeIntervalSince(started) * 1000)
             nameLoading = false
             rebuild()
@@ -1044,7 +1666,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
             guard gen == generation, !Task.isCancelled else { return }
             nameLoading = false
             fileItems = []
-            resultCount = 0
+            nameTotal = 0
             setBanner("The file-name index is not ready, and the indexed folders did not answer.")
             rebuild()
         }
@@ -1075,7 +1697,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         }
         let terms = SnippetText.terms(from: cq)
         // The request is the web's: q, c, limit, then the filter parameters (mode, type, after, before, include, exclude).
-        let items = [URLQueryItem(name: "q", value: cq), URLQueryItem(name: "c", value: scopeParameter ?? "all"),
+        let items = [URLQueryItem(name: "q", value: DocQuery.forServer(cq)), URLQueryItem(name: "c", value: scopeParameter ?? "all"),
                      URLQueryItem(name: "limit", value: "20")] + filters.contentParameters()
         contentTask = Task { [weak self] in
             if delay > 0 { try? await Task.sleep(nanoseconds: delay * 1_000_000) }
@@ -1087,6 +1709,8 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
                 self.contentHits = ((dict["results"] as? [[String: Any]]) ?? []).compactMap { ContentHit.parse($0, terms: terms) }
                 self.facets = (dict["facets"] as? [String: Any]).flatMap(SearchFacets.init)
                 self.bridgeTerms = SearchViewController.bridgeList(dict["bridge"])
+                if let applied = dict["filters"] as? [String: Any] { self.filterBar.setDocs(DocFilters(serverFilters: applied)) }
+                self.filterBar.setDocCounts(Dictionary((self.facets?.doctypes ?? []).map { ($0.type, $0.count) }, uniquingKeysWith: { a, _ in a }))
                 self.contentState = .loaded
                 self.contentLoadedGen = gen
                 self.facetRow.update(self.facets, filters: self.filters)
@@ -1110,7 +1734,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     private func refine(_ items: [URLQueryItem], _ gen: Int, before: [String], terms: [String]) async {
         guard wantContents else { return }
         refining = true
-        defer { refining = false }
+        defer { refining = false; rebuild() }
         rebuild()
         do {
             let obj = try await MSEClient.shared.get("/api/search", query: items + [URLQueryItem(name: "precise", value: "1")])
@@ -1151,7 +1775,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     private func updateAlso() {
         guard contentSectionVisible, !showingPicker, !bridgeTerms.isEmpty else { alsoLabel.isHidden = true; return }
         let s = NSMutableAttributedString(string: "Also searched: ",
-                                          attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor])
+                                          attributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: MSEStyle.secondary])
         s.append(NSAttributedString(string: bridgeTerms.joined(separator: " · "),
                                     attributes: [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.controlAccentColor]))
         alsoLabel.attributedStringValue = s
@@ -1161,6 +1785,87 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     /// The name query sent to /api/files/search: the typed text plus the Mac operators of the filters.
     private func nameQuery(_ q: String) -> String {
         (([q] + filters.macOperators()).joined(separator: " ")).trimmingCharacters(in: .whitespaces)
+    }
+
+    // MARK: document filters (the search text is their source)
+
+    /// Sets the search text, as if typed in the toolbar field (the field runs the search).
+    private func setQueryText(_ text: String) {
+        onRequestQuery?(text)
+    }
+
+    /// A document pop-up or the party field changed: its operators are rewritten in the text, and the search runs again.
+    private func docChanged(_ change: DocChange) {
+        let group: DocQuery.Group
+        let new: [String]
+        switch change {
+        case .types(let t): group = .type; new = DocQuery.typeOperators(t)
+        case .amount(let a): group = .amount; new = a.operators
+        case .currency(let c): group = .currency; new = DocQuery.currencyOperators(c)
+        case .party(let p): group = .party; new = DocQuery.partyOperators(p)
+        case .docdate(let d): group = .docdate; new = DocQuery.docdateOperators(d)
+        }
+        let text = DocQuery.replacing(query, group: group, with: new)
+        if text == query { filterBar.setDocs(DocQuery.parse(query)); return }
+        setQueryText(text)
+    }
+
+    /// Snapshot hook: the Timeline is shown once the next search text is set (see the timeline state, Snapshot.swift).
+    func snapshotShowTimelineOnRun() { showTimelineOnRun = true }
+
+    /// Results (false) or Timeline (true). The timeline is for the Indexed scope's folders, and takes the document type
+    /// the text names (the results keep the search text).
+    private func setTimelineShown(_ on: Bool) {
+        showingTimeline = on
+        filterBar.setView(timeline: on)
+        scroll.isHidden = on
+        timeline.isHidden = !on
+        if on {
+            emptyState.isHidden = true
+            timeline.load(scope: scopeParameter, type: DocQuery.parse(query).types.first)
+        } else {
+            updateEmptyNote()
+        }
+        onStatus?(statusText())
+    }
+
+    /// A month of the timeline was clicked: the search for that month and type (its own text), with the kind reset, because
+    /// a file kind in the URL would narrow the months.
+    private func timelineRan(_ text: String, type: DocType?) {
+        setTimelineShown(false)
+        var f = filters
+        f.kind = .any
+        filters = f
+        filterBar.show(f)
+        setQueryText(text)
+    }
+
+    /// A saved search was clicked in the sidebar (SavedSearches.swift): its text and folders run in Indexed mode, and its
+    /// file filters become this window's, as they were saved. Notifications from other windows are ignored.
+    private func savedPicked(_ n: Notification) {
+        guard (n.object as? NSWindow) === view.window, let saved = n.userInfo?["saved"] as? SavedSearch else { return }
+        let split = SavedQuery.split(saved.query)
+        filters = split.filters
+        filterBar.show(split.filters)
+        setTimelineShown(false)
+        let names = saved.collectionNames
+        onScopeChosen?(names.isEmpty ? .allIndexed : .folders(names), names, split.text)
+    }
+
+    /// Save Search…: the current text, its file filters as operators, and the folders, saved under a name the user gives.
+    private func saveSearchPressed() {
+        guard let win = view.window, !query.isEmpty else { return }
+        let text = SavedQuery.compose(query, filters: filters)
+        SavedSearchStore.askName(title: "Save Search", value: "", button: "Save", in: win) { name in
+            guard let name else { return }
+            Task { @MainActor in
+                do {
+                    _ = try await SavedSearchStore.add(name: name, query: text, collection: self.scopeParameter)
+                } catch {
+                    SavedSearchStore.report(error, in: win)
+                }
+            }
+        }
     }
 
     // MARK: filter actions
@@ -1179,6 +1884,9 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         let empty = SearchFilters()
         filterBar.show(empty)
         filtersChanged(empty)
+        var text = query
+        for group in DocQuery.Group.allCases { text = DocQuery.replacing(text, group: group, with: []) }
+        if text != query { setQueryText(text) }
     }
 
     /// A facet chip: a kind toggles its type, a year sets its whole year, a folder picks that folder (as the web does).
@@ -1280,10 +1988,32 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         for (i, r) in rows.enumerated() {
             if let k = key(of: r), kept.contains(k) { sel.insert(i) }
         }
-        if sel.isEmpty, let first = rows.firstIndex(where: { isSelectable($0) }) { sel.insert(first) }
+        // The first thing to select is a result, not a section header: a selected header is a heavy highlighted band, and
+        // a header selected only because it was the one row on screen while the content section loaded would stay
+        // selected when the results arrive. So the header is the fallback only when the section is closed or failed:
+        // those are final, and one Return or arrow key then opens it or tries again, as before.
+        let firstResult = rows.firstIndex(where: { r in
+            switch r { case .file, .content, .disk, .pick: return true; case .header, .contentHeader, .diskHeader, .diskMore: return false }
+        })
+        let headerIsFinal = (contentsCollapsible && !contentsExpanded) || contentState == .failed
+        let headerRow = headerIsFinal ? rows.firstIndex(where: { if case .contentHeader = $0 { return true }; return false }) : nil
+        if sel.isEmpty, let first = firstResult ?? headerRow { sel.insert(first) }
         if !sel.isEmpty { table.selectRowIndexes(sel, byExtendingSelection: false) }
+        updateKindColumnTitle()
         updateEmptyNote()
         onStatus?(statusText())
+    }
+
+    /// The last column shows the file's kind on a name row and the channel that found it ("Words", "Words + meaning")
+    /// on a content match. It is called "Match" only while every row in it is a content match, "Kind / Match" while
+    /// both are listed, and "Kind" otherwise.
+    private func updateKindColumnTitle() {
+        var files = false, hits = false
+        for r in rows {
+            switch r { case .file, .pick: files = true; case .content, .disk: hits = true; case .header, .contentHeader, .diskHeader, .diskMore: break }
+        }
+        let title = hits ? (files ? "Kind / Match" : "Match") : "Kind"
+        if let c = table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("kind")), c.title != title { c.title = title }
     }
 
     private func buildRows() -> [Row] {
@@ -1303,30 +2033,58 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         }
         if errorText != nil || noResults { return [] }
         var out: [Row] = []
+        // A section with nothing in it is not listed: no "File names · 0", no "Content matches · 0".
+        let showContent = contentSectionVisible && !contentSectionEmpty
         if wantNames && !namesUnavailable {
+            let files = sortedFiles()
             // With both sections on screen the names get a header too: it carries their count and the ⌃1 target.
-            if contentSectionVisible { out.append(.header(namesHeaderText)) }
-            out += sortedFiles().map { Row.file($0) }
+            if showContent && !files.isEmpty { out.append(.header(namesHeaderText)) }
+            out += files.map { Row.file($0) }
         }
-        if contentSectionVisible {
+        if diskSectionVisible {
+            out.append(.diskHeader)
+            if diskExpanded {
+                out += visibleDiskHits.map { Row.disk($0) }
+                if diskHasMore || diskMoreLoading { out.append(.diskMore) }
+            }
+        }
+        if showContent {
             out.append(.contentHeader)
             if contentsOpen { out += sortedHits().map { Row.content($0) } }
         }
         return out
     }
 
+    /// How many results the current search lists, for the window subtitle (MainWindowController.refreshSubtitle). Files, not rows:
+    /// the names (the service's total) plus the content matches that are not also a listed name, so a file found both ways
+    /// counts once. 0 = nothing matched ("No matches"). nil = nothing to count: no text, the picker, the timeline, an error,
+    /// a search still on its way (names or contents), or a Content matches section that is closed and so not searched.
+    var resultCount: Int? {
+        guard !query.isEmpty, !showingPicker, !showingTimeline, errorText == nil, !nameLoading, !moreLoading else { return nil }
+        if noResults { return 0 }
+        let namesListed = wantNames && !namesUnavailable
+        var total = namesListed ? (nameTotal ?? fileItems.count) : 0
+        if contentsOpen {
+            guard contentState == .failed || (contentState == .loaded && contentLoadedGen == generation) else { return nil }
+            let names = namesListed ? Set(fileItems.map { $0.path }) : []
+            total += contentHits.filter { !names.contains($0.path) }.count
+        }
+        return total > 0 ? total : nil
+    }
+
     /// "File names · 12", or "File names · 200 of 1,234" when the list is cut at 200.
     private var namesHeaderText: String {
         if nameLoading { return "File names · searching…" }
         let shown = fileItems.count
-        if let total = resultCount, total > shown {
+        if let total = nameTotal, total > shown {
             return "File names · \(counts.string(from: NSNumber(value: shown)) ?? "\(shown)") of \(counts.string(from: NSNumber(value: total)) ?? "\(total)")"
         }
         return "File names · \(counts.string(from: NSNumber(value: shown)) ?? "\(shown)")"
     }
 
-    /// The Content matches header: its title and the state the section is in.
-    private func contentHeaderParts() -> (String, String) {
+    /// The Content matches header, one line in the style of the File names header: "Content matches · 4", then the state
+    /// the section is in when it is not just the count.
+    private var contentHeaderText: String {
         let n = contentHits.count
         let collapsed = contentsCollapsible && !contentsExpanded
         let loadedHere = contentState == .loaded && contentLoadedGen == generation
@@ -1337,20 +2095,27 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         case .failed:
             tail = "could not load · click to try again"
         case .loaded where loadedHere:
-            let count = "\(counts.string(from: NSNumber(value: n)) ?? "\(n)") \(n == 1 ? "match" : "matches")"
-            if collapsed { tail = count + " · click to show" }
+            let count = counts.string(from: NSNumber(value: n)) ?? "\(n)"
+            if collapsed { tail = n > 0 ? count + " · click to show" : "click to show" }
             else if refining { tail = count + " · refining the order…" }
             else if reranked { tail = count + " · re-ranked" }
             else { tail = count }
         default:
             tail = collapsed ? "press ↓ or click to load" : "…"
         }
-        return ("Content matches", tail)
+        return "Content matches · " + tail
+    }
+
+    /// An open Content matches section that came back with nothing is not listed at all: no "Content matches · 0".
+    /// A closed one keeps its header (it is the way to open it again), and so do loading and failed.
+    private var contentSectionEmpty: Bool {
+        contentsOpen && contentState == .loaded && contentLoadedGen == generation && contentHits.isEmpty
     }
 
     /// Nothing at all to list for this query (and nothing still on its way): the empty state speaks instead of headers.
     private var noResults: Bool {
-        guard !query.isEmpty, !showingPicker, !nameLoading, errorText == nil else { return false }
+        guard !query.isEmpty, !showingPicker, !nameLoading, !moreLoading, errorText == nil else { return false }
+        if diskSectionVisible { return false }     // a whole-disk hit is a result too
         if namesUnavailable && !wantContents { return true }
         if wantNames && !namesUnavailable && !fileItems.isEmpty { return false }
         if contentSectionVisible {
@@ -1422,6 +2187,9 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         switch row {
         case .header: return nil
         case .contentHeader: return "h:content"
+        case .diskHeader: return "h:disk"
+        case .disk(let h): return "d:" + h.path
+        case .diskMore: return "m:disk"
         case .file(let i): return "f:" + i.path
         case .content(let c): return "c:" + c.path
         case .pick(let p): return "p:" + p.name
@@ -1442,10 +2210,12 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     /// The empty state: a service error, a query the service cannot read, or no matches, each with the way out.
+    /// One shared view (EmptyStateView): an icon, a short title, one line and the buttons.
     private func updateEmptyNote() {
-        if showingPicker || query.isEmpty { emptyState.isHidden = true; return }
+        if showingPicker || query.isEmpty || showingTimeline { emptyState.isHidden = true; return }
         if let e = errorText {
-            emptyState.show(title: e, detail: nil,
+            let symbol = errorRetry ? "exclamationmark.triangle" : "magnifyingglass"
+            emptyState.show(symbol: symbol, title: errorTitle, detail: e,
                             actions: errorRetry ? [("Try again", { [weak self] in
                                 guard let self else { return }
                                 self.run(self.query)
@@ -1456,36 +2226,42 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         let label = catalog.label(for: shownChoice)
         var actions: [(String, () -> Void)] = []
         let clear: (String, () -> Void) = ("Clear filters", { [weak self] in self?.clearFilters() })
-        let title: String, detail: String?
+        let symbol: String, title: String, detail: String
         if namesUnavailable && !wantContents {
-            title = "File names cannot be searched yet"
-            detail = "The Mac’s name index is not ready. Contents of your indexed folders can answer now."
+            symbol = "clock"
+            title = "Name index not ready"
+            detail = "File names cannot be searched yet. Contents of your indexed folders can answer now."
             actions.append(("Turn on Contents", { [weak self] in
                 guard let self else { return }
                 self.sourcesChanged(names: self.namesOn, contents: true, fromNames: false)
             }))
         } else if activeScope == .mac {
-            title = "No file names match “\(query)”"
-            detail = "The whole Mac is searched by name. Narrow it with kind:pdf, ext:docx or in:~/Documents, or search the contents of your indexed folders."
+            symbol = "magnifyingglass"
+            title = "No matches"
+            detail = "No file name on this Mac matches “\(query)”."
             actions.append(("Search indexed folders", { [weak self] in self?.scopePicked(.allIndexed) }))
         } else if !wantContents {
-            title = "No file names match “\(query)” in \(label)"
-            detail = "Fast mode searches names only. Contents looks inside the files."
+            symbol = "magnifyingglass"
+            title = "No matches"
+            detail = "No file name in \(label) matches “\(query)”. Fast mode does not look inside files."
             actions.append(("Search contents too", { [weak self] in
                 guard let self else { return }
                 self.sourcesChanged(names: self.namesOn, contents: true, fromNames: false)
             }))
             actions.append(("Whole Mac", { [weak self] in self?.scopePicked(.wholeMac) }))
         } else {
-            title = "No matches for “\(query)” in \(label)"
-            var hint = filters.method == .hybrid ? "Try other words, or widen the scope." : "Try “Words + meaning” in the method menu, or widen the scope."
-            if shortcut != nil { hint = "The shortcut in the search text sets this scope. " + hint }
-            detail = hint
+            symbol = "magnifyingglass"
+            title = "No matches"
+            let hint = shortcut != nil ? "The shortcut in your search sets this scope."
+                : (filters.method == .hybrid ? "Try other words, or widen the scope." : "Try “Words + meaning” in the method menu.")
+            detail = "Nothing in \(label) matches “\(query)”. " + hint
             actions.append(("Whole Mac", { [weak self] in self?.scopePicked(.wholeMac) }))
             if shownChoice != .allIndexed { actions.append(("All indexed", { [weak self] in self?.scopePicked(.allIndexed) })) }
         }
-        if filters.isActive { actions.append(clear) }
-        emptyState.show(title: title, detail: detail, actions: actions)
+        // Any filter: the file ones, and the document ones typed in the text (type:, amount:, party:). The same two sets
+        // that make the filter bar's Clear button and its chips show, so the button here and the chips always agree.
+        if filters.isActive || filterBar.docs.isActive { actions.append(clear) }
+        emptyState.show(symbol: symbol, title: title, detail: detail, actions: actions)
     }
 
     private func setBanner(_ text: String?) {
@@ -1517,7 +2293,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
             parts.append(progress > 0 ? "indexing your Mac… \(Int((progress * 100).rounded()))%" : "indexing your Mac…")
         }
         let sectioned = contentSectionVisible && wantNames && !namesUnavailable
-        if wantNames && !namesUnavailable, let n = resultCount {
+        if wantNames && !namesUnavailable, let n = nameTotal {
             parts.append("\(fmt(n)) " + (sectioned ? (n == 1 ? "name" : "names") : (n == 1 ? "result" : "results")))
         }
         if contentSectionVisible && !query.isEmpty {
@@ -1529,6 +2305,9 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
             case .failed: parts.append("contents did not load")
             default: if sectioned && !contentsOpen { parts.append("contents not loaded") }
             }
+        }
+        if wantDisk, !query.isEmpty, diskState == .loaded, !visibleDiskHits.isEmpty {
+            parts.append("\(fmt(visibleDiskHits.count)) on this Mac")
         }
         if wantNames, !namesUnavailable, let ms = resultMs { parts.append("\(ms) ms") }
         if reranked && contentSectionVisible { parts.append("re-ranked") }
@@ -1545,9 +2324,8 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         switch rows[row] {
-        case .header: return 22
-        case .contentHeader: return 26
-        case .content: return 56
+        case .header, .contentHeader, .diskHeader, .diskMore: return 26
+        case .content, .disk: return MSEStyle.rowHeight
         default: return 20
         }
     }
@@ -1561,16 +2339,17 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         switch rows[row] {
         case .header(let text):
             guard id == "name" else { return nil }
-            let label = NSTextField(labelWithString: text.uppercased())
-            label.font = .systemFont(ofSize: 10, weight: .semibold)
-            label.textColor = .secondaryLabelColor
+            let label = NSTextField(labelWithString: text)
+            label.font = MSEStyle.sectionHeaderFont
+            label.textColor = MSEStyle.secondary
             label.lineBreakMode = .byTruncatingTail
             let c = NSTableCellView()
             c.addSubview(label)
             c.textField = label
             label.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
-                label.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 4),
+                label.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 20),     // where the Content matches label starts (after its chevron)
+                label.trailingAnchor.constraint(lessThanOrEqualTo: c.trailingAnchor, constant: -4),
                 label.centerYAnchor.constraint(equalTo: c.centerYAnchor),
             ])
             return c
@@ -1578,23 +2357,47 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
             guard id == "name" else { return nil }
             return contentHeaderCell()
         case .file(let item):
-            return cellFor(id: id, name: item.name, match: item.match, detail: nil, icon: NSWorkspace.shared.icon(forFile: item.path),
+            return cellFor(id: id, name: item.name, match: item.match, detail: nil, icon: { NSWorkspace.shared.icon(forFile: item.path) },
                            folder: item.parent, size: item.isDir ? nil : item.size, date: item.mtime, dateText: item.dateText,
                            kind: item.isDir ? "Folder" : Self.kindName(item.kind), isDir: item.isDir,
-                           tags: id == "name" ? FileItem(url: URL(fileURLWithPath: item.path)).tagColors : [], in: tableView)
+                           tagPath: item.path, in: tableView)
         case .content(let hit):
             // Why it is here: the channels that found it ("Words + meaning"), and "Name" when its name matched too.
             let why = hit.whyText(alsoByName: namePaths.contains(hit.path))
             var tip = "Matched by " + why.lowercased()
             if let r = hit.relevance { tip += " · relevance \(r)%" }
             if !hit.kind.isEmpty { tip = Self.kindName(hit.kind) + " · " + tip }
-            return cellFor(id: id, name: hit.title, match: [], detail: hit.snippet, icon: NSWorkspace.shared.icon(forFile: hit.path),
+            return cellFor(id: id, name: hit.title, match: [], detail: hit.snippet, icon: { NSWorkspace.shared.icon(forFile: hit.path) },
                            folder: URL(fileURLWithPath: hit.path).deletingLastPathComponent().path,
                            size: hit.size, date: hit.date, dateText: hit.dateText, kind: why, isDir: false, tip: tip,
-                           tags: id == "name" ? FileItem(url: URL(fileURLWithPath: hit.path)).tagColors : [], in: tableView)
+                           tagPath: hit.path,
+                           meta: hit.meta, metaLine: hit.meta.map { Self.metaLine($0, dateText: hit.dateText) }, in: tableView)
+        case .diskHeader:
+            guard id == "name" else { return nil }
+            return diskHeaderCell()
+        case .diskMore:
+            guard id == "name" else { return nil }
+            let more = Self.textCell(id: "disk.more")
+            more.textField?.stringValue = diskMoreLoading ? "Loading more…" : "Show more on this Mac"
+            more.textField?.textColor = .controlAccentColor
+            return more
+        case .disk(let hit):
+            // The snippet with its matched words, else the labels the image was given; the channel that found it is the kind.
+            var detail: NSAttributedString?
+            if !hit.snippet.isEmpty {
+                detail = SnippetText.attributed(hit.snippet, terms: [])
+            } else if !hit.labels.isEmpty {
+                detail = NSAttributedString(string: hit.labels.joined(separator: " · "),
+                                            attributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.secondaryLabelColor])
+            }
+            let why = hit.why == "label" ? "Label" : hit.why == "text" ? "Text" : hit.why == "vector" ? "Meaning" : "Name"
+            return cellFor(id: id, name: hit.name, match: [], detail: detail, icon: { NSWorkspace.shared.icon(forFile: hit.path) },
+                           folder: URL(fileURLWithPath: hit.path).deletingLastPathComponent().path,
+                           size: hit.size, date: hit.mtime, kind: why, isDir: false, tip: "On this Mac · matched by " + why.lowercased(),
+                           tagPath: hit.path, in: tableView)
         case .pick(let p):
             let symbol = p.isGroup ? "rectangle.3.group" : "square.stack.3d.up"
-            let icon = NSImage(systemSymbolName: symbol, accessibilityDescription: p.name) ?? NSImage()
+            let icon = { NSImage(systemSymbolName: symbol, accessibilityDescription: p.name) ?? NSImage() }
             let kind = p.isGroup ? "Group · \(p.files) folders" : "Indexed folder · \(counts.string(from: NSNumber(value: p.files)) ?? "\(p.files)") files"
             return cellFor(id: id, name: p.name, match: [], detail: nil, icon: icon, folder: p.path.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "",
                            size: nil, date: nil, kind: kind, isDir: true, in: tableView)
@@ -1602,26 +2405,25 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     /// The cell for one column of a row: the name column carries the icon and title, the others one text line.
-    private func cellFor(id: String, name: String, match: [(Int, Int)], detail: NSAttributedString?, icon: NSImage,
+    /// `icon` is asked for only by the name column, and `tagPath` (the file whose colour tags go after the name) is read
+    /// only there too, off the main thread: the other columns look up neither.
+    private func cellFor(id: String, name: String, match: [(Int, Int)], detail: NSAttributedString?, icon: () -> NSImage,
                          folder: String, size: Int64? = nil, date: Date?, dateText: String? = nil, kind: String, isDir: Bool,
-                         tip: String? = nil, tags: [TagColor] = [], in tableView: NSTableView) -> NSView {
+                         tip: String? = nil, tagPath: String? = nil, meta: DocMeta? = nil, metaLine: String? = nil,
+                         in tableView: NSTableView) -> NSView {
         if id == "name" {
             let cell = (tableView.makeView(withIdentifier: NSUserInterfaceItemIdentifier("name"), owner: self) as? SearchCell)
                 ?? SearchCell(identifier: "name")
-            icon.size = NSSize(width: 16, height: 16)
-            cell.imageView?.image = icon
-            cell.title.attributedStringValue = Self.highlighted(name, match)
-            cell.title.font = .systemFont(ofSize: 13)
-            if let detail {
-                cell.detail.attributedStringValue = detail
-                cell.detail.isHidden = false
-            } else {
-                cell.detail.stringValue = ""
-                cell.detail.isHidden = true
-            }
-            let dots = TagStore.dotsImage(for: tags)                // nil clears the dots on a reused cell
-            cell.tagDots.image = dots
-            cell.tagDotsWidth.constant = dots?.size.width ?? 0
+            let rich = detail != nil                                // a content match: title, snippet, document line
+            let side = rich ? MSEStyle.iconSize : 16
+            let image = icon()
+            image.size = NSSize(width: side, height: side)
+            cell.imageView?.image = image
+            cell.setRich(rich)
+            cell.title.attributedStringValue = Self.highlighted(name, match, weight: rich ? .medium : .regular)
+            cell.setMeta(meta, line: metaLine)                      // hidden for a row without a document line
+            cell.setSnippet(detail)
+            showTags(in: cell, path: tagPath)
             cell.toolTip = tip
             return cell
         }
@@ -1639,17 +2441,49 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         cell.textField?.stringValue = text
         cell.textField?.alignment = rightAligned ? .right : .left
         cell.textField?.lineBreakMode = id == "folder" ? .byTruncatingMiddle : .byTruncatingTail
-        cell.textField?.textColor = id == "folder" ? .secondaryLabelColor : nil
+        (cell as? TextColumnCell)?.isSecondary = id == "folder"
         cell.toolTip = tip
         return cell
+    }
+
+    /// The colour dots of a name cell. A path read before is shown at once. Otherwise the dots are cleared (the cell may be
+    /// a reused one), the tags are read off the main thread, and the answer is applied only if the cell still belongs to
+    /// the same path: a reused cell is left alone. The read counts in isLoading until it ends, answer used or not.
+    private func showTags(in cell: SearchCell, path: String?) {
+        cell.tagPath = path
+        guard let path else { cell.setTags([]); return }
+        if let known = tagCache[path] { cell.setTags(known); return }
+        cell.setTags([])
+        tagLoadsPending += 1
+        Task { @MainActor [weak self] in
+            let colors = await Task.detached(priority: .userInitiated) { Self.tagColors(atPath: path) }.value
+            guard let self else { return }
+            self.tagLoadsPending -= 1
+            self.tagCache[path] = colors
+            if cell.tagPath == path { cell.setTags(colors) }
+        }
+    }
+
+    /// The colours among the file's Finder tags (the one resource value FileItem reads for them, and nothing else).
+    nonisolated private static func tagColors(atPath path: String) -> [TagColor] {
+        let names = (try? URL(fileURLWithPath: path).resourceValues(forKeys: [.tagNamesKey]))?.tagNames ?? []
+        return TagStore.colors(of: names)
+    }
+
+    /// The document line of a classified result: amount · date · counterparty (the badge before it carries the type).
+    static func metaLine(_ meta: DocMeta, dateText: String?) -> String {
+        var parts: [String] = []
+        if let amount = meta.amountText { parts.append(amount) }
+        let date = dateText ?? meta.docDate.flatMap { SearchDates.display($0) } ?? ""
+        if !date.isEmpty { parts.append(date) }
+        if let cp = meta.counterparty { parts.append(cp) }
+        return parts.joined(separator: " · ")
     }
 
     /// The Content matches header row.
     private func contentHeaderCell() -> NSView {
         let cell = SectionHeaderCell()
-        let (title, tail) = contentHeaderParts()
-        cell.title.stringValue = title.uppercased()
-        cell.tail.stringValue = tail
+        cell.title.stringValue = contentHeaderText
         let collapsed = contentsCollapsible && !contentsExpanded
         if contentsCollapsible || contentState == .failed {
             let name = contentState == .failed ? "arrow.clockwise" : (collapsed ? "chevron.right" : "chevron.down")
@@ -1662,7 +2496,7 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     private static func textCell(id: String) -> NSTableCellView {
-        let c = NSTableCellView()
+        let c = TextColumnCell()
         c.identifier = NSUserInterfaceItemIdentifier(id)
         let t = NSTextField(labelWithString: "")
         t.font = .systemFont(ofSize: 12)
@@ -1678,8 +2512,8 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     }
 
     /// The name with the matched character ranges in bold.
-    static func highlighted(_ name: String, _ ranges: [(Int, Int)]) -> NSAttributedString {
-        let out = NSMutableAttributedString(string: name, attributes: [.font: NSFont.systemFont(ofSize: 13)])
+    static func highlighted(_ name: String, _ ranges: [(Int, Int)], weight: NSFont.Weight = .regular) -> NSAttributedString {
+        let out = NSMutableAttributedString(string: name, attributes: [.font: NSFont.systemFont(ofSize: 13, weight: weight)])
         let chars = Array(name)
         for (s, e) in ranges {
             let start = max(0, min(s, chars.count)), end = max(start, min(e, chars.count))
@@ -1709,12 +2543,15 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         let opt = e.modifierFlags.contains(.option)
         let sel = table.selectedRow
         let onHeader: Bool = { if sel >= 0, sel < rows.count, case .contentHeader = rows[sel] { return true }; return false }()
+        let onDiskHeader: Bool = { if sel >= 0, sel < rows.count, case .diskHeader = rows[sel] { return true }; return false }()
         switch e.keyCode {
         case 36, 76:                                   // Return, Enter
+            if onDiskHeader && !cmd { activateDiskHeader(); return true }
             if onHeader && !cmd { activateContentHeader(); return true }
             if cmd { revealSelected() } else { openSelected() }
             return true
         case 49 where !cmd:                            // Space
+            if onDiskHeader { activateDiskHeader(); return true }
             if onHeader { activateContentHeader(); return true }
             toggleQuickLook()
             return true
@@ -1746,8 +2583,9 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     private func url(forRow row: Int) -> URL? {
         guard row >= 0, row < rows.count else { return nil }
         switch rows[row] {
-        case .header, .contentHeader: return nil
+        case .header, .contentHeader, .diskHeader, .diskMore: return nil
         case .file(let i): return i.url
+        case .disk(let h): return URL(fileURLWithPath: h.path)
         case .content(let c): return c.url
         case .pick(let p): return p.path.map { URL(fileURLWithPath: $0) }
         }
@@ -1772,11 +2610,28 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
     private func open(row: Int) {
         guard row < rows.count else { return }
         switch rows[row] {
-        case .header, .contentHeader: return
+        case .header, .contentHeader, .diskHeader: return
+        case .diskMore: loadMoreDisk()
+        case .disk(let h):
+            recordOpened(h.path)
+            NSWorkspace.shared.open(URL(fileURLWithPath: h.path))
         case .pick(let p): onPick?(p.members)
         case .file(let i):
+            recordOpened(i.path)
             if i.isDir { onOpenFolder?(i.url) } else { NSWorkspace.shared.open(i.url) }
-        case .content(let c): openPreview(c)
+        case .content(let c):
+            recordOpened(c.path)
+            openPreview(c)
+        }
+    }
+
+    /// Tells the service that the user opened a result (POST /api/files/opened {path, query}: the file ranks a little
+    /// higher afterwards, first for exactly this search text). Fire and forget: it runs off the main thread and its answer
+    /// and its errors are ignored, so it never blocks or changes anything on screen.
+    private func recordOpened(_ path: String) {
+        let text = query
+        Task.detached(priority: .utility) {
+            _ = try? await MSEClient.shared.postJSON("/api/files/opened", body: ["path": path, "query": text])
         }
     }
 
@@ -1876,6 +2731,9 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         menu.addItem(openWith)
         add("Quick Look", #selector(quickLookAction))
         add("Show in Enclosing Folder", #selector(revealAction))
+        if case .file(let i) = rows[row], i.isDir, !(library?.collections ?? []).contains(where: { $0.path == i.path }) {
+            add("Deep-index this Folder", #selector(deepIndexFolderAction))
+        }
         menu.addItem(.separator())
         add("Copy Path", #selector(copyPathAction))
         add("Search only here", #selector(searchHereAction))
@@ -1888,6 +2746,26 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
 
     @objc private func openAction() { openSelected() }
 
+    /// Deep-index the folder under the pointer: the same POST /api/collections the Folders pane's add flow sends.
+    @objc private func deepIndexFolderAction() {
+        let row = table.clickedRow
+        guard row >= 0, row < rows.count, case .file(let i) = rows[row], i.isDir else { return }
+        let path = i.path
+        Task { @MainActor in
+            do {
+                try await MSEClient.shared.deepIndex(path: path)
+                NotificationCenter.default.post(name: .deepIndexChanged, object: nil)
+            } catch {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "The folder was not added for deep indexing"
+                alert.informativeText = SW.clean(error)
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+        }
+    }
+
     private func isContentRow(_ row: Int) -> Bool { if case .content = rows[row] { return true }; return false }
 
     /// Open File: the file in its own app (a content row's Return opens the preview instead).
@@ -1895,7 +2773,9 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
         for row in selectedRowsInOrder() {
             guard row < rows.count else { continue }
             switch rows[row] {
-            case .content(let c): NSWorkspace.shared.open(c.url)
+            case .content(let c):
+                recordOpened(c.path)
+                NSWorkspace.shared.open(c.url)
             default: open(row: row)
             }
         }
@@ -1903,12 +2783,14 @@ final class SearchViewController: NSViewController, NSTableViewDataSource, NSTab
 
     @objc private func previewAction() {
         guard let row = selectedRowsInOrder().first, let (coll, rel) = previewTarget(forRow: row) else { return }
+        if let target = url(forRow: row) { recordOpened(target.path) }
         onOpenPreview?(query, indexedNames, coll, rel)
     }
 
     @objc private func openWithAction(_ sender: NSMenuItem) {
         guard let pair = sender.representedObject as? [Any], pair.count == 2,
               let file = pair[0] as? URL, let app = pair[1] as? URL else { return }
+        recordOpened(file.path)
         NSWorkspace.shared.open([file], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
     }
 

@@ -17,7 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import __version__, config, indexer, macindex, paths, search, store, tree
+from . import __version__, config, indexer, macindex, paths, search, store, tree, wholedisk
 from . import progress as liveprog
 from .embedder import pool
 from .jobs import JobManager
@@ -115,9 +115,9 @@ def submit_scoped(kind: str, spec, path: str | None = None, reason: str = "manua
     return {"jobs": jobs}
 
 
-def files_search(q: str, scope: str = "mac", names=None, limit=None) -> dict:
+def files_search(q: str, scope: str = "mac", names=None, limit=None, offset=0, paged: bool = False) -> dict:
     """The whole-Mac file-name search (GET /api/files/search, `mse files`): see Handler.get_api_files_search.
-    ValueError (a 400 at the API) for an unknown scope or folder name and for a bad query."""
+    ValueError (a 400 at the API) for an unknown scope or folder name, for a bad query and for a bad limit or offset."""
     from .filequery import DEFAULT_LIMIT, MAX_LIMIT
     cfg = config.load()
     if scope not in ("mac", "indexed"):
@@ -137,7 +137,12 @@ def files_search(q: str, scope: str = "mac", names=None, limit=None) -> dict:
             chosen = config.resolve_scope(cfg, names, strict=True)["collections"]
         roots = [c["path"] for c in enabled if c["name"] in chosen] or ["/nonexistent-mysearch-scope"]
     n = max(1, min(MAX_LIMIT, int(limit or DEFAULT_LIMIT)))
-    res = macindex.manager().search(q, n, roots, enabled)
+    off = int(offset or 0)
+    if off < 0:
+        raise ValueError("offset must not be negative")
+    kw = {"offset": off, "paged": True} if (paged or off) else {}
+    with macindex.interactive_qos():          # a person is waiting for this answer: this thread only, restored afterwards
+        res = macindex.manager().search(q, n, roots, enabled, **kw)
     res["scope"] = scope
     if shortcut:
         res["shortcut"] = shortcut
@@ -288,6 +293,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._route("POST")
 
+    def do_PATCH(self):
+        self._route("PATCH")
+
+    def do_DELETE(self):
+        self._route("DELETE")
+
     def _route(self, method: str):
         try:
             if not self._allowed_host():
@@ -314,6 +325,9 @@ class Handler(BaseHTTPRequestHandler):
                 m = re.match(r"^/api/groups/([\w\-]+)/remove$", p)
                 if m and method == "POST":
                     return self._group_remove(m.group(1))
+                m = re.match(r"^/api/collections/([\w\-]+)/forget-missing$", p)
+                if m and method == "POST":
+                    return self._forget_missing(m.group(1))
                 m = re.match(r"^/api/ask/providers/([\w\-]+)/(remove|models|test|connect)$", p)
                 if m and method == "POST":
                     return self._provider_action(m.group(1), m.group(2))
@@ -323,6 +337,12 @@ class Handler(BaseHTTPRequestHandler):
                 m = re.match(r"^/api/collections/([\w\-]+)(?:/(remove|update))?$", p)
                 if m and method == "POST":
                     return self._collection_action(m.group(1), m.group(2) or "update")
+                m = re.match(r"^/api/docs/([0-9a-f]{8})/meta$", p)
+                if m and method == "GET":
+                    return self._doc_meta(m.group(1), qs)
+                m = re.match(r"^/api/saved/([\w\-]+)(?:/(run))?$", p)
+                if m:
+                    return self._saved_route(method, m.group(1), m.group(2), qs)
                 return self._err(404, "no such endpoint")
             return handler(qs)
         except (KeyError, ValueError, PermissionError) as e:
@@ -477,6 +497,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._err(404, f"no group named '{name}'")
         self._json({"ok": True})
 
+    def _forget_missing(self, name: str):
+        """POST {path?, dry_run?, as_of?} -> the summary of indexer.forget_missing (the same as `mse forget-missing`).
+        dry_run defaults to true: only an explicit false removes rows, and then as_of, the time of the dry run of the same
+        scope, is required, so only rows that were listed are removed. Bad values are refused with 400 (ValueError)."""
+        if not config.get_collection(config.load(), name):
+            return self._err(404, f"no collection named '{name}'")
+        b = self._jbody()
+        dry = b.get("dry_run", True)
+        if not isinstance(dry, bool):
+            raise ValueError("dry_run must be true or false")
+        path = b.get("path") or ""
+        if not isinstance(path, str):
+            raise ValueError("path must be a string")
+        as_of = b.get("as_of")
+        if as_of is not None and (isinstance(as_of, bool) or not isinstance(as_of, (int, float))):
+            raise ValueError("as_of must be a number: the as_of of the dry run")
+        self._json(indexer.forget_missing(name, path, dry_run=dry, as_of=as_of))
+
     def _agents_action(self, name: str, method: str):
         """GET -> {collection, folder, mse_bin, agents: [status rows]}; POST {install: true|false} -> {files}."""
         from . import agents_setup
@@ -517,11 +555,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def get_api_settings(self, qs):
         cfg = config.load()
-        from .ignore import SECRET_PATTERNS
+        from .ignore import PRUNE_DIRS, SECRET_PATTERNS, effective_prune
         from . import ask
+        idx = dict(cfg.get("indexing") or {})          # the same keys POST /api/settings takes, so it round-trips
+        info = {"prune_dirs_default": sorted(PRUNE_DIRS),   # read-only: what the walk prunes by default and now
+                "prune_dirs_effective": sorted(effective_prune(idx.get("prune_dirs")))}
         self._json({**{k: cfg[k] for k in ("schedule", "worker", "search", "translation", "model", "port", "agents",
-                                             "mac_index")},
-                    "secret_patterns": list(SECRET_PATTERNS), "ask": ask.settings(cfg)})
+                                             "mac_index", "wholedisk")},
+                    "indexing": idx, "indexing_info": info, "secret_patterns": list(SECRET_PATTERNS),
+                    "ask": ask.settings(cfg)})
 
     def _resolve_file(self, qs) -> tuple[dict, dict]:
         found = search.find_file((qs.get("c") or [None])[0], (qs.get("path") or qs.get("ref") or [""])[0])
@@ -563,21 +605,75 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------- whole-Mac file names (mse/macindex.py, mse/filequery.py)
 
     def get_api_files_search(self, qs):
-        """?q=&limit=200&scope=mac|indexed&c=<collections/groups> -> {items: [{path, name, parent, is_dir, kind, ext,
-        size, mtime, score, match: [[start, end], …], collection?}], total, ms, scope, query: {words, filters},
-        truncated}. scope=mac (default) searches every file name under the configured roots; scope=indexed only the
-        folders of the given (or all enabled) collections and groups. A scope shortcut in q ("w: invoice", "in:work")
-        narrows to those folders; in:~/Folder or in:/Folder is a folder path. Errors in the query language -> 400."""
+        """?q=&limit=200&offset=0&scope=mac|indexed&c=<collections/groups> -> {items: [{path, name, parent, is_dir, kind,
+        ext, size, mtime, score, match: [[start, end], …], collection?}], total, ms, scope, query: {words, filters},
+        truncated, searchable, partial?}. scope=mac (default) searches every file name under the configured roots;
+        scope=indexed only the folders of the given (or all enabled) collections and groups. A scope shortcut in q
+        ("w: invoice", "in:work") narrows to those folders; in:~/Folder or in:/Folder is a folder path. Errors in the query
+        language -> 400.
+        Pages: with `limit` or `offset` in the request the answer also carries offset, limit, has_more and next_offset
+        (null when there is no more). A first page of limit=50 followed by offset=50&limit=150 is exactly the list a
+        single limit=200 would have returned (up to 200 rows in all; deeper pages are planned again). `partial: true`
+        means a pattern with no literal text ran out of its time budget (mac_index.regex_budget_ms): the matches so far."""
         self._json(files_search((qs.get("q") or [""])[0], (qs.get("scope") or ["mac"])[0] or "mac",
-                                qs.get("c", []), (qs.get("limit") or [None])[0]))
+                                qs.get("c", []), (qs.get("limit") or [None])[0], (qs.get("offset") or [0])[0],
+                                paged=("limit" in qs or "offset" in qs)))
+
+    def post_api_files_opened(self, qs):
+        """{path, query?} -> {recorded, reason?}. The UI calls it when the user opens a file from the results (query: the
+        text in the search box). The file ranks a little higher afterwards, and first for exactly that query. Only
+        a path the search itself could show is recorded (400 otherwise); the table holds hashes, never paths, is capped,
+        stays on this Mac, and is switched off with mac_index.frecency."""
+        b = self._jbody()
+        if not isinstance(b, dict):
+            raise ValueError("the body must be an object {path, query?}")
+        self._json(macindex.manager().opened(b.get("path"), b.get("query")))
+
+    def get_api_files_frecency(self, qs):
+        """-> {enabled, files, pairs, cap_files, cap_pairs}: how much the ranking remembers."""
+        m = macindex.manager()
+        self._json({"enabled": bool(macindex.settings()["frecency"]), **m.frecency.stats()})
+
+    def post_api_files_frecency_clear(self, qs):
+        """Forget every opened file and query (the name index is not touched). -> {cleared: true}"""
+        macindex.manager().frecency.clear()
+        self._json({"cleared": True})
 
     def get_api_files_status(self, qs):
-        self._json(macindex.manager().status())
+        """The whole-Mac index: entries, crawl progress, rules ... and `name_index`: {schema, table, upgrade: {state:
+        idle|running|done|failed, phase?, fraction?, elapsed_s?, entries?, error?}, upgrade_pending, legacy_table,
+        changed_since_recount}. While upgrade.state is running the old index keeps answering."""
+        m = macindex.manager()
+        res = m.status()
+        res["name_index"] = m.name_index_status()
+        self._json(res)
 
     def post_api_files_crawl(self, qs):
         """{force?: true} -> {started, reason?}. A full re-crawl in the background (nice'd, resumable)."""
         b = self._jbody()
         self._json(macindex.manager().start_crawl(force=bool(b.get("force"))))
+
+    # ---------------------------------------------------------- whole-disk content index (mse/wholedisk.py)
+
+    def get_api_disk_status(self, qs):
+        """-> {enabled, roots, files_seen, files_described, images_labelled, pdfs_described, pending, state:
+        idle|scanning|describing|paused, paused_reason: null|user_active|on_battery|disabled, rate_per_s, eta_s,
+        last_error, ...}. Counts are read from the index; nothing is written."""
+        self._json(wholedisk.manager().status())
+
+    def get_api_disk_search(self, qs):
+        """?q=&limit=20&offset=0&kind=image|pdf|doc|video|audio|code|other -> {results: [{path, name, kind, size, mtime,
+        snippet, labels: [strings, most confident first], score, why: name|label|text|vector}], has_more, next_offset,
+        took_ms, query}. Every result is checked on disk and against the privacy rules before it is returned."""
+        kind = (qs.get("kind") or [""])[0] or None
+        with macindex.interactive_qos():          # a person is waiting for this answer: this thread only, restored afterwards
+            res = wholedisk.manager().search((qs.get("q") or [""])[0], kind, int((qs.get("limit") or ["20"])[0]),
+                                             int((qs.get("offset") or ["0"])[0]))
+        self._json(res)
+
+    def post_api_disk_rescan(self, qs):
+        """-> {started}. A full merge with the name index at the next turn, and another try for the failed files."""
+        self._json(wholedisk.manager().rescan())
 
     def get_api_tree(self, qs):
         """?c=<collection>&path=<relative folder> -> {collection, path, folders: [{name, path, children}]}."""
@@ -654,8 +750,44 @@ class Handler(BaseHTTPRequestHandler):
     def post_api_settings(self, qs):
         cfg = config.update_settings(self._jbody())    # {"ask": {"enabled": false}} also unloads the Ask model
         from . import ask
-        self._json({**{k: cfg[k] for k in ("schedule", "worker", "search", "translation", "agents", "mac_index")},
+        self._json({**{k: cfg[k] for k in ("schedule", "worker", "search", "translation", "agents", "mac_index",
+                                             "wholedisk")},
                     "ask": ask.settings(cfg)})
+
+    # ---------------------------------------------------------- first-run setup (mse/setup_models.py; the app's setup assistant)
+
+    def get_api_setup_status(self, qs):
+        """-> {version, collections, minimal_models_ready, full_models_ready, needs_setup, full_disk_access
+        (granted | not_granted | unknown), bundled, app, job}. needs_setup: no folder yet, or the minimal models are missing."""
+        from . import setup_models
+        self._json(setup_models.setup_status())
+
+    def get_api_setup_models(self, qs):
+        """-> {models: [manifest rows with status, sizes, licence, source], tiers: {minimal, full: what is left to download},
+        job: {state, percent, done_bytes, total_bytes, current, models, rate_bps, eta_s, error, message}, free_bytes}."""
+        from . import setup_models
+        self._json(setup_models.models_view())
+
+    def post_api_setup_models(self, qs):
+        """{tier: "minimal" | "full"} -> the job {…, started}. Starts the download in a child process (the service itself stays
+        offline); finished files are kept and a re-run resumes. A running job is returned as it is. 400 with a sentence when it
+        cannot start (unknown tier, no disk space, an incomplete folder in the way)."""
+        from . import setup_models
+        self._json(setup_models.start_download(self._jbody().get("tier"), on_done=self._models_installed))
+
+    def post_api_setup_models_cancel(self, qs):
+        """Stops the running download; what it fetched stays and the next start resumes it. -> the job."""
+        from . import setup_models
+        self._json(setup_models.cancel_download())
+
+    @staticmethod
+    def _models_installed(state: str) -> None:
+        """After a setup download: index whatever was waiting for the models (embedding needs them)."""
+        if state == "done" and JOBS is not None:
+            try:
+                JOBS.submit("sync", None, None, reason="models-installed")
+            except Exception:
+                log(traceback.format_exc())
 
     # ---------------------------------------------------------- feedback (favourites) and quality
 
@@ -846,6 +978,87 @@ class Handler(BaseHTTPRequestHandler):
         except CloudError as e:
             return self._err(502, str(e))
 
+    # ---------------------------------------------------------- what documents are (mse/docmeta.py) and saved searches
+
+    @staticmethod
+    def _docs_scope(qs) -> list[str]:
+        """collection= (or c=): collections, groups, aliases, "all", comma separated; none = All. -> collection names."""
+        tokens = scope_param(qs.get("collection", []) + qs.get("c", []))
+        return config.resolve_scope(config.load(), tokens)["collections"]
+
+    def get_api_docs_facets(self, qs):
+        """?collection=&type= -> {collections, files, classified, unclassified, undated, doctypes: [{doctype, count}],
+        counterparties: [{name, count}] (top 20), months: [{month, count}], currencies: [{currency, count}]}."""
+        from . import docmeta
+        self._json(docmeta.facets(self._docs_scope(qs), qs.get("type", [])))
+
+    def get_api_docs_timeline(self, qs):
+        """?collection=&type=receipt&from=2025-01&to=2025-12 -> {types, from, to, first, last, buckets: [{month, count,
+        amounts: {EUR: sum}, with_amount, query}], gaps: [months with none], total, undated}. Without from/to: the first
+        to the last month that has a document."""
+        from . import docmeta
+        self._json(docmeta.timeline(self._docs_scope(qs), qs.get("type", []), (qs.get("from") or [None])[0],
+                                    (qs.get("to") or [None])[0]))
+
+    def get_api_docs_reindex(self, qs):
+        """?collection=name -> the state of the last document-facts rerun {state: running|done|cancelled|error, done, total}."""
+        from . import docmeta
+        name = (qs.get("collection") or [""])[0]
+        self._json(docmeta.REINDEX.get(name) or {"state": "idle"})
+
+    def post_api_docs_reindex(self, qs):
+        """{collection} -> starts redoing the document facts of that collection in the background (batches of 200)."""
+        from . import docmeta
+        name = self._jbody().get("collection") or ""
+        if not config.get_collection(config.load(), name):
+            raise KeyError(f"no collection named '{name}'")
+        self._json(docmeta.start_reindex(name))
+
+    def _doc_meta(self, ref: str, qs):
+        """GET /api/docs/<docid>/meta[?c=collection] -> {docid, path, collection, classified, meta: {doctype, confidence,
+        doc_date, amount, currency, counterparty, reference, lang, extractor_version, extracted_at} | null}."""
+        from . import docmeta
+        found = search.find_file((qs.get("c") or qs.get("collection") or [None])[0], ref)
+        if not found:
+            return self._err(404, "file not found")
+        c, f = found
+        conn = store.connect(c["name"], readonly=True)
+        try:
+            row = docmeta.get(conn, f["id"])
+        finally:
+            conn.close()
+        self._json({"docid": f["docid"], "path": f["path"], "collection": c["name"],
+                    "classified": bool(row and row.get("doctype")), "meta": row})
+
+    def get_api_saved(self, qs):
+        """-> {saved: [{id, name, query, collection, created_at, updated_at}]}"""
+        self._json({"saved": config.saved_searches()})
+
+    def post_api_saved(self, qs):
+        """{name, query, collection?} -> the new saved search. 400 with a sentence for a bad query, name or collection."""
+        b = self._jbody()
+        self._json(config.add_saved(b.get("name"), b.get("query"), b.get("collection")))
+
+    def _saved_route(self, method: str, saved_id: str, action: str | None, qs):
+        """GET /api/saved/<id> · GET /api/saved/<id>/run?limit=&mode= (the search, with its results) · PATCH /api/saved/<id>
+        {name?, query?, collection?} · DELETE /api/saved/<id> (the definition only; no file, no index is touched)."""
+        item = config.get_saved(saved_id)
+        if item is None:
+            return self._err(404, f"no saved search with id '{saved_id}'")
+        if method == "GET" and action is None:
+            return self._json(item)
+        if method == "GET" and action == "run":
+            res = search.run_saved(item, limit=int((qs.get("limit") or [0])[0]) or None,
+                                   mode=(qs.get("mode") or ["hybrid"])[0],
+                                   opts={"rerank": True} if (qs.get("precise") or ["0"])[0] in ("1", "true") else None)
+            res["saved"] = {k: item[k] for k in ("id", "name", "query", "collection")}
+            return self._json(res)
+        if method == "PATCH" and action is None:
+            return self._json(config.update_saved(saved_id, self._jbody()))
+        if method == "DELETE" and action is None:
+            return self._json({"removed": config.remove_saved(saved_id)["id"]})
+        return self._err(405, f"{method} is not supported here")
+
     def post_mcp(self, qs):
         from .mcp import LocalClient, handle
         req = self._jbody()
@@ -902,6 +1115,7 @@ def _stop_services() -> None:
     """Run after the port is released. Each step has a bound, and none waits for a file read to finish: a read still
     running after SHUTDOWN_WAIT_S is left behind, and the next start reads that file again."""
     for label, step in (("crawl", lambda: macindex.manager().stop()),
+                        ("whole-disk index", lambda: wholedisk.manager().stop()),
                         ("jobs", lambda: JOBS.wait_idle(SHUTDOWN_WAIT_S)),
                         ("model workers", lambda: pool().stop_all(SHUTDOWN_WAIT_S))):
         try:
@@ -924,6 +1138,7 @@ def serve(port: int | None = None) -> None:
     httpd.daemon_threads = True      # request threads are daemons, so server_close() does not wait for them
     JOBS = JobManager()
     macindex.manager().start()        # whole-Mac file names: the first crawl starts a little later, in the background
+    wholedisk.manager().start()       # whole-disk content index: waits for the name index, then describes in the background
     stopping = threading.Event()
 
     def stop(reason: str) -> None:

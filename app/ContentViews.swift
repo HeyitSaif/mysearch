@@ -28,7 +28,7 @@ final class ContentContainerViewController: NSViewController {
         view = NSView()
         host.translatesAutoresizingMaskIntoConstraints = false
         statusLine.font = .systemFont(ofSize: 11)
-        statusLine.textColor = .secondaryLabelColor
+        statusLine.textColor = MSEStyle.secondary        // the footer text: 4.5:1 or better in light and dark (MSEStyle, SearchView.swift)
         statusLine.alignment = .center
         statusLine.translatesAutoresizingMaskIntoConstraints = false
         pathBar.pathStyle = .standard

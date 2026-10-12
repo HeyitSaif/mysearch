@@ -24,7 +24,7 @@ os.environ.setdefault("MSE_HOME", tempfile.mkdtemp(prefix="mse-test-"))
 from mse import cli, config, ignore, macindex as mi  # noqa: E402
 
 H = "/Users/alex"
-TMP = os.path.realpath("/tmp")
+TMP = os.path.realpath(os.environ.get("TMPDIR") or "/tmp")
 
 
 def mkdtemp(prefix="mse-mx-"):

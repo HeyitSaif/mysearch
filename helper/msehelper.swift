@@ -6,11 +6,14 @@
 //   msehelper render <file.pdf> --pages 1,2 --out <dir> [--max-px 1280]
 //   msehelper ocr    <file.pdf|image> [--pages 1,2] [--langs de-DE,en-US]   (no --langs: detect the language per image)
 //   msehelper image  <file> --out <file.jpg> [--max-px 1536] [--thumb <file.jpg>] [--thumb-px 360]
+//   msehelper probe  <image> [--max-px 512]                       (does the picture likely hold text? a cheap pre-check)
 //   msehelper keychain get|has|set|delete <account> [--no-ui]      (Ask's cloud provider keys, see below)
-//   msehelper watch  <folder>... [--latency 0.3] [--exclude <folder>]...   (FSEvents, one JSON line per event)
+//   msehelper watch  <folder>... [--latency 0.3] [--no-defer] [--exclude <folder>]...   (FSEvents, one JSON line per event)
 //   msehelper features -                                           (what this build can do: crawl, watch_latency, watch_exclude)
 //   msehelper crawl  <root> [--skip-prefix P]... [--skip-name G]... [--skip-dir G]... [--no-descend EXT]...
 //                    [--max-depth N] [--nice N]                      (file-name index for the whole-Mac search, below)
+//   msehelper describe --probe | --stdin [--max-px N] [--text-px N] [--pdf-px N] [--ocr gate|always|off]
+//                    [--qos background|utility|default] [--nice N]   (whole-disk content index: labels and text, see below)
 
 import Foundation
 import PDFKit
@@ -19,6 +22,8 @@ import ImageIO
 import CoreGraphics
 import Security
 import UniformTypeIdentifiers
+import AVFoundation
+import NaturalLanguage
 
 func emit(_ obj: Any) {
     let data = try! JSONSerialization.data(withJSONObject: obj, options: [])
@@ -319,6 +324,12 @@ func crawlCommand(root: String, args: [String]) -> Never {
     exit(0)
 }
 
+// `describe` (the whole-disk content index, see the MARK below) takes no file argument, so it is dispatched before the
+// argument parsing below, which every other command shares.
+if CommandLine.arguments.count >= 2 && CommandLine.arguments[1] == "describe" {
+    describeCommand(Array(CommandLine.arguments.dropFirst(2)))
+}
+
 var args = Array(CommandLine.arguments.dropFirst())
 guard args.count >= 2 else { fail("usage: msehelper <pdf|render|ocr|image> <file> [options]") }
 let command = args.removeFirst()
@@ -562,17 +573,49 @@ case "image":
     }
     emit(result)
 
+case "probe":
+    // Does this picture likely hold text? The cheap pre-check the indexer runs before the full OCR of a picture
+    // (media.image_ocr "auto"): Vision at the .fast level, no language correction, on a copy whose long side is at most
+    // --max-px (512; the indexer asks for 768, where a 26 px caption in a 1600 px picture is still seen). The minimum
+    // text height is the one the full OCR uses, so small text is not dropped before it is looked at. {"text_likely":
+    // true} when at least one line with two or more letters or digits was read with a confidence of 0.5 or more (the
+    // fast recogniser reports 0.5 for most real text; a lone glyph read out of a shape does not count); "lines" counts
+    // those, "confidence" is the best one seen. About 0.06 s against 0.6 s for the full OCR. Pictures only: a PDF
+    // page goes through `ocr`.
+    let probePx = Int(option("--max-px") ?? "") ?? 512
+    guard let img = loadImage(url, maxPx: probePx) else { fail("cannot read image") }
+    let probe = VNRecognizeTextRequest()
+    probe.recognitionLevel = .fast
+    probe.usesLanguageCorrection = false
+    probe.minimumTextHeight = 0.006
+    let probeHandler = VNImageRequestHandler(cgImage: img, options: [:])
+    do { try probeHandler.perform([probe]) } catch { fail("probe failed: \(error.localizedDescription)") }
+    var probeLines = 0
+    var probeBest = 0.0
+    for obs in probe.results ?? [] {
+        guard let top = obs.topCandidates(1).first else { continue }
+        let conf = Double(top.confidence)
+        probeBest = max(probeBest, conf)
+        let wordy = top.string.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.count
+        if conf >= 0.5 && wordy >= 2 { probeLines += 1 }
+    }
+    emit(["text_likely": probeLines >= 1, "lines": probeLines, "confidence": probeBest])
+
 case "watch":
     // File-level FSEvents for one or more folders. One JSON line per event; exits when stdin closes.
     // `watch <folder>... [--latency seconds]`: the first argument must be a folder.
     var roots = [path]
     var latency = 1.5
+    var noDefer = false          // --no-defer: the first event after a quiet spell is delivered at once, not after `latency`
     var excluded: [String] = []
     var wi = 0
     while wi < args.count {
         if args[wi] == "--latency", wi + 1 < args.count {
             latency = max(0.05, Double(args[wi + 1]) ?? 1.5)
             wi += 2
+        } else if args[wi] == "--no-defer" {
+            noDefer = true
+            wi += 1
         } else if args[wi] == "--exclude", wi + 1 < args.count {
             excluded.append(args[wi + 1])               // at most 8 folders inside the watched ones (an FSEvents limit)
             wi += 2
@@ -588,8 +631,9 @@ case "watch":
             emit(["path": paths[i], "flags": Int(eventFlags[i])])
         }
     }
-    let flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes
+    var flags = UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes
                        | kFSEventStreamCreateFlagWatchRoot)
+    if noDefer { flags |= UInt32(kFSEventStreamCreateFlagNoDefer) }
     guard let stream = FSEventStreamCreate(nil, callback, &ctx, roots as CFArray,
                                            FSEventStreamEventId(kFSEventStreamEventIdSinceNow), latency, flags) else {
         fail("cannot watch")
@@ -611,8 +655,221 @@ case "crawl":
 
 case "features":
     // What this build can do (an older installed helper answers {"error": "unknown command"}).
-    emit(["crawl": true, "watch_latency": true, "watch_exclude": true, "ocr_layout": true, "pdf_coverage": true])
+    emit(["crawl": true, "watch_latency": true, "watch_exclude": true, "watch_nodefer": true, "ocr_layout": true, "pdf_coverage": true])
 
 default:
     fail("unknown command \(command)")
+}
+
+// MARK: - Describe (whole-disk content index, mse/wholedisk.py)
+//
+//   msehelper describe --probe                 {"describe": true, "version": 1}
+//   msehelper describe --stdin [--max-px N] [--text-px N] [--pdf-px N] [--ocr gate|always|off] [--top N] [--min-conf F]
+//                              [--qos background|utility|default] [--nice N]
+//
+// One JSON object per input line: {"id": <any>, "path": "...", "kind": "image" | "pdf" | "video"}. For each one, one JSON
+// object on stdout, flushed at once (errors included):
+//   {"id", "ok": true, "labels": [{"id", "c"}], "text", "lines", "ocr", "title", "pages", "lang", "ms"}
+//   {"id", "ok": false, "error"}
+// image: Vision VNClassifyImageRequest on a copy of at most --max-px pixels (labels with confidence >= --min-conf, the top
+//        --top, identifiers with "_" written as spaces). Text is read with VNRecognizeTextRequest at the .fast level on a
+//        copy of --text-px: --ocr gate reads it only when a text-like label is among the results, always reads it, off never.
+// pdf:   the text layer of the first two pages (PDFKit). When page 1 has no text layer the page is rendered at --pdf-px and
+//        read with .fast OCR. Encrypted files are reported, not opened.
+// video: the labels of the poster frame at 10 % of the duration (AVFoundation). Nothing else is decoded.
+// A file that is dataless (an iCloud placeholder: SF_DATALESS) is refused before any read. The process runs at the given
+// QoS class (background by default), nice --nice, with its disk I/O throttled, as the crawl does.
+
+struct DescribeOptions {
+    var maxPx = 512
+    var textPx = 1280
+    var pdfPx = 1200
+    var ocr = "gate"
+    var top = 10
+    var minConf: Float = 0.15
+}
+
+/// Labels that make an image worth reading for text (a screenshot, a scan of a page, a poster, a sign ...). A static
+/// member, not a file-level constant: main.swift initialises its globals in order, and the describe command runs before
+/// the end of the file, so a file-level constant would still be unset when it is read.
+enum DescribeLabels {
+    static let textLike: Set<String> = ["document", "newspaper", "screenshot", "book", "menu", "poster", "receipt", "letter",
+                                        "sign", "text", "paper", "label", "chart", "map", "whiteboard", "blackboard"]
+}
+
+func describeFastOCR(_ image: CGImage) -> (text: String, lines: Int) {
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .fast
+    request.usesLanguageCorrection = false
+    request.minimumTextHeight = 0.012
+    if let supported = try? VNRecognizeTextRequest.supportedRecognitionLanguages(for: .fast, revision: request.revision) {
+        let wanted = supported.filter { $0 == "en-US" || $0 == "de-DE" }
+        if !wanted.isEmpty { request.recognitionLanguages = wanted }
+    }
+    let handler = VNImageRequestHandler(cgImage: image, options: [:])
+    do { try handler.perform([request]) } catch { return ("", 0) }
+    var reads: [(text: String, conf: Float, box: CGRect)] = []
+    for obs in request.results ?? [] {
+        guard let top = obs.topCandidates(1).first, top.confidence >= 0.4 else { continue }
+        let s = top.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !s.isEmpty { reads.append((s, top.confidence, obs.boundingBox)) }
+    }
+    reads.sort { $0.box.midY > $1.box.midY }                    // Vision's origin is bottom-left: top to bottom
+    return (reads.map { $0.text }.joined(separator: "\n"), reads.count)
+}
+
+func describeClassify(_ image: CGImage, _ o: DescribeOptions) -> (labels: [[String: Any]], ids: [String], textLike: Bool) {
+    let request = VNClassifyImageRequest()
+    let handler = VNImageRequestHandler(cgImage: image, options: [:])
+    do { try handler.perform([request]) } catch { return ([], [], false) }
+    let kept = (request.results ?? [])
+        .filter { $0.confidence >= o.minConf }
+        .sorted { $0.confidence > $1.confidence }
+        .prefix(o.top)
+    var labels: [[String: Any]] = [], ids: [String] = []
+    var textLike = false
+    for obs in kept {
+        let raw = obs.identifier
+        if DescribeLabels.textLike.contains(raw) { textLike = true }
+        let name = raw.replacingOccurrences(of: "_", with: " ")
+        labels.append(["id": name, "c": (Double(obs.confidence) * 1000).rounded() / 1000])
+        ids.append(name)
+    }
+    return (labels, ids, textLike)
+}
+
+func describeLanguage(_ text: String) -> String {
+    guard !text.isEmpty else { return "" }
+    let recognizer = NLLanguageRecognizer()
+    recognizer.processString(String(text.prefix(2000)))
+    switch recognizer.dominantLanguage {
+    case .some(.german): return "de"
+    case .some(.english): return "en"
+    default: return ""
+    }
+}
+
+func describeImage(_ url: URL, _ o: DescribeOptions) -> [String: Any] {
+    guard let image = loadImage(url, maxPx: o.maxPx) else { return ["ok": false, "error": "cannot read image"] }
+    if image.width < 48 || image.height < 48 { return ["ok": false, "error": "too small to describe"] }
+    let (labels, _, textLike) = describeClassify(image, o)
+    var text = "", lines = 0, ocr = false
+    if o.ocr == "always" || (o.ocr == "gate" && textLike) {
+        if let big = loadImage(url, maxPx: o.textPx) {
+            (text, lines) = describeFastOCR(big)
+            ocr = true
+        }
+    }
+    return ["ok": true, "labels": labels, "text": text, "lines": lines, "ocr": ocr, "lang": describeLanguage(text)]
+}
+
+func describePDF(_ url: URL, _ o: DescribeOptions) -> [String: Any] {
+    guard let doc = PDFDocument(url: url) else { return ["ok": false, "error": "cannot open pdf"] }
+    if doc.isLocked { return ["ok": false, "error": "encrypted"] }
+    let pages = doc.pageCount
+    var parts: [String] = []
+    var firstChars = 0
+    for i in 0..<min(2, pages) {
+        let t = doc.page(at: i)?.string ?? ""
+        if i == 0 { firstChars = t.filter { !$0.isWhitespace }.count }
+        parts.append(t)
+    }
+    var text = parts.joined(separator: "\n"), lines = 0, ocr = false
+    if firstChars < 40 && pages > 0, let cg = CGPDFDocument(url as CFURL), let page = cg.page(at: 1),
+       let img = renderPage(page, maxPx: CGFloat(o.pdfPx)) {
+        (text, lines) = describeFastOCR(img)                    // a scan: no text layer, read the picture of page 1
+        ocr = true
+    }
+    let title = (doc.documentAttributes?["Title"] as? String) ?? ""
+    return ["ok": true, "text": text, "lines": lines, "ocr": ocr, "title": title, "pages": pages,
+            "lang": describeLanguage(text)]
+}
+
+func describeVideo(_ url: URL, _ o: DescribeOptions) -> [String: Any] {
+    let asset = AVURLAsset(url: url)
+    var seconds = 0.0
+    let loaded = DispatchSemaphore(value: 0)
+    Task {
+        if let d = try? await asset.load(.duration), d.isNumeric { seconds = d.seconds }
+        loaded.signal()
+    }
+    loaded.wait()
+    let generator = AVAssetImageGenerator(asset: asset)
+    generator.appliesPreferredTrackTransform = true
+    generator.maximumSize = CGSize(width: o.maxPx, height: o.maxPx)
+    let at = CMTime(seconds: seconds > 0 ? seconds * 0.1 : 0, preferredTimescale: 600)
+    guard let frame = try? generator.copyCGImage(at: at, actualTime: nil) else { return ["ok": false, "error": "no poster frame"] }
+    let (labels, _, _) = describeClassify(frame, o)
+    return ["ok": true, "labels": labels, "text": "", "lines": 0, "ocr": false, "lang": ""]
+}
+
+func describeOne(_ item: [String: Any], _ o: DescribeOptions) -> [String: Any] {
+    let started = Date()
+    var out: [String: Any] = ["id": item["id"] ?? NSNull()]
+    guard let path = item["path"] as? String, !path.isEmpty, path.hasPrefix("/") else {
+        out["ok"] = false; out["error"] = "no absolute path"; return out
+    }
+    var st = stat()
+    guard lstat(path, &st) == 0 else { out["ok"] = false; out["error"] = "missing"; return out }
+    if st.st_flags & 0x40000000 != 0 {                          // SF_DATALESS: an iCloud placeholder, reading it downloads it
+        out["ok"] = false; out["error"] = "dataless"; return out
+    }
+    let url = URL(fileURLWithPath: path)
+    let result: [String: Any]
+    switch (item["kind"] as? String) ?? "" {
+    case "image": result = describeImage(url, o)
+    case "pdf": result = describePDF(url, o)
+    case "video": result = describeVideo(url, o)
+    default: result = ["ok": false, "error": "unknown kind"]
+    }
+    out.merge(result) { _, new in new }
+    out["ms"] = Int(Date().timeIntervalSince(started) * 1000)
+    return out
+}
+
+func describeCommand(_ args: [String]) -> Never {
+    var o = DescribeOptions()
+    var stdinMode = false, probe = false
+    var qos = "background"
+    var nice: Int32 = 10
+    var i = 0
+    while i < args.count {
+        let a = args[i]
+        func value() -> String { i += 1; return i < args.count ? args[i] : "" }
+        switch a {
+        case "--probe": probe = true
+        case "--stdin": stdinMode = true
+        case "--max-px": o.maxPx = Int(value()) ?? o.maxPx
+        case "--text-px": o.textPx = Int(value()) ?? o.textPx
+        case "--pdf-px": o.pdfPx = Int(value()) ?? o.pdfPx
+        case "--ocr": let v = value(); if ["gate", "always", "off"].contains(v) { o.ocr = v }
+        case "--top": o.top = Int(value()) ?? o.top
+        case "--min-conf": o.minConf = Float(value()) ?? o.minConf
+        case "--qos": qos = value()
+        case "--nice": nice = Int32(value()) ?? nice
+        default: break
+        }
+        i += 1
+    }
+    if probe { emit(["describe": true, "version": 1]); exit(0) }
+    guard stdinMode else { fail("describe: use --stdin (one JSON object per line) or --probe") }
+    signal(SIGPIPE, SIG_IGN)
+    setpriority(PRIO_PROCESS, 0, nice)
+    _ = setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_THROTTLE)
+    let qosClass: UInt32 = qos == "background" ? 0x09 : (qos == "utility" ? 0x11 : 0x15)
+    _ = pthread_set_qos_class_self_np(qos_class_t(qosClass), 0)
+    while let line = readLine(strippingNewline: true) {
+        if line.isEmpty { continue }
+        autoreleasepool {
+            var result: [String: Any]
+            if let data = line.data(using: .utf8),
+               let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+                result = describeOne(obj, o)
+            } else {
+                result = ["id": NSNull(), "ok": false, "error": "bad input line"]
+            }
+            emit(result)
+        }
+    }
+    exit(0)
 }

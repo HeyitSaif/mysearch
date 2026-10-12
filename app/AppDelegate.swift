@@ -32,6 +32,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settings: SettingsWindowController?
     /// The classic (old web UI) window, created on first use and kept until the native app replaces it.
     private var classic: ClassicWindowController?
+    /// The App and View menu's "Open Classic MySearch" items, hidden while the Classic interface is off (ClassicUI.swift).
+    private var classicMenuItems: [NSMenuItem] = []
     private let hotKeys = HotKeyCenter()
     private var quickKey = HotKey.load()
     private var quickMenuItems: [NSMenuItem] = []     // the View menu's Quick Search item (the status item keeps its own)
@@ -39,6 +41,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     init(snapshot: SnapshotOptions?) {
         self.snapshot = snapshot
         super.init()
+        NotificationCenter.default.addObserver(forName: ClassicUI.didChange, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.classicStateChanged() }
+        }
     }
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -77,6 +82,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !hotKeys.registerAll(quick: quickKey) {
             NSLog("MySearch: Quick Search shortcut \(quickKey.label) is taken by another app")
         }
+
+        // update check (Updater.swift): the menu-bar item shows a newer release; the check itself runs at most once a day
+        status.onUpdate = { UpdateChecker.shared.openReleasePage() }
+        UpdateChecker.shared.onChange = { [weak self] version in self?.status.setUpdate(version) }
+        UpdateChecker.shared.start()
+        // first run (OnboardingController.swift): opens the setup assistant when there is something to set up
+        OnboardingController.shared.showIfNeeded()
 
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -172,9 +184,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// The Classic page's `setQuickKey` message: reads the key it sent and applies it (applyQuickKey).
     func setQuickKey(_ d: [String: Any], from pane: WebPane) {
         let reset = (d["reset"] as? Bool) == true
-        var key = HotKey.quickDefault
+        var key: HotKey?
         if !reset {
             guard let code = (d["code"] as? String).flatMap({ HotKey.codes[$0] }) else {
                 hotKeys.registerAll(quick: quickKey)
@@ -186,38 +199,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if (d["alt"] as? Bool) == true { mods |= UInt32(optionKey) }
             if (d["shift"] as? Bool) == true { mods |= UInt32(shiftKey) }
             key = HotKey(code: UInt32(code), mods: mods)
-            let refusal: String?
-            if mods & UInt32(cmdKey | controlKey | optionKey) == 0 && !key.isFunctionKey {
-                refusal = "Add ⌘, ⌃ or ⌥, so the shortcut does not take over normal typing."
-            } else if key == HotKey.main {
-                refusal = "\(key.label) already shows the main window."
-            } else if HotKey.reserved.contains(key) {
-                refusal = "\(key.label) belongs to macOS or another app you use."
-            } else {
-                refusal = nil
-            }
-            if let refusal {
-                hotKeys.registerAll(quick: quickKey)
-                return sendAppInfo(to: pane, error: refusal)
-            }
         }
+        if let refusal = applyQuickKey(key) {
+            hotKeys.registerAll(quick: quickKey)     // the page paused the hot keys to record; they go back on
+            return sendAppInfo(to: pane, error: refusal)
+        }
+        sendAppInfo(to: pane, message: "Saved. Press \((key ?? .quickDefault).label) anywhere.")
+    }
+
+    /// Makes `key` (nil: the default) the Quick Search shortcut at once. It is checked (HotKey.refusal), registered and
+    /// saved, and the status item and the View menu follow it. Returns the reason it is not used, or nil when it is. A
+    /// refusal changes nothing; a key another app has taken leaves the old shortcut registered.
+    func applyQuickKey(_ key: HotKey?) -> String? {
+        let new = key ?? .quickDefault
+        if key != nil, let refusal = HotKey.refusal(for: new) { return refusal }
         let old = quickKey
-        quickKey = key
+        quickKey = new
         hotKeys.unregisterAll()
-        if hotKeys.registerAll(quick: key) {
-            if reset {
-                UserDefaults.standard.removeObject(forKey: "quickKeyCode")
-                UserDefaults.standard.removeObject(forKey: "quickKeyMods")
-            } else {
-                key.save()
-            }
-            status.setQuickKey(key, extraItems: quickMenuItems)
-            sendAppInfo(to: pane, message: "Saved. Press \(key.label) anywhere.")
-        } else {
+        guard hotKeys.registerAll(quick: new) else {
             quickKey = old
             hotKeys.registerAll(quick: old)
-            sendAppInfo(to: pane, error: "\(key.label) is taken by another app. Try another.")
+            return "\(new.label) is taken by another app. Try another."
         }
+        if key == nil {
+            UserDefaults.standard.removeObject(forKey: "quickKeyCode")
+            UserDefaults.standard.removeObject(forKey: "quickKeyMods")
+        } else {
+            new.save()
+        }
+        status.setQuickKey(new, extraItems: quickMenuItems)
+        return nil
+    }
+
+    /// The hot keys off or back on. The shortcut recorder turns them off while it waits for a key (ShortcutRecorder.swift),
+    /// so that the key it is given does not also fire Quick Search or the main window.
+    func setHotKeysPaused(_ paused: Bool) {
+        if paused { hotKeys.unregisterAll() } else { hotKeys.registerAll(quick: quickKey) }
     }
 
     func loginState() -> String {
@@ -244,15 +261,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func openSettings() {
+    /// Opens Settings, optionally at a section with one row highlighted (the Classic alert's "Open Settings").
+    func openSettings(section: SWSection? = nil, highlight: String? = nil) {
         if settings == nil { settings = SettingsWindowController(appDelegate: self) }
-        settings?.show()
+        settings?.show(section: section, highlight: highlight)
     }
 
-    /// Opens the classic window (the full old web UI) or brings it forward. Independent of the main window.
+    /// Opens the classic window (the full old web UI) or brings it forward. Independent of the main window. While the
+    /// Classic interface is turned off (ClassicUI.swift) every caller gets the alert instead: the route, the menus, the
+    /// Command Palette and the toolbar.
     func showClassic() {
+        guard ClassicUI.isEnabled else { ClassicUI.presentOffAlert(); return }
         if classic == nil { classic = ClassicWindowController() }
         classic?.show()
+    }
+
+    /// Applies the Classic setting to what is already on screen: the App and View menu items, the classic window and
+    /// the toolbars of the open main windows. The status item and the Settings toolbar listen for the same notification.
+    func classicStateChanged() {
+        let on = ClassicUI.isEnabled
+        for item in classicMenuItems { item.isHidden = !on }
+        if !on { classic?.hide() }
+        for controller in mainControllers {
+            ClassicUI.syncToolbar(controller.window.toolbar, itemID: ClassicUI.toolbarItemID)
+        }
     }
 
     @objc func openClassicWindow(_ sender: Any?) { showClassic() }
@@ -387,6 +419,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let item = NSMenuItem(title: "Open Classic MySearch", action: #selector(openClassicAction), keyEquivalent: keyed ? "0" : "")
         if keyed { item.keyEquivalentModifierMask = [.command, .shift] }
         item.target = self
+        item.isHidden = !ClassicUI.isEnabled
+        classicMenuItems.append(item)
         return item
     }
     @objc private func backAction() { mainWindow.goBack() }

@@ -71,7 +71,7 @@ enum SW {
 // MARK: - sections and the search index
 
 enum SWSection: String, CaseIterable, Identifiable {
-    case folders, groups, search, schedule, ask, wholeMac, favourites, agents, privacy, macApp, about
+    case folders, groups, search, indexing, schedule, ask, wholeMac, wholeDisk, favourites, agents, privacy, macApp, advanced, about
     var id: String { rawValue }
 
     var title: String {
@@ -79,13 +79,16 @@ enum SWSection: String, CaseIterable, Identifiable {
         case .folders: return "Folders"
         case .groups: return "Groups"
         case .search: return "Search"
+        case .indexing: return "Indexing"
         case .schedule: return "Schedule & Engine"
         case .ask: return "Ask"
         case .wholeMac: return "Whole-Mac Search"
+        case .wholeDisk: return "Whole-disk Search"
         case .favourites: return "Favourites"
         case .agents: return "AI Agents"
         case .privacy: return "Privacy"
         case .macApp: return "Mac App"
+        case .advanced: return "Advanced"
         case .about: return "About"
         }
     }
@@ -95,13 +98,16 @@ enum SWSection: String, CaseIterable, Identifiable {
         case .folders: return "folder.fill"
         case .groups: return "square.stack.3d.up.fill"
         case .search: return "magnifyingglass"
+        case .indexing: return "text.magnifyingglass"
         case .schedule: return "moon.stars.fill"
         case .ask: return "sparkles"
         case .wholeMac: return "internaldrive.fill"
+        case .wholeDisk: return "doc.text.magnifyingglass"
         case .favourites: return "star.fill"
         case .agents: return "cpu.fill"
         case .privacy: return "hand.raised.fill"
         case .macApp: return "macwindow"
+        case .advanced: return "slider.horizontal.3"
         case .about: return "info.circle.fill"
         }
     }
@@ -111,13 +117,16 @@ enum SWSection: String, CaseIterable, Identifiable {
         case .folders: return .blue
         case .groups: return .indigo
         case .search: return .teal
+        case .indexing: return .mint
         case .schedule: return .purple
         case .ask: return .pink
         case .wholeMac: return .orange
+        case .wholeDisk: return .red
         case .favourites: return .yellow
         case .agents: return .green
         case .privacy: return .gray
         case .macApp: return .cyan
+        case .advanced: return .brown
         case .about: return .secondary
         }
     }
@@ -127,13 +136,16 @@ enum SWSection: String, CaseIterable, Identifiable {
         case .folders: return "Each folder has its own index. Your files are only read, never changed."
         case .groups: return "A group searches several folders together and can get its own tab."
         case .search: return "How results are found and ordered. Changes apply to the next search."
+        case .indexing: return "What is read and what is skipped, for every folder. Changes apply at the next sync."
         case .schedule: return "Changed files are indexed within seconds. Heavy work waits for the night run or Sync now."
         case .ask: return "Short answers with numbered references, written from your top results."
         case .wholeMac: return "File names across this Mac, never contents. Private places are always skipped."
+        case .wholeDisk: return "Finds files by name and by what is in them, across the folders you choose. Heavy work waits until the Mac is idle."
         case .favourites: return "Results you starred come first the next time you, or an agent, search for them."
         case .agents: return "Connect AI apps so they search your folders through MCP."
         case .privacy: return "Everything stays on this Mac. Nothing is uploaded, and searches are not logged."
         case .macApp: return "Quick Search, the menu-bar item and what happens at login."
+        case .advanced: return "Options that change what the app itself offers."
         case .about: return "Versions, where things live, and the models on disk."
         }
     }
@@ -165,12 +177,18 @@ enum SWIndex {
         .init(section: .folders, id: "folder.cloud", title: "Allow cloud answers", keywords: "ask private keep on this mac"),
         .init(section: .folders, id: "folder.agents", title: "AI agents in this folder", keywords: "connect disconnect mcp claude cursor codex"),
         .init(section: .folders, id: "folder.problems", title: "Unreadable files and retry", keywords: "errors failed problems waiting embed ocr"),
+        .init(section: .folders, id: "folder.gitignore", title: "Skip .gitignore files in this folder", keywords: "git override use default indexing"),
+        .init(section: .folders, id: "folder.code", title: "Index code files in this folder", keywords: "source lockfiles override use default indexing"),
         .init(section: .groups, id: "groups.new", title: "New group", keywords: "combine folders tab"),
         .init(section: .groups, id: "groups.tab", title: "Show a group as a tab", keywords: "hidden menu"),
         .init(section: .search, id: "search.limit", title: "Results per search", keywords: "limit count agents cli"),
         .init(section: .search, id: "search.bridge", title: "Translate between English and German", keywords: "language bridge vocabulary rechnung"),
         .init(section: .search, id: "search.rerank", title: "Re-check close calls", keywords: "reranker re-rank ties"),
         .init(section: .search, id: "search.hub", title: "Overview files rank lower", keywords: "summary readme index penalty hub"),
+        .init(section: .indexing, id: "indexing.gitignore", title: "Skip files listed in .gitignore", keywords: "git ignore repository build output caches"),
+        .init(section: .indexing, id: "indexing.code", title: "Index code files (source code, lockfiles)", keywords: "source programming lockfile contents read by name"),
+        .init(section: .indexing, id: "indexing.excludes", title: "Never index these folders", keywords: "skip extra exclude prune node_modules build cache"),
+        .init(section: .indexing, id: "indexing.embedding", title: "Embedding mode and priority", keywords: "embedding fast full quality low impact balanced meaning"),
         .init(section: .schedule, id: "sched.night", title: "Night run", keywords: "nightly time ocr embeddings enable"),
         .init(section: .schedule, id: "sched.ac", title: "Only when plugged in", keywords: "battery power ac"),
         .init(section: .schedule, id: "sched.scan", title: "Check folders for changes every", keywords: "interval minutes scan"),
@@ -202,10 +220,14 @@ enum SWIndex {
         .init(section: .privacy, id: "privacy.secrets", title: "Always skipped secrets", keywords: "patterns credentials keys read-only"),
         .init(section: .macApp, id: "app.login", title: "Open at login", keywords: "startup launch"),
         .init(section: .macApp, id: "app.quick", title: "Quick Search shortcut", keywords: "hotkey option space"),
+        .init(section: .macApp, id: "app.updates", title: "Check for updates", keywords: "new version release github automatic daily privacy"),
+        .init(section: .macApp, id: "app.setup", title: "Setup Assistant", keywords: "welcome first run onboarding models folders full disk access service"),
         .init(section: .macApp, id: "app.launchers", title: "Open in… (Terminal, VS Code, Cursor, Claude Code, Codex)", keywords: "launcher editor terminal iterm refresh finder"),
+        .init(section: .advanced, id: "classic.toggle", title: "Show Classic interface (legacy web UI)", keywords: "old web classic legacy window menu shortcut settings"),
         .init(section: .about, id: "about.versions", title: "Versions", keywords: "version service uptime port"),
         .init(section: .about, id: "about.models", title: "Models and their sizes", keywords: "search model reranker whisper speech disk"),
         .init(section: .about, id: "about.paths", title: "Data folder and mse path", keywords: "logs binary location"),
+        .init(section: .about, id: "about.licences", title: "Licences", keywords: "license notices third party open source gpl lgpl mit ffmpeg"),
     ]
 
     static func matches(_ q: String) -> [SWIndexItem] {
@@ -253,9 +275,13 @@ struct SWFolder: Identifiable {
     let askCloud: Bool?                 // nil: this service does not report it
     let stats: SWStats?
     let hasAliases: Bool
+    /// The folder's row as the service sent it. The per-folder Indexing overrides (respect_gitignore, index_code) are read
+    /// from here: a missing key or null means "use the default".
+    let raw: SWJSON
     var id: String { name }
 
     init(_ r: SWJSON) {
+        raw = r
         name = r.swS("name") ?? ""; path = r.swS("path") ?? ""; desc = r.swS("description") ?? ""
         inAll = r.swB("in_global") ?? false; enabled = r.swB("enabled") ?? true; exists = r.swB("exists") ?? true
         hasAliases = r["aliases"] != nil
@@ -284,6 +310,8 @@ final class SWModel: ObservableObject {
     @Published var notice: String?
     @Published var savedAt: Date?
     @Published var errors: [String: String] = [:]
+    /// The Classic interface setting (ClassicUI.swift), kept current so the screens can hide Classic entry points.
+    @Published var classicOn = ClassicUI.isEnabled
 
     // service
     @Published var status: SWJSON = [:]
@@ -303,6 +331,9 @@ final class SWModel: ObservableObject {
     @Published var busy: Set<String> = []
     @Published var localModels: SWJSON?
     @Published var wholeStatus: SWJSON?
+    /// The latest whole-disk status read (GET /api/disk/status) and why it could not be read, if it could not.
+    @Published var diskStatus: DiskStatus?
+    @Published var diskError: String?
     @Published var agentsAvailable: Bool?
     @Published var globalAgents: [SWJSON]?
     @Published var folderAgents: [String: [SWJSON]] = [:]
@@ -334,6 +365,9 @@ final class SWModel: ObservableObject {
         NotificationCenter.default.addObserver(forName: GroupNotes.changed, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in await self?.refreshCollections(force: true) }
         }
+        NotificationCenter.default.addObserver(forName: ClassicUI.didChange, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.classicOn = ClassicUI.isEnabled }
+        }
     }
 
     // MARK: derived
@@ -344,7 +378,27 @@ final class SWModel: ObservableObject {
     var jobs: SWJSON { status.swO("jobs") }
     var currentJob: SWJSON? { jobs["current"] as? SWJSON }
     var visible: Bool { (window?.isVisible ?? false) && (window?.occlusionState.contains(.visible) ?? false) }
-    var sectionsShown: [SWSection] { SWSection.allCases.filter { $0 != .ask || askAvailable || statusState == nil } }
+    var sectionsShown: [SWSection] {
+        SWSection.allCases.filter { s in
+            switch s {
+            case .ask: return askAvailable || statusState == nil
+            case .indexing: return indexingShown
+            case .wholeDisk: return wholeDiskShown || statusState == nil
+            default: return true
+            }
+        }
+    }
+
+    /// The Indexing options the service reports (settings.indexing), checked key by key. Nothing is shown, and nothing is
+    /// posted, for a key the service does not send. Older services send none of them, so the pane is hidden.
+    var indexingKeys: SWJSON { settings.swO("indexing") }
+    /// The whole-disk pane is shown only when the service sends the "wholedisk" key (API.swift).
+    var wholeDiskShown: Bool { settings["wholedisk"] != nil }
+    static let indexingKeyNames = ["respect_gitignore", "index_code", "extra_excludes"]
+    var indexingAvailable: Bool { SWModel.indexingKeyNames.contains { indexingKeys[$0] != nil } }
+    /// The Embedding placeholders (settings.embedding: mode, priority). They arrive with a later service.
+    var embeddingAvailable: Bool { settings.swO("embedding")["mode"] != nil || settings.swO("embedding")["priority"] != nil }
+    var indexingShown: Bool { indexingAvailable || embeddingAvailable }
 
     func setSection(_ s: SWSection) {
         section = s
@@ -413,6 +467,8 @@ final class SWModel: ObservableObject {
             onAppear(section)
             return
         }
+        // a pane whose options the service no longer sends (or a saved pane that is hidden) falls back to Folders
+        if !sectionsShown.contains(section) { section = .folders }
         let busyNow = currentJob != nil
         if t % (busyNow ? 2 : 4) == 0 { await refreshCollections() }
         if t % 4 == 0 { await refreshSettings() }
@@ -506,6 +562,7 @@ final class SWModel: ObservableObject {
         defer { inflight -= 1 }
         do {
             let reply = try await MSEClient.shared.postJSON("/api/settings", body: body)
+            if body["wholedisk"] != nil { WholeDiskStore.shared.refresh() }   // the searches read the saved values again
             for k in keys { errors[k] = nil }
             if pending.isEmpty {                          // the stored (normalised) values replace the optimistic ones
                 for (k, v) in reply where v is SWJSON { settings[k] = v }

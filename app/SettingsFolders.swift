@@ -5,6 +5,34 @@ import SwiftUI
 
 // MARK: - Folders
 
+/// The heading of the Folders pane: what deep indexing means, and the action that adds a folder to it. The action is the
+/// same add flow as Add Folder (SWFolderPicker, then the add sheet, POST /api/collections).
+struct SWDeepIndexHeader: View {
+    @EnvironmentObject var m: SWModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text("Deep indexed").font(.headline)
+                Spacer(minLength: 12)
+                Button("Deep-index a folder…") { SWFolderPicker.choose(from: m) }
+                    .buttonStyle(.borderedProminent).controlSize(.small)
+            }
+            Text("Deep indexing reads all text, scans, audio and video in a folder, with English↔German matching.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+/// The English-German bridge, read from the settings: on when translation is enabled and the corpus bridge is on, the
+/// same two switches the Search pane shows as "Translate between English and German".
+enum SWLanguage {
+    static func bridgeOn(_ settings: SWJSON) -> Bool {
+        let t = settings.swO("translation")
+        return (t.swB("enabled") ?? false) && (t.swB("corpus_bridge") ?? false)
+    }
+}
+
 struct SWFoldersView: View {
     @EnvironmentObject var m: SWModel
     @State private var dropping = false
@@ -13,6 +41,7 @@ struct SWFoldersView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
+                    SWDeepIndexHeader()
                     SWActivityPanel()
                     if m.collections.isEmpty {
                         SWEmptyFolders()
@@ -137,7 +166,13 @@ struct SWFolderCard: View {
         return (.ok, "Up to date")
     }
 
+    /// The status line, with the language note of a deep-indexed folder: "English + German" while the English-German
+    /// bridge is on (read from the settings only; this pane never writes it).
     private var statusLine: String {
+        ([baseStatusLine] + (SWLanguage.bridgeOn(m.settings) ? ["English + German"] : [])).joined(separator: " · ")
+    }
+
+    private var baseStatusLine: String {
         guard let s = f.stats else { return f.exists ? "Not indexed yet." : "\(SW.tilde(f.path)) is not there." }
         var parts = [SW.count(s.files, "file"), SW.bytes(s.bytes)]
         if s.embedPending > 0 { parts.append("\(SW.num(s.embedPending)) waiting to embed") }
@@ -291,6 +326,23 @@ struct SWFolderDetail: View {
                     Toggle("", isOn: Binding(get: { ask }, set: { m.patchFolder(f.name, ["ask_cloud": $0], err: err) })).labelsHidden().toggleStyle(.switch)
                 }
             }
+            if m.indexingKeys["respect_gitignore"] != nil || m.indexingKeys["index_code"] != nil {
+                Text("Indexing").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 4)
+                if m.indexingKeys["respect_gitignore"] != nil {
+                    SWRow(id: "folder.gitignore", title: "Skip files listed in .gitignore",
+                          detail: "Follows the Indexing setting unless this folder has its own.", errorKey: err) {
+                        overridePicker(key: "respect_gitignore", value: f.raw["respect_gitignore"] as? Bool,
+                                       inherited: (m.indexingKeys["respect_gitignore"] as? Bool) ?? true)
+                    }
+                }
+                if m.indexingKeys["index_code"] != nil {
+                    SWRow(id: "folder.code", title: "Index code files (source code, lockfiles)",
+                          detail: "Follows the Indexing setting unless this folder has its own.", errorKey: err) {
+                        overridePicker(key: "index_code", value: f.raw["index_code"] as? Bool,
+                                       inherited: (m.indexingKeys["index_code"] as? Bool) ?? false)
+                    }
+                }
+            }
             Text("Read from files").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary).padding(.top, 4)
             SWRow(id: "folder.media", title: "Images", detail: "OCR for text in pictures, and search by picture.", cost: "Runs in the night run; the picture model uses memory while it works.") {
                 Toggle("", isOn: Binding(get: { f.images }, set: { m.patchFolder(f.name, ["media": ["images": $0]], err: err) })).labelsHidden().toggleStyle(.switch)
@@ -346,6 +398,22 @@ struct SWFolderDetail: View {
             }) { m.patchFolder(f.name, [key: lines($0)], err: err) }
             if !note.isEmpty { Text(note).font(.caption).foregroundStyle(key == "exclude" && note.contains("would be skipped") ? Color.orange : Color.secondary) }
         }
+    }
+
+    /// "Use default (On)" / "On" / "Off" for one per-folder Indexing override. A missing or null value is "use default";
+    /// choosing it sends null, which clears the folder's override on the service.
+    private func overridePicker(key: String, value: Bool?, inherited: Bool) -> some View {
+        let current: String
+        if let value { current = value ? "on" : "off" } else { current = "default" }
+        return Picker("", selection: Binding(get: { current }, set: { choice in
+            let body: Any = choice == "default" ? NSNull() : (choice == "on")
+            m.patchFolder(f.name, [key: body], err: err)
+        })) {
+            Text("Use default (\(inherited ? "On" : "Off"))").tag("default")
+            Text("On").tag("on")
+            Text("Off").tag("off")
+        }
+        .labelsHidden().frame(width: 220)
     }
 
     private func lines(_ t: String) -> [String] { t.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } }

@@ -670,6 +670,6 @@ final class CommandPalette: NSObject, NSWindowDelegate, NSTextFieldDelegate, NST
                     catch { NSLog("MySearch: Rescan Mac failed: \(error.localizedDescription)") }
                 }
             },
-        ]
+        ].filter { $0.id != "classic" || ClassicUI.isEnabled }      // built on every open, so recents follow the setting too
     }
 }

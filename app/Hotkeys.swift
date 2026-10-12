@@ -1,9 +1,20 @@
 // Global shortcuts with Carbon hot keys (no accessibility permission needed).
 //   ⌃⌥Space  show or hide the main window          (HotKey.main, id 1)
-//   ⌥Space   Quick Search (default; Settings › Mac app changes it, saved in UserDefaults, id 2)
+//   ⌥Space   Quick Search (default; Settings › Mac app records a new one, saved in UserDefaults, id 2)
+// The rules a shortcut must pass (HotKey.refusal) and the reading of a recorded key press (HotKey.capture) are pure: no
+// window, no defaults write. The logic tests (tests/swift/main.swift) compile this file alone. The recorder is
+// ShortcutRecorder.swift; AppDelegate.applyQuickKey registers a shortcut at once.
 
 import Cocoa
 import Carbon.HIToolbox
+
+/// What one recorded key press means (ShortcutRecorder.swift).
+enum ShortcutCapture: Equatable {
+    case cancel                 // Esc: leave the recorder, nothing changes
+    case reset                  // Delete or forward Delete: back to the default
+    case key(HotKey)            // a shortcut that passes the rules
+    case refused(String)        // a key or combination that cannot be used, with the reason to show
+}
 
 /// A global shortcut as Carbon wants it, plus how to show it.
 struct HotKey: Equatable {
@@ -14,7 +25,7 @@ struct HotKey: Equatable {
     /// ⌥Space: one hand, launcher-like, and free here. ⌘Space is Raycast (raycastGlobalHotkey "Command-49"),
     /// ⌃Space / ⌃⌥Space switch input sources (⌃⌥Space is also the main window), ⌥⌘Space is Finder search.
     static let quickDefault = HotKey(code: UInt32(kVK_Space), mods: UInt32(optionKey))
-    /// shortcuts that belong to macOS or to other apps
+    /// shortcuts that belong to macOS or to other apps; refusal(for:) turns each into its own reason
     static let reserved: [HotKey] = [
         HotKey(code: UInt32(kVK_Space), mods: UInt32(cmdKey)),
         HotKey(code: UInt32(kVK_Space), mods: UInt32(controlKey)),
@@ -23,6 +34,28 @@ struct HotKey: Equatable {
         HotKey(code: UInt32(kVK_Tab), mods: UInt32(cmdKey)),
         HotKey(code: UInt32(kVK_ANSI_Q), mods: UInt32(cmdKey)),
         HotKey(code: UInt32(kVK_ANSI_W), mods: UInt32(cmdKey)),
+        HotKey(code: UInt32(kVK_ANSI_Grave), mods: UInt32(cmdKey)),          // cycle the windows of an app
+        HotKey(code: UInt32(kVK_ANSI_Q), mods: UInt32(controlKey | cmdKey)), // lock the screen
+        HotKey(code: UInt32(kVK_ANSI_F), mods: UInt32(controlKey | cmdKey)), // full screen
+        HotKey(code: UInt32(kVK_ANSI_D), mods: UInt32(optionKey | cmdKey)),  // show or hide the Dock
+        HotKey(code: UInt32(kVK_F3), mods: 0),                               // Mission Control
+        HotKey(code: UInt32(kVK_F11), mods: 0),                              // show the desktop
+    ]
+    /// shortcuts MySearch itself uses, in its menus and in its windows (a global key would shadow them); each one has its
+    /// own reason in refusal(for:). ⌥⌘⌫ (Delete Immediately) is not listed: the recorder reads Delete as "reset".
+    static let ownKeys: [HotKey] = [
+        HotKey(code: UInt32(kVK_ANSI_N), mods: UInt32(optionKey | cmdKey)),          // New Group…
+        HotKey(code: UInt32(kVK_ANSI_Backslash), mods: UInt32(optionKey | cmdKey)),  // Split Pane
+        HotKey(code: UInt32(kVK_ANSI_Backslash), mods: UInt32(controlKey | cmdKey)), // Show All Tabs
+        HotKey(code: UInt32(kVK_ANSI_O), mods: UInt32(optionKey | cmdKey)),          // Open in Editor
+        HotKey(code: UInt32(kVK_ANSI_C), mods: UInt32(optionKey | cmdKey)),          // Copy Path
+        HotKey(code: UInt32(kVK_ANSI_A), mods: UInt32(controlKey | cmdKey)),         // Make Alias
+        HotKey(code: UInt32(kVK_ANSI_F), mods: UInt32(optionKey | cmdKey)),          // the scope picker
+        HotKey(code: UInt32(kVK_ANSI_1), mods: UInt32(controlKey)),                  // jump to the names
+        HotKey(code: UInt32(kVK_ANSI_2), mods: UInt32(controlKey)),                  // jump to the contents
+        HotKey(code: UInt32(kVK_ANSI_3), mods: UInt32(controlKey)),                  // jump to the filters
+        HotKey(code: UInt32(kVK_F5), mods: 0),                                       // copy to the other pane
+        HotKey(code: UInt32(kVK_F6), mods: 0),                                       // move to the other pane
     ]
 
     /// KeyboardEvent.code → virtual key code (ANSI layout positions)
@@ -52,6 +85,47 @@ struct HotKey: Equatable {
     }()
     var isFunctionKey: Bool { [kVK_F1, kVK_F2, kVK_F3, kVK_F4, kVK_F5, kVK_F6, kVK_F7, kVK_F8, kVK_F9, kVK_F10, kVK_F11, kVK_F12].contains(Int(code)) }
 
+    /// Why this shortcut cannot be used, or nil when it can. One set of rules for every way a shortcut is set (the recorder
+    /// and the Classic page). A global key must not take over other apps: a letter, digit or punctuation key needs ⌃ or ⌥
+    /// (⌘ or ⇧ alone are menu shortcuts in most apps, and ⇧ alone would type capitals), and any other key needs ⌘, ⌃ or ⌥
+    /// unless it is a function key.
+    static func refusal(for key: HotKey) -> String? {
+        guard names[Int(key.code)] != nil else { return "That key cannot be used for a shortcut." }
+        if reserved.contains(key) { return "\(key.label) belongs to macOS or another app you use." }
+        if ownKeys.contains(key) { return "\(key.label) already does something in MySearch." }
+        if key == .main { return "\(key.label) already shows the main window." }
+        if key.isFunctionKey { return nil }
+        if key.mods & UInt32(cmdKey | controlKey | optionKey) == 0 {
+            return "Add ⌘, ⌃ or ⌥, so the shortcut does not take over normal typing."
+        }
+        if key.mods & UInt32(controlKey | optionKey) == 0 {
+            return "Add ⌃ or ⌥. ⌘ and ⇧ alone are menu shortcuts in most apps."
+        }
+        return nil
+    }
+
+    /// What one recorded key press means: Esc cancels, Delete restores the default, anything else is a shortcut or refused.
+    /// `keyCode` is the event's virtual key code (kVK_*) and `flags` its modifiers.
+    static func capture(keyCode: Int, flags: NSEvent.ModifierFlags) -> ShortcutCapture {
+        if keyCode == kVK_Escape { return .cancel }
+        if keyCode == kVK_Delete || keyCode == kVK_ForwardDelete { return .reset }
+        guard names[keyCode] != nil else { return .refused("That key cannot be used for a shortcut.") }
+        let key = HotKey(code: UInt32(truncatingIfNeeded: keyCode), mods: carbonMods(flags))
+        if let why = refusal(for: key) { return .refused(why) }
+        return .key(key)
+    }
+
+    /// Carbon modifier bits for a Cocoa modifier set. Fn, Caps Lock and the keypad are not part of a shortcut.
+    static func carbonMods(_ flags: NSEvent.ModifierFlags) -> UInt32 {
+        let f = flags.intersection(.deviceIndependentFlagsMask).subtracting([.function, .capsLock, .numericPad])
+        var m: UInt32 = 0
+        if f.contains(.control) { m |= UInt32(controlKey) }
+        if f.contains(.option) { m |= UInt32(optionKey) }
+        if f.contains(.shift) { m |= UInt32(shiftKey) }
+        if f.contains(.command) { m |= UInt32(cmdKey) }
+        return m
+    }
+
     var label: String {
         var s = ""
         if mods & UInt32(controlKey) != 0 { s += "⌃" }
@@ -73,7 +147,11 @@ struct HotKey: Equatable {
         return (key, f)
     }
 
+    /// Snapshot renders only (SnapshotSettingsExtra.swift): the shortcut they show, so they read no preference.
+    nonisolated(unsafe) static var snapshotKey: HotKey?
+
     static func load() -> HotKey {
+        if let snapshotKey { return snapshotKey }
         let d = UserDefaults.standard
         guard d.object(forKey: "quickKeyCode") != nil else { return .quickDefault }
         return HotKey(code: UInt32(d.integer(forKey: "quickKeyCode")), mods: UInt32(d.integer(forKey: "quickKeyMods")))

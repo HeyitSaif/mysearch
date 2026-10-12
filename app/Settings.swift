@@ -35,13 +35,24 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         window.toolbarStyle = .unified
         model.window = window
         model.openClassic = { [weak self] section in self?.classic.show(section: section) }
+        NotificationCenter.default.addObserver(forName: ClassicUI.didChange, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.syncClassicToolbarItem() }
+        }
     }
 
-    /// Opens the window (⌘,) and starts the live refresh.
-    func show() {
+    /// Opens the window (⌘,) and starts the live refresh. `section` opens that pane; `highlight` opens the pane of that
+    /// row and flashes it (the Classic alert's "Open Settings" uses both).
+    func show(section: SWSection? = nil, highlight: String? = nil) {
+        if let highlight, let item = SWIndex.items.first(where: { $0.id == highlight }) { model.reveal(item) }
+        else if let section { model.setSection(section) }
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
         model.start()
+    }
+
+    /// Adds or removes the toolbar's Classic Settings item to match the Classic setting (ClassicUI.swift).
+    func syncClassicToolbarItem() {
+        ClassicUI.syncToolbar(window.toolbar, itemID: ClassicUI.settingsToolbarItemID)
     }
 
     @objc private func classicAction(_ sender: Any?) { classic.show() }
@@ -56,7 +67,9 @@ extension SettingsWindowController: NSToolbarDelegate {
     private static let classicID = NSToolbarItem.Identifier("classicSettings")
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, Self.classicID] }
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { [.flexibleSpace, Self.classicID] }
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [.flexibleSpace] + (ClassicUI.isEnabled ? [Self.classicID] : [])      // off: no Classic Settings item
+    }
 
     func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier,
                  willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
@@ -103,7 +116,7 @@ final class ClassicSettingsWindowController: NSObject, NSWindowDelegate {
 
     /// Opens the window on the web settings page (loading it the first time), at `section` when given.
     func show(section: String? = nil) {
-        if pane.web.url == nil { pane.load(MSEClient.shared.pageURL()) }
+        if pane.web.url == nil || pane.authFailed { pane.load(MSEClient.shared.pageURL()) }
         let arg = section.map { js($0) } ?? "undefined"
         pane.run("window.showSettings && showSettings(\(arg))")
         NSApp.activate(ignoringOtherApps: true)

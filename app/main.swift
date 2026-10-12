@@ -11,6 +11,8 @@ if CommandLine.arguments.contains("--daemon") { runDaemonSupervisor() }
 MainActor.assumeIsolated {
     // --selftest-groups: the group operations against a dev service (MSE_API_BASE); prints and exits, no window (GroupEditor.swift).
     if CommandLine.arguments.contains("--selftest-groups") { GroupsSelfTest.run() }
+    // --selftest-onboarding: the setup assistant's model against a dev service (MSE_API_BASE); no window, no download (OnboardingController.swift).
+    if CommandLine.arguments.contains("--selftest-onboarding") { OnboardingSelfTest.run() }
     let snapshotOptions = SnapshotOptions.parse(CommandLine.arguments)
     let application = NSApplication.shared
     application.setActivationPolicy(snapshotOptions == nil ? .regular : .prohibited)

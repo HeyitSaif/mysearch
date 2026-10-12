@@ -26,7 +26,7 @@ os.environ.setdefault("MSE_HOME", tempfile.mkdtemp(prefix="mse-test-"))
 from mse import ask, cli, config, filequery as fq, macindex as mi, mcp, search  # noqa: E402
 
 # The system temp folder (/private/var/folders) is private to the rules on purpose; test trees live under /tmp.
-TMP = os.path.realpath("/tmp")
+TMP = os.path.realpath(os.environ.get("TMPDIR") or "/tmp")
 
 
 def mkdtemp(prefix="mse-mi-"):
@@ -1346,7 +1346,8 @@ class AskHttp(unittest.TestCase):
 class AgentBoundary(unittest.TestCase):
     def test_mcp_has_no_whole_mac_tool_and_no_route_to_it(self):
         names = {t["name"] for t in mcp.TOOLS}
-        self.assertEqual(names, {"search", "get", "multi_get", "similar", "collections", "mark_best", "sync", "ask"})
+        self.assertEqual(names, {"search", "get", "multi_get", "similar", "collections", "mark_best", "sync", "ask",
+                                 "timeline", "facets"})
         self.assertFalse([n for n in names if "file" in n and n not in ("multi_get",)])
         src = Path(mcp.__file__).read_text()
         for forbidden in ("macindex", "filequery", "/api/files", "files_search"):

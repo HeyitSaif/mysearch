@@ -317,11 +317,17 @@ final class ColumnViewController: NSViewController, NSBrowserDelegate, FolderHos
     /// preview, so a folder column later at the same depth is not left at the preview's width.
     private var normalWidths: [Int: CGFloat] = [:]
     private var previewWidthPending = false
+    /// The widths the user dragged the folder columns to, by depth, kept across launches. NSBrowser's own column autosave
+    /// (columnsAutosaveName) also stored the preview's widened width at its depth, so a folder there opened too wide. The
+    /// app keeps these itself and writes only folder columns the user resized. Snapshots neither read nor write them.
+    private var folderWidths: [Int: CGFloat] = [:]
+    private static let folderWidthsKey = "MySearchColumnFolderWidths"
 
     init(provider: ContentProvider, snapshot: Bool) {
         self.provider = provider
         self.snapshot = snapshot
         super.init(nibName: nil, bundle: nil)
+        if !snapshot { folderWidths = Self.loadFolderWidths() }
         actions.onOpenFolder = { [weak self] url in self?.onNavigate?(url) }
         actions.host = self
         observers.append(NotificationCenter.default.addObserver(forName: FileOpsService.changed, object: nil, queue: .main) { [weak self] n in
@@ -356,16 +362,26 @@ final class ColumnViewController: NSViewController, NSBrowserDelegate, FolderHos
         browser.action = #selector(selectionChanged(_:))
         browser.doubleAction = #selector(doubleClicked(_:))
         browser.onKey = { [weak self] event in self?.handleKey(event) ?? false }
-        if !snapshot {
-            browser.columnsAutosaveName = "MySearchColumnView"
-        }
         let menu = NSMenu()
         menu.delegate = self
         browser.menu = menu
         filterBar.onChange = { [weak self] text in self?.setFilterText(text) }
         filterBar.onClose = { [weak self] in self?.closeFilter() }
         filterBar.onMoveIntoList = { [weak self] in self?.moveIntoList() }
-        view = FolderFilterContainer(content: browser, bar: filterBar)
+        // The window's content view runs under the toolbar (full-size content view), and NSBrowser does not inset its
+        // columns for that. The container is therefore pinned below the safe area: otherwise the first rows of every
+        // column sit under the toolbar and cannot be seen.
+        let root = NSView()
+        let container = FolderFilterContainer(content: browser, bar: filterBar)
+        container.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(container)
+        NSLayoutConstraint.activate([
+            container.topAnchor.constraint(equalTo: root.safeAreaLayoutGuide.topAnchor),
+            container.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            container.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            container.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+        ])
+        view = root
     }
 
     // MARK: public API
@@ -537,11 +553,15 @@ final class ColumnViewController: NSViewController, NSBrowserDelegate, FolderHos
     /// Every other column keeps the width NSBrowser suggests.
     func browser(_ sender: NSBrowser, shouldSizeColumn column: Int, forUserResize: Bool, toWidth suggestedWidth: CGFloat) -> CGFloat {
         guard column == previewColumn() else {
-            if !forUserResize, let normal = normalWidths.removeValue(forKey: column) { return normal }
-            return suggestedWidth
+            if forUserResize {
+                rememberFolderWidth(suggestedWidth, column: column)
+                return suggestedWidth
+            }
+            if let normal = normalWidths.removeValue(forKey: column) { return normal }
+            return folderWidths[column] ?? suggestedWidth
         }
         if normalWidths[column] == nil { normalWidths[column] = suggestedWidth }
-        return previewFillWidth(column)
+        return previewPlacement(column).width
     }
 
     /// The last column changes when a file is selected or a folder is opened: the preview comes or goes.
@@ -627,13 +647,67 @@ final class ColumnViewController: NSViewController, NSBrowserDelegate, FolderHos
         return browser.parentForItems(inColumn: last - 1) as? ItemNode
     }
 
-    /// The width the preview takes: what is left of the visible width after the columns before it, and never less
-    /// than minPreviewWidth. Columns scrolled off the left edge do not count. The frames are used, not the widths,
-    /// because NSBrowser puts a separator between columns (two points) that the widths leave out.
-    private func previewFillWidth(_ column: Int) -> CGFloat {
-        let first = min(max(browser.firstVisibleColumn, 0), column)
-        let start = browser.frame(ofColumn: column).minX - browser.frame(ofColumn: first).minX
-        return max(ColumnViewController.minPreviewWidth, browser.bounds.width - start)
+    /// The folder-column widths the user kept (see folderWidths).
+    private static func loadFolderWidths() -> [Int: CGFloat] {
+        let stored = UserDefaults.standard.dictionary(forKey: folderWidthsKey) as? [String: Double] ?? [:]
+        var widths: [Int: CGFloat] = [:]
+        for (depth, width) in stored {
+            if let column = Int(depth), width >= 60, width <= 2000 { widths[column] = CGFloat(width) }
+        }
+        return widths
+    }
+
+    /// Records a folder column's width after the user dragged it. Writes only when it changed.
+    private func rememberFolderWidth(_ width: CGFloat, column: Int) {
+        guard !snapshot, folderWidths[column] != width else { return }
+        folderWidths[column] = width
+        let stored = Dictionary(uniqueKeysWithValues: folderWidths.map { (String($0.key), Double($0.value)) })
+        UserDefaults.standard.set(stored, forKey: Self.folderWidthsKey)
+    }
+
+    /// NSBrowser's internal scroll view. Its document is the row of columns, and its clip view moves by pixels. NSBrowser's
+    /// own scrolling (firstVisibleColumn) moves by whole columns, which cannot line the preview up with the right edge.
+    /// It is a direct subview of the browser with a horizontal scroller. Each column is a scroll view too, but it lives
+    /// inside the columns container and has no horizontal scroller, so it is never picked here.
+    private var columnsScrollView: NSScrollView? {
+        browser.subviews.lazy.compactMap { $0 as? NSScrollView }.first { $0.hasHorizontalScroller }
+    }
+
+    /// The clip view of the column-title strip under the columns. It scrolls with them.
+    private var titlesClipView: NSClipView? { browser.subviews.first { $0 is NSClipView } as? NSClipView }
+
+    /// Where the preview goes: the horizontal scroll of the columns, and the preview's width. The preview's right edge is
+    /// the visible right edge, and it is at least minPreviewWidth wide. The scroll goes to the first column edge that
+    /// still leaves the minimum width on screen, so the columns in view are whole (no sliver of a column at the edge)
+    /// and the preview takes what is left. Everything is in document coordinates (the columns' own space).
+    /// NSBrowser's frame(ofColumn:) is measured from the visible left edge, so the current scroll is added back.
+    private func previewPlacement(_ column: Int) -> (x: CGFloat, width: CGFloat) {
+        let visible = browser.bounds.width
+        let current = columnsScrollView?.contentView.bounds.origin.x ?? 0
+        let left = browser.frame(ofColumn: column).minX + current
+        let lowest = left + ColumnViewController.minPreviewWidth - visible      // the scroll at which the minimum just fits
+        var x = left
+        for c in 0..<column {
+            let edge = browser.frame(ofColumn: c).minX + current
+            if edge >= lowest, edge < x { x = edge }
+        }
+        x = max(0, x)
+        return (x, visible - (left - x))
+    }
+
+    /// Scrolls the columns and their title strip to x. The clip view constrains x to the columns, so no blank space is
+    /// left after the last column when the preview goes.
+    private func scrollColumns(toX x: CGFloat) {
+        guard let scroll = columnsScrollView else { return }
+        let clip = scroll.contentView
+        let target = clip.constrainBoundsRect(NSRect(origin: NSPoint(x: x, y: clip.bounds.origin.y), size: clip.bounds.size)).origin
+        if abs(target.x - clip.bounds.origin.x) > 0.5 {
+            clip.scroll(to: target)
+            scroll.reflectScrolledClipView(clip)
+        }
+        if let titles = titlesClipView, abs(titles.bounds.origin.x - target.x) > 0.5 {
+            titles.scroll(to: NSPoint(x: target.x, y: titles.bounds.origin.y))
+        }
     }
 
     /// Defers updatePreviewWidth to the next turn of the run loop, after NSBrowser has laid out the columns. Calls made
@@ -660,14 +734,13 @@ final class ColumnViewController: NSViewController, NSBrowserDelegate, FolderHos
         }
         guard let preview else {
             previewController = nil
+            scrollColumns(toX: columnsScrollView?.contentView.bounds.origin.x ?? 0)     // clamped: no blank space on the right
             return
         }
-        if normalWidths[preview] == nil {
-            normalWidths[preview] = browser.width(ofColumn: preview)
-            browser.scrollColumnToVisible(preview)      // a newly shown preview is on screen
-        }
-        let fill = previewFillWidth(preview)
-        if abs(browser.width(ofColumn: preview) - fill) > 0.5 { browser.setWidth(fill, ofColumn: preview) }
+        if normalWidths[preview] == nil { normalWidths[preview] = browser.width(ofColumn: preview) }
+        let placement = previewPlacement(preview)
+        if abs(browser.width(ofColumn: preview) - placement.width) > 0.5 { browser.setWidth(placement.width, ofColumn: preview) }
+        scrollColumns(toX: placement.x)
     }
 
     // MARK: live updates

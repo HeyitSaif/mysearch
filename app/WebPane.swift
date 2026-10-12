@@ -49,6 +49,14 @@ final class WebPane: NSObject, WKNavigationDelegate, WKUIDelegate {
     private var loaded = false
     private var queued: [String] = []
     private var retryTimer: Timer?
+    /// A 401 from the service (the page's token was refused) reloads the page once with the current token. A second 401
+    /// shows a native notice with Retry and sets `authFailed`, so the owner can ask the pane to load again.
+    private var authRetried = false
+    private(set) var authFailed = false
+    /// Set when our own cancel of a 401 response is about to fail the navigation. That failure (WebKit error 102, or
+    /// NSURLErrorCancelled) is expected and must not show the waiting page or arm its retry.
+    private var awaitingAuthCancel = false
+    private var notice: NSView?
 
     /// - Parameters:
     ///   - messages: the names of the page's message handlers
@@ -79,10 +87,23 @@ final class WebPane: NSObject, WKNavigationDelegate, WKUIDelegate {
         }
     }
 
+    /// Loads a page. A call from outside starts over: the 401 retry is available again.
     func load(_ url: URL) {
         loaded = false
         retryURL = url
+        authRetried = false
+        authFailed = false
+        hideNotice()
         web.load(URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 10))
+    }
+
+    /// Loads the page again with the token the service has now (the config may have been written or rotated since).
+    /// Internal retries use this, so the "retried once" state is kept.
+    private func reloadPage() {
+        guard let url = retryURL else { return }
+        loaded = false
+        web.load(URLRequest(url: MSEClient.shared.refreshingToken(url), cachePolicy: .reloadIgnoringLocalCacheData,
+                            timeoutInterval: 10))
     }
 
     /// Runs a script in the page. Before the page has loaded the call waits and runs once it has.
@@ -99,6 +120,10 @@ final class WebPane: NSObject, WKNavigationDelegate, WKUIDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard webView.url?.host == "127.0.0.1" else { return }     // not the "waiting for the service" note
         loaded = true
+        authRetried = false
+        authFailed = false
+        awaitingAuthCancel = false
+        hideNotice()
         let pending = queued
         queued = []
         for script in pending { webView.evaluateJavaScript(script) }
@@ -106,14 +131,16 @@ final class WebPane: NSObject, WKNavigationDelegate, WKUIDelegate {
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        let code = (error as NSError).code
+        if awaitingAuthCancel && (code == 102 || code == NSURLErrorCancelled) {     // WebKit 102: policy change; ours
+            awaitingAuthCancel = false
+            return
+        }
         guard let html = waitingHTML else { return }
         webView.loadHTMLString(html, baseURL: nil)
         retryTimer?.invalidate()
         retryTimer = Timer.scheduledTimer(withTimeInterval: retryAfter, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, let url = self.retryURL else { return }
-                self.load(url)
-            }
+            MainActor.assumeIsolated { self?.reloadPage() }     // with the token the service has now
         }
     }
 
@@ -126,6 +153,63 @@ final class WebPane: NSObject, WKNavigationDelegate, WKUIDelegate {
             return
         }
         decisionHandler(.allow)
+    }
+
+    /// A 401 from the service means the page's token was refused: the config was not written yet, or the token was
+    /// rotated. The 401 page is not shown. The page is reloaded once with the current token; if that is refused too, a
+    /// native notice offers Retry. Only the main frame counts: a 401 for a sub-resource is the page's own business.
+    func webView(_ webView: WKWebView, decidePolicyFor response: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        guard response.isForMainFrame, (response.response as? HTTPURLResponse)?.statusCode == 401 else {
+            decisionHandler(.allow)
+            return
+        }
+        decisionHandler(.cancel)
+        awaitingAuthCancel = true
+        retryTimer?.invalidate()
+        loaded = false
+        if !authRetried {
+            authRetried = true
+            DispatchQueue.main.async { [weak self] in
+                MainActor.assumeIsolated { self?.reloadPage() }     // after the cancel has finished
+            }
+        } else {
+            authFailed = true
+            showNotice()
+        }
+    }
+
+    /// The native notice for a page the service still refuses. Retry loads it again with the current token.
+    private func showNotice() {
+        guard notice == nil else { return }
+        let label = NSTextField(labelWithString: "MySearch could not sign in to the search service.")
+        label.font = .systemFont(ofSize: 15)
+        label.alignment = .center
+        let button = NSButton(title: "Retry", target: self, action: #selector(retryClicked))
+        button.bezelStyle = .rounded
+        let stack = NSStackView(views: [label, button])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        web.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: web.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: web.centerYAnchor),
+        ])
+        notice = stack
+    }
+
+    private func hideNotice() {
+        notice?.removeFromSuperview()
+        notice = nil
+    }
+
+    @objc private func retryClicked() {
+        hideNotice()
+        authRetried = false
+        authFailed = false
+        reloadPage()
     }
 
     // MARK: confirm() / prompt() / alert() need native panels in WKWebView.

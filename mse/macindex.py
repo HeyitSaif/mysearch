@@ -25,13 +25,16 @@ import traceback
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import config, filequery, paths
-from .ignore import SECRET_PATTERNS, compile_pattern
+from . import config, filequery, frecency, gitignore, paths
+from .ignore import KEYNOTE_MIN_BYTES, SECRET_PATTERNS, compile_pattern, is_key_name, secret_rules_without_key
 from .textutil import fold
 
-SCHEMA_VERSION = 1
+TRI_NAME = "name_tri"
+SCHEMA_VERSION = 2                     # 2: detail=none trigram index (name_tri) + tri_stats; 1: the first index (names)
+LEGACY_SCHEMA = 1
 RULES_VERSION = 3                      # bump when the built-in privacy rules change: forces a re-crawl and a purge
 BATCH = 2000
+SMALL_BATCH = 400                      # rows in a write that is not worth loading the whole vocabulary for
 CRAWL_DELAY_S = 20                     # after the service starts, before the first crawl begins
 MUST_SCAN = 0x1 | 0x2 | 0x4            # FSEvents: MustScanSubDirs, UserDropped, KernelDropped
 F_CREATED, F_REMOVED, F_RENAMED, F_ISDIR = 0x100, 0x200, 0x800, 0x20000
@@ -65,11 +68,82 @@ DEFAULT_EXCLUDE = config.DEFAULTS["mac_index"]["exclude"]
 # Folders macOS protects with a consent dialog (TCC): skipped without Full Disk Access unless already in use.
 PROTECTED_HOME = ["Desktop", "Documents", "Downloads", "Movies", "Music", "Pictures", "Library/Mobile Documents"]
 
-DEFAULT_CONFIG = config.DEFAULTS["mac_index"]
+# The settings of the name search that the shipped defaults (config.DEFAULTS) do not list. Every key can be changed with
+# POST /api/settings {"mac_index": {...}}; config.json keeps only what was changed.
+EXTRA_DEFAULTS = {
+    "smart_case": True,            # a word typed with a capital AND a small letter (Report) is matched with its case
+    "frecency": True,              # files opened from the results rank a little higher, see mse/frecency.py
+    "respect_gitignore": False,    # leave out what the .gitignore / .ignore files of a git repository ignore
+    "match_folder_names": False,   # when the names alone come up short, words may also be found in the folder path
+    "regex_budget_ms": 150,        # time a pattern with no literal text may scan before it returns what it has (partial)
+}
+DEFAULT_CONFIG = {**config.DEFAULTS["mac_index"], **EXTRA_DEFAULTS}
 
 
 def home() -> str:
     return str(Path.home())
+
+
+# ------------------------------------------------------------------ thread QoS
+
+QOS_USER_INTERACTIVE, QOS_DEFAULT = 0x21, 0x15
+_QOS_LIB: list = []
+
+
+def _qos_lib():
+    """libSystem's QoS calls through ctypes, or None (not macOS, or the symbols are missing)."""
+    if not _QOS_LIB:
+        lib = None
+        if sys.platform == "darwin":
+            try:
+                import ctypes
+                lib = ctypes.CDLL(None)
+                lib.pthread_set_qos_class_self_np.argtypes = [ctypes.c_uint, ctypes.c_int]
+                lib.pthread_set_qos_class_self_np.restype = ctypes.c_int
+                lib.pthread_get_qos_class_np.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint),
+                                                         ctypes.POINTER(ctypes.c_int)]
+                lib.pthread_get_qos_class_np.restype = ctypes.c_int
+                lib.pthread_self.restype = ctypes.c_void_p
+            except (OSError, AttributeError):
+                lib = None
+        _QOS_LIB.append(lib)
+    return _QOS_LIB[0]
+
+
+def thread_qos() -> int | None:
+    """The QoS class of the calling thread (0 = unspecified), or None when it cannot be read."""
+    lib = _qos_lib()
+    if lib is None:
+        return None
+    import ctypes
+    cls, rel = ctypes.c_uint(0), ctypes.c_int(0)
+    return int(cls.value) if lib.pthread_get_qos_class_np(lib.pthread_self(), ctypes.byref(cls), ctypes.byref(rel)) == 0 else None
+
+
+@contextmanager
+def interactive_qos():
+    """Run the block at user-interactive QoS on the calling thread only (setpriority would change the whole process),
+    then put the thread back: a keep-alive connection thread goes on to serve other routes. A no-op where it cannot work."""
+    lib = _qos_lib()
+    old = None
+    if lib is not None:
+        try:
+            import ctypes
+            cls, rel = ctypes.c_uint(0), ctypes.c_int(0)
+            if lib.pthread_get_qos_class_np(lib.pthread_self(), ctypes.byref(cls), ctypes.byref(rel)) == 0:
+                old = (cls.value or QOS_DEFAULT, rel.value)
+            if lib.pthread_set_qos_class_self_np(QOS_USER_INTERACTIVE, 0) != 0:
+                old = None
+        except Exception:
+            old = None
+    try:
+        yield
+    finally:
+        if old is not None:
+            try:
+                lib.pthread_set_qos_class_self_np(old[0], min(0, old[1]))
+            except Exception:
+                pass
 
 
 def db_path() -> Path:
@@ -143,6 +217,12 @@ def check_settings(v: dict) -> dict:
         v = {**v, "roots": normalize_roots(v["roots"])}
     if "exclude" in v:
         v = {**v, "exclude": normalize_excludes(v["exclude"])}
+    for k in ("smart_case", "frecency", "respect_gitignore", "match_folder_names"):
+        if k in v and not isinstance(v[k], bool):
+            raise ValueError(f"mac_index.{k} must be true or false")
+    if "regex_budget_ms" in v and not (isinstance(v["regex_budget_ms"], (int, float)) and not isinstance(v["regex_budget_ms"], bool)
+                                       and 20 <= v["regex_budget_ms"] <= 5000):
+        raise ValueError("mac_index.regex_budget_ms must be a number of milliseconds between 20 and 5000")
     if "skip_protected" in v and v["skip_protected"] not in ("auto", "always", "never"):
         raise ValueError("mac_index.skip_protected must be auto, always or never")
     if "rescan_every_h" in v and not (isinstance(v["rescan_every_h"], (int, float)) and v["rescan_every_h"] >= 0):
@@ -301,6 +381,29 @@ def edit_paths(current: list[str], action: str, items: list[str], h: str | None 
     return new, changed, same
 
 
+QOS_UTILITY = 0x11
+
+
+@contextmanager
+def background_qos():
+    """The calling thread at utility QoS for the block (long housekeeping must not compete with a typed search)."""
+    lib = _qos_lib()
+    ok = False
+    if lib is not None:
+        try:
+            ok = lib.pthread_set_qos_class_self_np(QOS_UTILITY, 0) == 0
+        except Exception:
+            ok = False
+    try:
+        yield
+    finally:
+        if ok:
+            try:
+                lib.pthread_set_qos_class_self_np(QOS_DEFAULT, 0)
+            except Exception:
+                pass
+
+
 # ------------------------------------------------------------------ the privacy rules
 
 def _expand(p: str, h: str) -> str:
@@ -339,11 +442,40 @@ def protected_skips(mode: str, fda: bool | None, collection_paths: list[str], h:
     return out
 
 
+def keynote_verdict(path: str) -> bool | None:
+    """The built-in *.key rule for one path, the same rule as indexer._secret_excluded:
+    True = blocked: inside a package, a .key that is a private key (a small file), or a .key that is gone (nothing
+    can say what it was). False = a Keynote deck: a folder named *.key, or a regular file over KEYNOTE_MIN_BYTES,
+    decided by lstat, nothing read. None = no .key name is involved. The other rules still apply to a deck."""
+    parts = path.split("/")
+    if any(is_key_name(p) for p in parts[:-1]):
+        return True
+    if not is_key_name(parts[-1]):
+        return None
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return True
+    if S.S_ISDIR(st.st_mode):
+        return False
+    return not (S.S_ISREG(st.st_mode) and st.st_size > KEYNOTE_MIN_BYTES)
+
+
+def gone_keynote(path: str) -> bool:
+    """A *.key path, outside any package, that no longer exists. Its event must still reach the index, which removes the
+    rows under it (a deck it holds). Nothing else is let through: the rules still block everything else."""
+    parts = path.split("/")
+    if not is_key_name(parts[-1]) or any(is_key_name(p) for p in parts[:-1]):
+        return False
+    return not os.path.lexists(path)
+
+
 class Excluder:
     """blocked(path) -> True for anything that must not be indexed or shown. Built from the built-in rules, the
     secret patterns and the settings. A configurable exclusion (mac_index.exclude, the protected folders) does not
     apply inside an explicit root that sits within it (root ~/Library/CloudStorage inside the excluded ~/Library);
-    the hard rules apply everywhere."""
+    the hard rules apply everywhere. The built-in *.key pattern is the one exception: a Keynote deck is let through
+    (keynote_verdict), a private key is not. A *.key that the user configured is blocked as before."""
 
     def __init__(self, cfg: dict | None = None, h: str | None = None, protected: list[str] | None = None,
                  roots: list[str] | None = None):
@@ -352,12 +484,14 @@ class Excluder:
         self.hard = [os.path.normpath(os.path.join(self.home, p)) for p in HARD_HOME] + HARD_ABS
         self.soft: list[str] = []
         self.patterns: list[str] = list(SECRET_PATTERNS) + HARD_PATTERNS
+        configured: list[str] = []
         for e in cfg.get("exclude") or []:
             e = _expand(e, self.home)
             if e.startswith("/") and not re.search(r"[*?\[]", e):
                 self.soft.append(e.rstrip("/") or "/")
             else:
                 self.patterns.append(e)
+                configured.append(e)
         self.soft += [p.rstrip("/") for p in (protected or [])]
         self.noise = {n.lower() for n in NOISE_DIRS}
         carve = []
@@ -371,25 +505,43 @@ class Excluder:
         self._hset, self._htuple = set(pre), tuple(p.rstrip("/") + "/" for p in pre)
         soft = [p.lower() for p in self.soft]
         self._sset, self._stuple = set(soft), tuple(p.rstrip("/") + "/" for p in soft)
-        rx = [compile_pattern(p).pattern for p in self.patterns]
-        self._rx = re.compile("|".join(f"(?:{r})" for r in rx), re.I) if rx else None
+        # every rule but the built-in *.key one (keynote_verdict decides that per path)
+        rx = [compile_pattern(p).pattern for p in secret_rules_without_key() + HARD_PATTERNS + configured]
+        # re.S: the rules' `.*` must run across a newline too, or one folder named "a\nb" would switch every rule below it off
+        self._rx = re.compile("|".join(f"(?:{r})" for r in rx), re.I | re.S) if rx else None
         # every built-in pattern is about one name; a configured pattern with a "/" is about a path: no shortcut then
-        self._name_only = not any("/" in p.strip("/") and not p.startswith("**/") for p in self.patterns)
-        self._clean_parent = None
+        self._name_only = not any("/" in (p[3:] if p.startswith("**/") else p).strip("/") for p in self.patterns)
+        # Directories whose own chain is verified not blocked (see blocked()). Only clean verdicts are kept: a blocked or
+        # unknown directory always takes the full check, so a carved-out root below a blocked folder is still let through.
+        self._clean_dirs: set[str] = set()
+
+    CLEAN_DIRS_MAX = 50000
 
     def blocked(self, path: str, soft: bool = True) -> bool:
         lp = path.lower()
+        if ".key" in lp and keynote_verdict(path):
+            return True
+        if not (soft and self._name_only):
+            return self._blocked_full(path, lp, soft)
         parent, _, name = path.rpartition("/")
-        if soft and self._name_only and parent == self._clean_parent:
-            # the previous call verified this folder and everything above it: only the entry's own name is new
-            if lp in self._hset or lp in self._sset or lp[len(parent) + 1:] in self.noise:
-                return lp in self._hset or self._blocked_full(path, lp, soft)
+        if parent in self._clean_dirs:
+            # The folder chain is known to be clean: only the entry's own name is new. A name that is itself a rule
+            # (an exact hard/soft entry, a noise folder) takes the full check.
+            if lp in self._hset or lp in self._sset or name.lower() in self.noise:
+                return self._blocked_full(path, lp, soft)
             return bool(self._rx and self._rx.search(name))
         if self._blocked_full(path, lp, soft):
             return True
-        if soft and self._name_only:
-            self._clean_parent = parent
+        if parent and not self._blocked_full(parent, parent.lower(), soft):
+            if len(self._clean_dirs) >= self.CLEAN_DIRS_MAX:
+                self._clean_dirs.clear()
+            self._clean_dirs.add(parent)
         return False
+
+    def blocked_uncached(self, path: str, soft: bool = True) -> bool:
+        """The verdict without any cache: the reference blocked() must agree with (tests, audits)."""
+        lp = path.lower()
+        return bool((".key" in lp and keynote_verdict(path)) or self._blocked_full(path, lp, soft))
 
     def _blocked_full(self, path: str, lp: str, soft: bool) -> bool:
         if lp in self._hset or lp.startswith(self._htuple):
@@ -411,6 +563,8 @@ class Excluder:
             args += ["--skip-prefix", p]
         for n in NOISE_DIRS:
             args += ["--skip-dir", n]
+        # --skip-name is a name glob and cannot test a size, so "*.key" stays a skip here and the crawl never lists a
+        # Keynote deck. keynote_verdict lets a deck through only where Python checks a path: live events, walk_python.
         for pat in self.patterns:
             pat = pat.rstrip("/")
             if pat.startswith("**/"):
@@ -566,9 +720,22 @@ CREATE TABLE IF NOT EXISTS files(
   size INTEGER NOT NULL DEFAULT 0, mtime INTEGER NOT NULL DEFAULT 0, ctime INTEGER NOT NULL DEFAULT 0,
   ext TEXT NOT NULL DEFAULT '', kind INTEGER NOT NULL, depth INTEGER NOT NULL, gen INTEGER NOT NULL DEFAULT 0);
 CREATE UNIQUE INDEX IF NOT EXISTS files_path ON files(path);
-CREATE VIRTUAL TABLE IF NOT EXISTS names USING fts5(nf, content='files', content_rowid='id', tokenize='trigram');
 CREATE TABLE IF NOT EXISTS vocab(tok TEXT PRIMARY KEY, rtok TEXT NOT NULL) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS vocab_r ON vocab(rtok);
+"""
+# Schema 2. The name index keeps no positions (detail=none: about a third of the size of the first index) and no column
+# sizes (columnsize=0: nothing here ranks by bm25), so it answers "which names contain this 3-letter piece" and nothing
+# else; filequery verifies the whole word with instr(). tri_stats holds how many names contain each piece; it only
+# steers the query plan (which pieces to ask for first), so a stale count costs speed and never a result.
+FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS name_tri USING fts5(nf, content='files', content_rowid='id', tokenize='trigram',
+  detail=none, columnsize=0);
+CREATE VIRTUAL TABLE IF NOT EXISTS name_tri_v USING fts5vocab(name_tri, 'row');
+CREATE TABLE IF NOT EXISTS tri_stats(tri TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID;
+"""
+# Schema 1, still read (and kept current) until Store.migrate_fts has built the new index.
+LEGACY_FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS names USING fts5(nf, content='files', content_rowid='id', tokenize='trigram');
 """
 INDEXES = """
 CREATE INDEX IF NOT EXISTS files_nf ON files(nf);
@@ -580,11 +747,29 @@ CREATE INDEX IF NOT EXISTS files_size ON files(size) WHERE is_dir = 0;
 """
 TRIGGERS = """
 CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
+  INSERT INTO name_tri(rowid, nf) VALUES (new.id, new.nf); END;
+CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
+  INSERT INTO name_tri(name_tri, rowid, nf) VALUES ('delete', old.id, old.nf); END;
+"""
+LEGACY_TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
   INSERT INTO names(rowid, nf) VALUES (new.id, new.nf); END;
 CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
   INSERT INTO names(names, rowid, nf) VALUES ('delete', old.id, old.nf); END;
 """
 SECONDARY_INDEXES = ["files_nf", "files_parent", "files_ext", "files_kind", "files_mtime", "files_size"]
+
+STAT_MIN = 8                           # pieces in fewer names than this are not listed in tri_stats (they read as rare)
+WATCH_LATENCY_S = 0.05                 # FSEvents coalescing in the helper: a created file is reported ~20 ms later (was 0.3 s)
+FLUSH_COALESCE_S = 0.01                # after the first event of a burst, wait this long for the rest before applying
+FLUSH_MIN_GAP_S = 0.05                 # at least this long between two applies; 4x the apply time when that is longer
+LEGACY_GRACE_S = 60                    # after the upgrade, before the first index's table is dropped
+STATS_EVERY_MIN = 5000                 # rows changed before the counts are recounted (or 2% of the index, if more)
+
+# tri_stats is rebuilt from the name index's own vocabulary, a slice of the key space at a time (about 40 ms each on
+# two million names), so it never needs one long write.
+STAT_BOUNDS = [""] + list("0123456789abcdefghijklmnopqrstuvwxyz") + ["\u0080"]
+STAT_SLICES = [(STAT_BOUNDS[i], STAT_BOUNDS[i + 1]) for i in range(len(STAT_BOUNDS) - 1)] + [(STAT_BOUNDS[-1], None)]
 
 UPSERT = ("INSERT INTO files(path, nf, parent_id, is_dir, size, mtime, ctime, ext, kind, depth, gen)"
           " VALUES (?, ?, (SELECT id FROM files WHERE path = ?), ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -597,6 +782,21 @@ INSERT_NEW = ("INSERT INTO files(path, nf, parent_id, is_dir, size, mtime, ctime
               " ON CONFLICT(path) DO NOTHING")
 UPDATE_CHANGED = ("UPDATE files SET is_dir = ?, size = ?, mtime = ?, ctime = ?, ext = ?, kind = ? WHERE path = ?"
                   " AND (is_dir != ? OR size != ? OR mtime != ? OR ext != ? OR kind != ?)")
+
+
+def _statements(script: str) -> list[str]:
+    """The statements of a DDL script made of statements that each end in ';' (no trigger bodies with inner ';' ...
+    triggers are split on their closing 'END;')."""
+    out, cur = [], []
+    for line in script.strip().splitlines():
+        cur.append(line)
+        if line.rstrip().endswith("END;") or (line.rstrip().endswith(";") and not any(
+                l.lstrip().upper().startswith("CREATE TRIGGER") for l in cur)):
+            out.append("\n".join(cur).rstrip().rstrip(";"))
+            cur = []
+    if cur:
+        out.append("\n".join(cur).rstrip().rstrip(";"))
+    return [x for x in out if x.strip()]
 
 
 def open_db(path: Path | str, readonly: bool = False) -> sqlite3.Connection:
@@ -626,25 +826,63 @@ class Store:
         self._count = (0.0, 0)
         self._bulk = False
         self._bulk_read = (0.0, False)
+        self._fts_cache = (0.0, "names")
+        self._dirty = 0                                  # rows changed since tri_stats was last recounted (a hint)
+        self._stats_built = False                        # tri_stats recounted by this process (an empty one is then normal)
+        self._legacy_left = False                        # schema 2 with the first index still on disk (dropped later)
+        self.upgrade: dict = {"state": "idle"}           # the index upgrade, for /api/files/status
 
     # ---- connections
     def writer(self) -> sqlite3.Connection:
         with self.wlock:
             if self._w is None:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                self._w = open_db(self.path)
-                self._w.execute("PRAGMA wal_autocheckpoint = 2000")
-                self._w.executescript(BASE_SCHEMA)
-                self._bulk = self._w.execute("SELECT v FROM meta WHERE k = 'bulk'").fetchone()
-                self._bulk = bool(self._bulk and self._bulk[0] == "1")
-                if not self._bulk:                       # (a load interrupted in bulk mode stays in it until it ends)
-                    self._w.executescript(INDEXES + TRIGGERS)
-                v = self.get_meta("schema")
-                if v is None:
-                    self.set_meta("schema", str(SCHEMA_VERSION))
-                elif v != str(SCHEMA_VERSION):
-                    raise RuntimeError(f"macindex.db has schema {v}, expected {SCHEMA_VERSION}")
+                w = open_db(self.path)
+                try:
+                    self._init_writer(w)
+                except BaseException:
+                    w.close()
+                    raise
+                self._w = w
             return self._w
+
+    @staticmethod
+    def _has_table(w: sqlite3.Connection, name: str) -> bool:
+        return w.execute("SELECT 1 FROM sqlite_master WHERE name = ?", (name,)).fetchone() is not None
+
+    def _init_writer(self, w: sqlite3.Connection) -> None:
+        """Open an existing or new database in whatever schema it has. Schema 2 gets the trigram index and its triggers.
+        Schema 1 (an index from before the speed work) is left exactly as it is and keeps being maintained and searched
+        until migrate_fts() has built the new index; a schema-1 database that never finished its first load holds no
+        index at all and simply becomes schema 2."""
+        w.execute("PRAGMA wal_autocheckpoint = 2000")
+        w.executescript(BASE_SCHEMA)
+        row = w.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()
+        v = row[0] if row else None
+        bulk = w.execute("SELECT v FROM meta WHERE k = 'bulk'").fetchone()
+        self._bulk = bool(bulk and bulk[0] == "1")       # (a load interrupted in bulk mode stays in it until it ends)
+        legacy_table = self._has_table(w, "names")
+        if v is None:
+            v = str(LEGACY_SCHEMA) if legacy_table else str(SCHEMA_VERSION)    # decided by the tables, not by a missing row
+            w.execute("INSERT INTO meta(k, v) VALUES ('schema', ?)", (v,))
+        elif v == str(LEGACY_SCHEMA) and self._bulk:
+            w.execute("DROP TABLE IF EXISTS names")
+            legacy_table = False
+            v = str(SCHEMA_VERSION)
+            w.execute("UPDATE meta SET v = ? WHERE k = 'schema'", (v,))
+        if v == str(SCHEMA_VERSION):
+            w.executescript(FTS_SCHEMA)
+            if not self._bulk:
+                w.executescript(INDEXES + TRIGGERS)
+            self._legacy_left = legacy_table
+            self._fts_cache = (time.time(), "name_tri")
+        elif v == str(LEGACY_SCHEMA):
+            w.executescript(LEGACY_FTS_SCHEMA)
+            if not self._bulk:
+                w.executescript(INDEXES + LEGACY_TRIGGERS)
+            self._fts_cache = (time.time(), "names")
+        else:
+            raise RuntimeError(f"macindex.db has schema {v}, expected {SCHEMA_VERSION}")
 
     @contextmanager
     def read(self):
@@ -733,6 +971,14 @@ class Store:
     def begin_bulk(self) -> None:
         with self.wlock:
             w = self.writer()
+            if self._schema_of(w) < 2 and w.execute("SELECT count(*) FROM files").fetchone()[0] == 0:
+                # an empty schema-1 database about to be loaded: nothing to keep, so it simply becomes schema 2
+                w.execute("DROP TABLE IF EXISTS names")
+                w.execute("UPDATE meta SET v = ? WHERE k = 'schema'", (str(SCHEMA_VERSION),))
+                for stmt in _statements(FTS_SCHEMA):
+                    w.execute(stmt)
+                self._legacy_left = False
+                self._fts_cache = (time.time(), "name_tri")
             w.execute("BEGIN")
             w.execute("DROP TRIGGER IF EXISTS files_ai")
             w.execute("DROP TRIGGER IF EXISTS files_ad")
@@ -747,27 +993,208 @@ class Store:
         with self.wlock:
             w = self.writer()
             w.executescript(INDEXES)
-            w.execute("INSERT INTO names(names) VALUES ('rebuild')")
-            w.executescript(TRIGGERS)
+            if self._schema_of(w) >= 2:
+                w.execute("INSERT INTO name_tri(name_tri) VALUES ('rebuild')")
+                w.execute("INSERT INTO name_tri(name_tri) VALUES ('optimize')")
+                self.refresh_stats()
+                w.executescript(TRIGGERS)
+            else:                                                 # a schema-1 database that was not emptied first
+                w.execute("INSERT INTO names(names) VALUES ('rebuild')")
+                w.executescript(LEGACY_TRIGGERS)
             w.execute("INSERT INTO meta(k, v) VALUES ('bulk', '0') ON CONFLICT(k) DO UPDATE SET v = '0'")
             w.execute("ANALYZE")
             self._bulk, self._bulk_read = False, (time.time(), False)
 
+    # ---- the name index: which table answers, how it is counted, how an old one is replaced
+    def schema_version(self) -> int:
+        v = self.get_meta("schema")
+        return int(v) if v and v.isdigit() else SCHEMA_VERSION
+
+    def fts_name(self) -> str:
+        """The table to ask for names: name_tri (schema 2) or, until migrate_fts has run, the first index."""
+        t, v = self._fts_cache
+        if time.time() - t > 1.0:
+            v = "name_tri" if self.schema_version() >= 2 else "names"
+            self._fts_cache = (time.time(), v)
+        return v
+
+    def fts_pending(self) -> bool:
+        """True for a finished schema-1 index that migrate_fts() should replace."""
+        return (self.path.exists() and self.get_meta("schema") == str(LEGACY_SCHEMA) and not self.in_bulk())
+
+    def refresh_stats(self, sl: int | None = None) -> int:
+        """Recount tri_stats from the name index's own vocabulary: all of it, or one slice of the key space (STAT_SLICES).
+        Pieces held by fewer than STAT_MIN names are left out: a missing piece reads as rare, which is all the planner
+        needs to know. Readers see the old counts or the new ones, never half of each. Returns the rows now in the table."""
+        with self.wlock:
+            w = self.writer()
+            if self._schema_of(w) < 2:
+                return 0
+            w.execute("BEGIN IMMEDIATE")
+            try:
+                if sl is None:
+                    w.execute("DELETE FROM tri_stats")
+                    w.execute("INSERT INTO tri_stats SELECT term, doc FROM name_tri_v WHERE doc >= ?", (STAT_MIN,))
+                else:
+                    lo, hi = STAT_SLICES[sl % len(STAT_SLICES)]
+                    if hi is None:
+                        w.execute("DELETE FROM tri_stats WHERE tri >= ?", (lo,))
+                        w.execute("INSERT INTO tri_stats SELECT term, doc FROM name_tri_v WHERE term >= ? AND doc >= ?",
+                                  (lo, STAT_MIN))
+                    else:
+                        w.execute("DELETE FROM tri_stats WHERE tri >= ? AND tri < ?", (lo, hi))
+                        w.execute("INSERT INTO tri_stats SELECT term, doc FROM name_tri_v WHERE term >= ? AND term < ?"
+                                  " AND doc >= ?", (lo, hi, STAT_MIN))
+                w.execute("COMMIT")
+            except BaseException:
+                w.execute("ROLLBACK")
+                raise
+            if sl is None:
+                self._dirty = 0
+                self._stats_built = True
+            return w.execute("SELECT count(*) FROM tri_stats").fetchone()[0]
+
+    @staticmethod
+    def _schema_of(w: sqlite3.Connection) -> int:
+        r = w.execute("SELECT v FROM meta WHERE k = 'schema'").fetchone()
+        return int(r[0]) if r and str(r[0]).isdigit() else SCHEMA_VERSION
+
+    def stats_due(self, entries: int | None = None) -> bool:
+        """Enough rows changed since the last recount to be worth another (or there is no recount at all yet)."""
+        n = self.count() if entries is None else entries
+        if n <= 0 or self.schema_version() < 2:
+            return False
+        if self._dirty >= max(STATS_EVERY_MIN, n // 50):
+            return True
+        if self._stats_built:
+            return False
+        with self.read() as c:                              # no counts at all (a failed first recount): make them
+            try:
+                return c is not None and c.execute("SELECT 1 FROM tri_stats LIMIT 1").fetchone() is None
+            except sqlite3.Error:
+                return False
+
+    def migrate_fts(self, chunk: int = 50000, on_progress=None) -> dict:
+        """Replace the schema-1 name index with the schema-2 one without ever hiding the index: the old table keeps
+        answering searches (readers are not blocked by the writer) until the last statement, which switches the triggers,
+        the schema flag and the counts in one transaction. Until then the new table is built in chunks of `chunk` rows by
+        the one thread that holds the write lock, so no row can change underneath it. A crash before the switch leaves
+        schema 1 and a half-built new table that the next call drops and starts over; nothing is lost, the index is only
+        derived data. Returns {migrated, entries, seconds}. The old table is dropped later (drop_legacy_fts)."""
+        t0 = time.time()
+        with self.wlock:
+            w = self.writer()
+            if self._schema_of(w) >= 2:
+                return {"migrated": False, "reason": "already current", "entries": 0, "seconds": 0.0}
+            self.upgrade = {"state": "running", "phase": "preparing", "fraction": 0.0, "started": t0, "entries": 0}
+            try:
+                for t in ("tri_stats", "name_tri_v", "name_tri"):
+                    w.execute(f"DROP TABLE IF EXISTS {t}")              # a half-built table of an earlier attempt
+                for stmt in _statements(FTS_SCHEMA):
+                    w.execute(stmt)
+                lo, hi = w.execute("SELECT min(id), max(id) FROM files").fetchone()
+                entries = w.execute("SELECT count(*) FROM files").fetchone()[0]
+                self.upgrade.update(phase="building the new name index", entries=entries)
+                done = 0
+                if lo is not None:
+                    pos = lo
+                    while pos <= hi:
+                        end = pos + chunk
+                        w.execute("BEGIN IMMEDIATE")
+                        try:
+                            done += w.execute("INSERT INTO name_tri(rowid, nf) SELECT id, nf FROM files WHERE id >= ?"
+                                              " AND id < ? ORDER BY id", (pos, end)).rowcount
+                            w.execute("COMMIT")
+                        except BaseException:
+                            w.execute("ROLLBACK")
+                            raise
+                        pos = end
+                        frac = min(1.0, (pos - lo) / max(1, hi - lo + 1))
+                        self.upgrade.update(fraction=round(0.9 * frac, 3), done=done)
+                        if on_progress:
+                            on_progress(self.upgrade)
+                # Built in chunks the index is many segments, and every later small write would merge some of them
+                # (a 100-file batch took 20-100 ms instead of 3). One merge into a single segment is cheap (~1 s on
+                # two million names).
+                self.upgrade.update(phase="merging the new index", fraction=0.9)
+                w.execute("INSERT INTO name_tri(name_tri) VALUES ('optimize')")
+                self.upgrade.update(phase="counting the pieces", fraction=0.95)
+                w.execute("BEGIN IMMEDIATE")
+                try:
+                    w.execute("INSERT INTO tri_stats SELECT term, doc FROM name_tri_v WHERE doc >= ?", (STAT_MIN,))
+                    self.upgrade.update(phase="switching over", fraction=0.98)
+                    w.execute("DROP TRIGGER IF EXISTS files_ai")
+                    w.execute("DROP TRIGGER IF EXISTS files_ad")
+                    for stmt in _statements(TRIGGERS):
+                        w.execute(stmt)
+                    w.execute("INSERT INTO meta(k, v) VALUES ('schema', ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                              (str(SCHEMA_VERSION),))
+                    w.execute("COMMIT")
+                except BaseException:
+                    w.execute("ROLLBACK")
+                    raise
+            except BaseException as e:
+                self.upgrade = {"state": "failed", "error": f"{type(e).__name__}: {e}", "started": t0,
+                                "elapsed_s": round(time.time() - t0, 1)}
+                raise
+            self._fts_cache = (time.time(), "name_tri")
+            self._legacy_left = True
+            self._dirty = 0
+            self.upgrade = {"state": "done", "entries": entries, "elapsed_s": round(time.time() - t0, 1),
+                            "finished": time.time()}
+            try:
+                w.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            except sqlite3.Error:
+                pass
+            return {"migrated": True, "entries": entries, "seconds": round(time.time() - t0, 2)}
+
+    def optimize_names(self) -> bool:
+        """Merge the name index into one segment (after a big change such as a crawl; about a second per two million
+        names). Searches keep answering while it runs."""
+        with self.wlock:
+            w = self.writer()
+            if self._schema_of(w) < 2:
+                return False
+            w.execute("INSERT INTO name_tri(name_tri) VALUES ('optimize')")
+            return True
+
+    def drop_legacy_fts(self) -> bool:
+        """Drop the schema-1 table once nothing reads it any more (schema 2 and a grace period after the switch).
+        Its pages go to the free list for the new index to reuse; the file does not shrink by itself."""
+        with self.wlock:
+            w = self.writer()
+            if self._schema_of(w) < 2 or not self._has_table(w, "names"):
+                self._legacy_left = False
+                return False
+            w.execute("DROP TABLE IF EXISTS names")
+            self._legacy_left = False
+            return True
+
     # ---- writes
-    def upsert(self, rows: list[tuple]) -> None:
-        """rows: make_row() tuples. One transaction; the vocabulary of new name words is kept up to date."""
+    def upsert(self, rows: list[tuple], lean: bool | None = None) -> None:
+        """rows: make_row() tuples. One transaction; the vocabulary of new name words is kept up to date. `lean`: do not
+        load the index's whole vocabulary to find the new words (INSERT OR IGNORE finds them in the table instead): right
+        for live changes, wrong for a crawl, which tests millions of words. Default: lean for a small batch."""
         if not rows:
             return
         with self.wlock:
             c = self.writer()
-            if self._vocab is None:
-                self._vocab = {r[0] for r in c.execute("SELECT tok FROM vocab")}
             new = []
-            for r in rows:
-                for t in name_tokens(r[0].rsplit("/", 1)[-1]):
-                    if t not in self._vocab:
-                        self._vocab.add(t)
-                        new.append((t, t[::-1]))
+            if lean is None:
+                lean = len(rows) <= SMALL_BATCH
+            if self._vocab is None and lean and not self._bulk:
+                # a few changed files on a quiet index (FSEvents): the first one must not load the whole vocabulary of
+                # the index just to find out which words are new. INSERT OR IGNORE below does the same job.
+                new = sorted({(t, t[::-1]) for r in rows for t in name_tokens(r[0].rsplit("/", 1)[-1])})
+            else:
+                if self._vocab is None:
+                    self._vocab = {r[0] for r in c.execute("SELECT tok FROM vocab")}
+                for r in rows:
+                    for t in name_tokens(r[0].rsplit("/", 1)[-1]):
+                        if t not in self._vocab:
+                            self._vocab.add(t)
+                            new.append((t, t[::-1]))
+            self._dirty += len(rows)
             c.execute("BEGIN")
             try:
                 if self._bulk:                           # first load: every row is new, no secondary indexes to churn
@@ -796,6 +1223,7 @@ class Store:
             c.execute("BEGIN")
             n = c.execute("DELETE FROM files WHERE path = ? OR (path >= ? AND path < ?)", (path, lo, hi)).rowcount
             c.execute("COMMIT")
+            self._dirty += n
         return n
 
     def sweep(self, root: str, gen: int, chunk: int = 5000) -> int:
@@ -806,9 +1234,11 @@ class Store:
             with self.wlock:
                 c = self.writer()
                 c.execute("BEGIN")
+                # a crawl never lists a Keynote deck (--skip-name *.key), so the decks that live events added are not swept
                 n = c.execute("DELETE FROM files WHERE id IN (SELECT id FROM files WHERE path >= ? AND path < ?"
-                              " AND gen < ? LIMIT ?)", (lo, hi, gen, chunk)).rowcount
+                              " AND gen < ? AND path NOT LIKE '%.key' LIMIT ?)", (lo, hi, gen, chunk)).rowcount
                 c.execute("COMMIT")
+                self._dirty += n
             total += n
             if n < chunk:
                 break
@@ -832,6 +1262,7 @@ class Store:
                 n = c.execute(f"DELETE FROM files WHERE id IN (SELECT id FROM files WHERE NOT ({' OR '.join(conds)})"
                               f" LIMIT {chunk})", params).rowcount
                 c.execute("COMMIT")
+                self._dirty += n
             total += n
             if n < chunk:
                 return total
@@ -898,7 +1329,7 @@ def walk_python(root: str, excl: Excluder, max_depth: int = 0):
                 if is_dir and st.st_dev == dev and not getattr(st, "st_flags", 0) & 0x40000000 \
                         and (not max_depth or depth + 1 < max_depth):
                     ext = e.name.rpartition(".")[2].lower() if "." in e.name else ""
-                    if ext not in filequery.PACKAGE_EXTS:
+                    if ext not in filequery.PACKAGE_EXTS and ext != "key":      # a deck is one entry, not walked into
                         todo.append((e.path, depth + 1))
 
 
@@ -937,7 +1368,7 @@ def helper_rows(root: str, excl: Excluder, max_depth: int = 0, proc_holder: list
 # ------------------------------------------------------------------ ingest
 
 def ingest(store: Store, rows, gen: int, excl: Excluder, on_batch=None, stop: threading.Event | None = None,
-           throttle: float = 0.0) -> int:
+           throttle: float = 0.0, lean: bool | None = None) -> int:
     """Store a stream of crawl rows ({"path", "is_dir", "size", "mtime", "ctime"} dicts). Anything the rules block
     is dropped here, whatever produced it. Returns the number of rows stored."""
     batch, n = [], 0
@@ -950,7 +1381,7 @@ def ingest(store: Store, rows, gen: int, excl: Excluder, on_batch=None, stop: th
         batch.append(make_row(p, bool(d.get("is_dir")), d.get("size") or 0, d.get("mtime") or 0, d.get("ctime") or 0, gen))
         if len(batch) >= BATCH:
             t = time.time()
-            store.upsert(batch)
+            store.upsert(batch, lean=lean)
             n += len(batch)
             batch = []
             if on_batch:
@@ -958,7 +1389,7 @@ def ingest(store: Store, rows, gen: int, excl: Excluder, on_batch=None, stop: th
             if throttle:
                 time.sleep((time.time() - t) * throttle)
     if batch:
-        store.upsert(batch)
+        store.upsert(batch, lean=lean)
         n += len(batch)
         if on_batch:
             on_batch(n)
@@ -974,7 +1405,7 @@ def apply_events(store: Store, events: dict[str, int], excl: Excluder, scan=None
     rows, scans = [], []
     for path, flags in events.items():
         path = path.rstrip("/") or "/"
-        if excl.blocked(path):
+        if excl.blocked(path) and not gone_keynote(path):
             continue
         if flags & MUST_SCAN:
             scans.append(path)
@@ -989,7 +1420,7 @@ def apply_events(store: Store, events: dict[str, int], excl: Excluder, scan=None
         rows.append(row_from_stat(path, st, gen))
         if S.S_ISDIR(st.st_mode) and flags & (F_CREATED | F_RENAMED):
             scans.append(path)
-    store.upsert(rows)
+    store.upsert(rows, lean=True)
     out["upserted"] = len(rows)
     for path in scans:
         if scan is not None and os.path.isdir(path):
@@ -1016,7 +1447,12 @@ class MacIndex:
         self.watcher: subprocess.Popen | None = None
         self.watch_roots: tuple = ()
         self.events_seen = 0
+        self.applies = 0                                  # batches of events applied so far
+        self._wake = threading.Event()                    # set by feed_event: something is waiting in `pending`
         self.crawl_thread: threading.Thread | None = None
+        self.migrating = False
+        self.frecency = frecency.Frecency(self.store.path.parent / "frecency.db")      # opened only when something is recorded or ranked
+        self._gitignore: tuple | None = None              # (the Excluder it was made for, the matcher)
         self.t0 = time.time()
         self._excl: tuple | None = None
         self._fda: tuple = (0.0, None)
@@ -1059,8 +1495,10 @@ class MacIndex:
 
     def stop(self) -> None:
         self.stop_flag.set()
+        self._wake.set()
         self.crawl_stop.set()
         self._stop_watcher()
+        self.frecency.close()
 
     def _log(self, msg: str) -> None:
         try:
@@ -1079,7 +1517,9 @@ class MacIndex:
                     self._stop_watcher()
                 else:
                     self._watch(cfg)
-                    if not self.crawling and time.time() - self.t0 > CRAWL_DELAY_S and self.crawl_due(cfg):
+                    self._maintain()
+                    if (not self.crawling and not self.migrating and time.time() - self.t0 > CRAWL_DELAY_S
+                            and self.crawl_due(cfg)):
                         self.start_crawl()
             except Exception:
                 self.last_error = traceback.format_exc().splitlines()[-1]
@@ -1104,6 +1544,52 @@ class MacIndex:
             return True                                   # unfinished: resume
         every = float(cfg.get("rescan_every_h") or 0)
         return bool(every) and time.time() - state["finished"] > every * 3600
+
+    # ---- the name index itself: the one-time upgrade, the counts that steer the query plan
+    def _maintain(self) -> None:
+        """One supervisor tick of housekeeping, never while a crawl or the upgrade holds the writer: replace an index of
+        the first schema (in a thread of its own, the old one keeps answering), drop the old table a minute after the
+        switch, and recount tri_stats a slice at a time once enough rows have changed."""
+        st = self.store
+        if self.crawling or self.migrating or not st.path.exists():
+            return
+        st.writer()                           # opens it: a leftover first index is noticed there
+        if st.fts_pending():
+            if time.time() < self.retry_at:
+                return                                        # the last attempt failed: not again at once
+            self.migrating = True
+            threading.Thread(target=self._migrate_main, daemon=True, name="macindex-upgrade").start()
+            return
+        if st._legacy_left:
+            up = st.upgrade
+            if up.get("state") != "done" or time.time() - up.get("finished", 0) > LEGACY_GRACE_S:
+                st.drop_legacy_fts()
+                self._log("dropped the first name index (its pages are free for the new one)")
+        elif st.stats_due():
+            for i in range(len(STAT_SLICES)):
+                if self.stop_flag.is_set() or self.crawling:
+                    break
+                st.refresh_stats(i)
+                self.stop_flag.wait(0.05)
+            st._dirty = 0
+
+    def _migrate_main(self) -> None:
+        try:
+            def alive(_p):
+                if self.stop_flag.is_set():
+                    raise InterruptedError("the service is stopping")
+            with background_qos():
+                r = self.store.migrate_fts(on_progress=alive)
+            self._log(f"name index upgraded: {r}")
+            self.last_update = time.time()
+        except InterruptedError:
+            self._log("name index upgrade interrupted; it starts over next time (the old index kept working)")
+        except Exception:
+            self.last_error = traceback.format_exc().splitlines()[-1]
+            self._log(traceback.format_exc())
+            self.retry_at = time.time() + 300
+        finally:
+            self.migrating = False
 
     # ---- crawl
     def start_crawl(self, force: bool = False) -> dict:
@@ -1204,6 +1690,12 @@ class MacIndex:
             store.set_meta("crawl", json.dumps(state))
             self.last_update = time.time()
             store.count(fresh=True)
+            try:
+                if store.schema_version() >= 2:
+                    store.optimize_names()                     # a crawl rewrote a lot: one segment again
+                    store.refresh_stats()                      # and the counts that steer the query plan
+            except sqlite3.Error:
+                pass
         except InterruptedError:
             self._log("crawl stopped; it resumes later")
         except Exception:
@@ -1223,7 +1715,9 @@ class MacIndex:
             self.watch_roots = roots
             if roots and helper_path().exists():
                 feats = helper_features()
-                fast = ["--latency", "0.3"] if "watch_latency" in feats else []
+                fast = ["--latency", str(WATCH_LATENCY_S)] if "watch_latency" in feats else []
+                if "watch_nodefer" in feats:             # the first change after a quiet spell is reported at once
+                    fast += ["--no-defer"]
                 if "watch_exclude" in feats:             # keep the churn of ~/Library etc. out of the event stream
                     for p in self.watch_excludes(list(roots)):
                         fast += ["--exclude", p]
@@ -1277,24 +1771,38 @@ class MacIndex:
 
     def feed_event(self, path: str, flags: int, excl: Excluder | None = None) -> None:
         excl = excl or self.excluder()
-        if excl.blocked(path.rstrip("/") or "/"):
+        p = path.rstrip("/") or "/"
+        if excl.blocked(p) and not gone_keynote(p):
             return                                                    # FSEvents reports ~/.ssh too: dropped here
         with self.plock:
             self.pending[path] = self.pending.get(path, 0) | flags
             self.events_seen += 1
+        self._wake.set()
 
     def _flush_loop(self) -> None:
+        """Apply what FSEvents reported. Event driven: nothing runs while nothing changes (no polling), the first event of a
+        burst starts a FLUSH_COALESCE_S window for the rest of it, and the next apply waits at least FLUSH_MIN_GAP_S, or four
+        times as long as the last one took. So one new file is searchable ~25 ms after the helper reports it, and a burst
+        of thousands (a build, a checkout) costs a few transactions, not one per event, at under a fifth of a core."""
         while not self.stop_flag.is_set():
-            self.stop_flag.wait(0.25)
+            if not self._wake.wait(1.0):                  # woken by feed_event; the timeout only lets a stop request through
+                continue
+            if self.stop_flag.wait(FLUSH_COALESCE_S):
+                return
+            self._wake.clear()
             with self.plock:
                 batch, self.pending = self.pending, {}
             if not batch:
                 continue
+            t = time.perf_counter()
             try:
                 self.apply(batch)
+                self.applies += 1
             except Exception:
                 self.last_error = traceback.format_exc().splitlines()[-1]
                 self._log(traceback.format_exc())
+            if self.stop_flag.wait(min(2.0, max(FLUSH_MIN_GAP_S, 4 * (time.perf_counter() - t)))):
+                return
 
     def apply(self, batch: dict[str, int]) -> dict:
         excl = self.excluder()
@@ -1303,7 +1811,7 @@ class MacIndex:
         def scan(path: str, gen: int) -> int:
             r_excl = excl
             rows = helper_rows(path, r_excl) if helper else walk_python(path, r_excl)
-            n = ingest(self.store, rows, gen, r_excl)
+            n = ingest(self.store, rows, gen, r_excl, lean=True)       # live change: no whole-vocabulary load
             self.store.sweep(path, gen)
             return n
         out = apply_events(self.store, batch, excl, scan)
@@ -1324,15 +1832,31 @@ class MacIndex:
         return self.store.count() > 0
 
     def search(self, query: str, limit: int = filequery.DEFAULT_LIMIT, scope_roots: list[str] | None = None,
-               collections: list[dict] | None = None) -> dict:
+               collections: list[dict] | None = None, offset: int = 0, paged: bool = False) -> dict:
         t0 = time.time()
-        q = filequery.parse_query(query, home=home())
+        cfg = settings()
+        q = filequery.parse_query(query, home=home(), smart_case=bool(cfg["smart_case"]))
         excl = self.excluder()
+        allow = lambda p: not excl.blocked(p)                  # noqa: E731
+        if cfg["respect_gitignore"]:
+            gi = self.gitignore(excl)
+            allow = lambda p: not excl.blocked(p) and gi.keep(p)     # noqa: E731  (the ignore files of a blocked path are never read)
+        hints = self.frecency.for_query(query) if cfg["frecency"] and not os.environ.get("MSE_LOCK") else None
+        kw = dict(allow=allow, budget_ms=cfg["regex_budget_ms"], offset=offset, paged=paged,
+                  folder_words=bool(cfg["match_folder_names"]), hints=hints)
+        fts = self.store.fts_name()                            # these two read the meta table through the pool: ask them
+        ready = self.searchable()                              # before this search holds a pooled connection of its own
         with self.store.read() as conn:
-            if conn is None or not self.searchable():          # no index yet / still being built: not "no matches"
+            if conn is None or not ready:                      # no index yet / still being built: not "no matches"
                 res = {"items": [], "total": 0, "truncated": False, "query": q.public(), "searchable": False}
             else:
-                res = filequery.search(conn, q, limit, scope_roots, allow=lambda p: not excl.blocked(p))
+                try:
+                    res = filequery.search(conn, q, limit, scope_roots, fts=fts, **kw)
+                except sqlite3.OperationalError as e:
+                    if "no such table" not in str(e):
+                        raise
+                    self.store._fts_cache = (0.0, "")           # the index was switched under us: ask again which one
+                    res = filequery.search(conn, q, limit, scope_roots, fts=self.store.fts_name(), **kw)
                 res["searchable"] = True
         roots = sorted(((c["path"].rstrip("/"), c["name"]) for c in collections or []), key=lambda x: -len(x[0]))
         if roots:
@@ -1343,6 +1867,49 @@ class MacIndex:
                         break
         res["ms"] = round((time.time() - t0) * 1000, 1)
         return res
+
+    def gitignore(self, excl: Excluder) -> "gitignore.GitIgnore":
+        """The ignore-file matcher for these rules (remade when the rules change: it must not read a newly blocked folder)."""
+        g = self._gitignore
+        if g is None or g[0] is not excl:
+            g = self._gitignore = (excl, gitignore.GitIgnore(blocked=excl.blocked))
+        return g[1]
+
+    def opened(self, path, query: str | None = None) -> dict:
+        """The UI opened `path` from the results (after typing `query`): remember it for the ranking. Refuses what the
+        search itself would never show: a relative or odd path, anything the privacy rules block, anything outside the
+        roots, anything not in the name index. -> {recorded, reason?}; ValueError for a bad request."""
+        if not isinstance(path, str) or not path.startswith("/") or "\x00" in path or len(path) > 4096 or _has_dotdot(path):
+            raise ValueError("path must be an absolute path")
+        if query is not None and not isinstance(query, str):
+            raise ValueError("query must be text")
+        if not settings()["frecency"] or os.environ.get("MSE_LOCK"):
+            return {"recorded": False, "reason": "switched off (mac_index.frecency)"}
+        p = _collapse(path)
+        if self.excluder().blocked(p):
+            raise ValueError("that path is not searchable")
+        if not any(_covers(r, p) for r in self.roots()):
+            raise ValueError("that path is outside the searched folders")
+        with self.store.read() as conn:
+            row = conn.execute("SELECT id FROM files WHERE path = ?", (p,)).fetchone() if conn is not None else None
+        if row is None:
+            return {"recorded": False, "reason": "not in the name index"}
+        return {"recorded": bool(self.frecency.record(p, query, row[0]))}
+
+    def name_index_status(self) -> dict:
+        """What the name index is and how an upgrade of it is going: {schema, table, upgrade: {state: idle|running|done|failed,
+        phase?, fraction?, elapsed_s?, entries?, error?}, legacy_table, stats_rows?}. While state is running the old index
+        keeps answering, and the new one takes over in one step."""
+        st = self.store
+        up = dict(st.upgrade)
+        if up.get("state") == "running":
+            up["elapsed_s"] = round(time.time() - up.pop("started", time.time()), 1)
+        up.pop("started", None)
+        out = {"schema": st.schema_version() if st.path.exists() else SCHEMA_VERSION,
+               "table": st.fts_name() if st.path.exists() else TRI_NAME, "upgrade": up,
+               "upgrade_pending": bool(st.path.exists() and st.fts_pending()),
+               "legacy_table": bool(st._legacy_left), "changed_since_recount": st._dirty}
+        return out
 
     def status(self) -> dict:
         cfg = settings()

@@ -11,7 +11,18 @@ within a fixed time.
 
 * Your files, the search indexes, the file-name index and the models stay on the machine.
 * Setup downloads Python packages (from PyPI, and the mlx-vlm repository on GitHub) and the model weights (from Hugging
-  Face). These are downloads from public hosts; they carry no information about your files.
+  Face). These are downloads from public hosts; they carry no information about your files. In the app, the model download
+  starts only when you press *Download* in the setup assistant, and runs in a separate short-lived process: the background
+  service itself runs with Hugging Face access switched off (`HF_HUB_OFFLINE=1`). That process sends no Hugging Face account
+  token (`HF_HUB_DISABLE_IMPLICIT_TOKEN=1`): the models are public.
+* **The update check** (Mac app, on by default, Settings > Mac App > *Check for updates*, or `MSE_NO_UPDATE_CHECK=1`): at most
+  once a day the app sends `GET https://api.github.com/repos/HeyitSaif/mysearch/releases/latest` and compares `tag_name` with
+  its own version. The request carries the default `User-Agent: MySearch/<version>` and a fixed `Accept-Language: en`, and
+  nothing else: no identifier, no cookie, no query string, no body, and none of your data. GitHub sees your IP address, as
+  any website does. A reply of any kind, an error included, ends the day's check; only a request that got no reply at all is
+  tried again, and not sooner than an hour later. The answer is used only if its tag is a version number; the release page it offers is built from that tag,
+  not taken from the answer. MySearch never downloads or installs an update. Together with the model downloads and the
+  optional Ask, this is one of the only outbound requests MySearch makes.
 * **Ask with cloud models** is off by default. When you switch it on, the question, the top passages and the recent chat
   turns go to the provider you choose. Personal identifiers are masked first (`cloud_redact`, on by default). Provider keys
   are kept in the macOS Keychain.

@@ -10,9 +10,11 @@ import threading
 import time
 import traceback
 from collections import defaultdict
+from pathlib import Path
 
-from . import config, paths
-from .indexer import matchers
+from . import config, paths, store
+from .ignore import is_key_name
+from .indexer import _nokey_matcher, _secret_excluded, matchers
 
 SETTLE_S = 3.0          # wait for a burst of writes to finish ...
 MAX_WAIT_S = 45.0       # ... but flush anyway after this long: a file written all the time must not hold everything back
@@ -24,6 +26,47 @@ KERNEL_DROPPED = 0x4
 EVENT_IDS_WRAPPED = 0x8
 ROOT_CHANGED = 0x20         # the watched folder itself moved or was replaced
 FULL_RESCAN = USER_DROPPED | KERNEL_DROPPED | EVENT_IDS_WRAPPED | ROOT_CHANGED
+
+
+def _indexed(name: str, rel: str) -> bool:
+    """Whether the collection's index holds a row for this exact path. Unknown counts as yes: the safe side."""
+    try:
+        conn = store.connect(name, readonly=True)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+    try:
+        return conn.execute("SELECT 1 FROM files WHERE path=?", (rel,)).fetchone() is not None
+    except Exception:
+        return True
+    finally:
+        conn.close()
+
+
+def job_target(root: Path, rel: str, exclude, nokey, indexed=None) -> str | None:
+    """Where a changed path goes in the job queue, or None when the collection's rules drop it.
+
+    The path itself when the rules keep it: a file, or a Keynote deck that exists (a folder named *.key, or a file over
+    KEYNOTE_MIN_BYTES, decided by indexer._secret_excluded). A change inside a deck goes to the deck, so its row is
+    refreshed. A *.key path that is gone and that the index holds (`indexed(rel)`, a deck) goes as its parent folder,
+    so the folder sweep marks what it held missing ("" means the root, which is a full scan). A gone .key the index
+    does not hold (a rotated private key) is dropped, and so is a smaller .key that exists."""
+    parts = rel.split("/")
+    if any(part.startswith(".") for part in parts):
+        return None
+    for i, part in enumerate(parts[:-1]):                  # inside a Keynote package: the package is the entry
+        if is_key_name(part):                               # (Keynote saves by rewriting files in it)
+            return job_target(root, "/".join(parts[:i + 1]), exclude, nokey, indexed)
+    if not exclude.match(rel):
+        return rel
+    if not is_key_name(parts[-1]):
+        return None
+    if not os.path.lexists(root / rel):
+        if indexed is not None and not indexed(rel):
+            return None                                     # a private key that is gone: nothing to mark
+        return rel.rpartition("/")[0]
+    return None if _secret_excluded(rel, exclude, nokey, root) else rel
 
 
 class Watcher:
@@ -78,7 +121,7 @@ class Watcher:
     def _read(self, proc):
         cfg = config.load()
         colls = [(c["path"].rstrip("/") + "/", c) for c in cfg["collections"] if c.get("enabled", True)]
-        rules = {c["name"]: matchers(c)[0] for _, c in colls}
+        rules = {c["name"]: (Path(c["path"]), matchers(c)[0], _nokey_matcher(c)) for _, c in colls}
         for line in proc.stdout:
             try:
                 ev = json.loads(line)
@@ -90,18 +133,21 @@ class Watcher:
             for prefix, c in colls:
                 if p.startswith(prefix) or p + "/" == prefix:
                     rel = p[len(prefix):]
+                    # decided before the lock: it may stat a Keynote package, and the flush loop waits on the lock
+                    root, exclude, nokey = rules[c["name"]]
+                    target = job_target(root, rel, exclude, nokey, lambda r: _indexed(c["name"], r)) \
+                        if rel and not flags & FULL_RESCAN else None
                     with self.lock:
                         if not (self.pending or self.rescan):
                             self.first_pending = time.time()
                         self.events_seen += 1
                         self.last_event = time.time()
-                        if flags & FULL_RESCAN or not rel:
+                        if flags & FULL_RESCAN or not rel or target == "":
                             self.rescan.add(c["name"])
-                        elif not rules[c["name"]].match(rel) and not any(
-                                part.startswith(".") for part in rel.split("/")):
+                        elif target is not None:
                             # a file, or a folder (MUST_SCAN_SUBDIRS or a plain folder event): the path job walks a
                             # folder and removes whatever vanished inside it, so no full scan is needed
-                            self.pending[c["name"]].add(rel)
+                            self.pending[c["name"]].add(target)
                     break
 
     # ---------------------------------------------------------- hand-off to the job queue

@@ -11,7 +11,7 @@ import traceback
 from collections import deque
 from datetime import datetime, timedelta
 
-from . import config, indexer, paths
+from . import config, indexer, paths, readers
 from . import progress as liveprog
 
 STATE = paths.DATA / "state.json"
@@ -218,6 +218,7 @@ class JobManager:
             except OSError:
                 pass
         indexer.STOPPING = True          # set before the markers are cleared: no read writes one again after this
+        readers.close_all()              # idle reader processes die now; a read in progress ends within a quarter second
         self._clear_inflight()
 
     def wait_idle(self, timeout: float) -> bool:
@@ -355,12 +356,14 @@ class JobManager:
             out["scan"] = indexer.scan(coll, prog, cancel, night=night)
         if kind == "sync":
             # quick wins first: documents (3 at a time, smallest first), then make them searchable,
-            # and only then the long audio/video work (shortest first)
+            # and only then the long audio/video work (shortest first). A sync is "Sync now" or the night run: its
+            # heavy and embed stages pass priority "always" and are never paused by the idle gate (indexing.priority).
             out["heavy_docs"] = indexer.heavy(coll, prog, cancel, exclude_kinds=indexer.MEDIA_KINDS,
-                                              workers=indexer.DOC_HEAVY_WORKERS)
-            out["embed"] = indexer.embed(coll, prog, cancel, media=True, batch_priority=night)
-            out["heavy_media"] = indexer.heavy(coll, prog, cancel, kinds=indexer.MEDIA_KINDS)
-            out["embed_media"] = indexer.embed(coll, prog, cancel, media=True, batch_priority=night)
+                                              workers=indexer.DOC_HEAVY_WORKERS, priority="always")
+            out["embed"] = indexer.embed(coll, prog, cancel, media=True, batch_priority=night, priority="always")
+            out["heavy_media"] = indexer.heavy(coll, prog, cancel, kinds=indexer.MEDIA_KINDS, priority="always")
+            out["embed_media"] = indexer.embed(coll, prog, cancel, media=True, batch_priority=night,
+                                               priority="always")
             if night:
                 prog("optimizing", 0, 0, "")
                 indexer.optimize_fts(coll["name"])        # the night run merges the keyword index once
@@ -432,3 +435,63 @@ class JobManager:
             except Exception:
                 (paths.LOGS / "daemon.log").open("a").write(traceback.format_exc())
             time.sleep(30)
+
+
+# ---------------------------------------------------------------- background windows (mse/wholedisk.py)
+# The describer asks for the idle time and the power source before every file. Each reading starts a subprocess, so
+# the answer is kept for a few seconds: a gate that is checked often is not a load of its own.
+_READINGS: dict[str, tuple[float, object]] = {}
+
+
+def _cached(key: str, max_age: float, fn):
+    now = time.monotonic()
+    hit = _READINGS.get(key)
+    if hit and now - hit[0] < max_age:
+        return hit[1]
+    value = fn()
+    _READINGS[key] = (now, value)
+    return value
+
+
+def idle_seconds_cached(max_age: float = 1.0) -> float:
+    """jobs.idle_seconds(), asked again only after max_age seconds."""
+    return float(_cached("idle", max_age, idle_seconds))
+
+
+def on_ac_power_cached(max_age: float = 10.0) -> bool:
+    """jobs.on_ac_power(), asked again only after max_age seconds."""
+    return bool(_cached("ac", max_age, on_ac_power))
+
+
+# ---------------------------------------------------------------- one gate for heavy background work
+# The whole-disk describer (mse/wholedisk.py) and the deep-folder indexing ask the same question before each heavy step:
+# may it run now, given the power source and the user's input? These thresholds are the only definition of the answer.
+HEAVY_IDLE_LOW_S = 60.0       # low: on AC power after this long without input; balanced: or on battery after this long
+HEAVY_IDLE_ACTIVE_S = 5.0     # balanced: nothing heavy while the user typed or clicked within this many seconds
+HEAVY_PRIORITIES = ("low", "balanced")
+
+
+def heavy_work_allowed(priority: str, enabled: bool = True) -> tuple[bool, str | None]:
+    """May a heavy background step run now? Returns (allowed, paused_reason); the reason is None when allowed, otherwise
+    "disabled" (enabled is False: the caller's switch), "user_active" (the user typed or clicked too recently), or
+    "on_battery" (on battery, and not idle long enough). low: AC power and HEAVY_IDLE_LOW_S without input. balanced: at
+    least HEAVY_IDLE_ACTIVE_S without input, and either AC power or HEAVY_IDLE_LOW_S without input. It reads only the
+    power source and the idle time (both cached for a few seconds); it holds no state of any feature. An unknown
+    priority raises ValueError."""
+    if priority not in HEAVY_PRIORITIES:
+        raise ValueError(f"priority must be one of {', '.join(HEAVY_PRIORITIES)}, not {priority!r}")
+    if not enabled:
+        return False, "disabled"
+    ac = on_ac_power_cached()
+    idle = idle_seconds_cached()
+    if priority == "low":
+        if not ac:
+            return False, "on_battery"
+        if idle < HEAVY_IDLE_LOW_S:
+            return False, "user_active"
+        return True, None
+    if idle < HEAVY_IDLE_ACTIVE_S:
+        return False, "user_active"
+    if ac or idle >= HEAVY_IDLE_LOW_S:
+        return True, None
+    return False, "on_battery"

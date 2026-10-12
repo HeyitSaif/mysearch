@@ -22,9 +22,28 @@ I wrote about why and how I built it on my blog: [EmbeddingGemma 2 and local sea
 
 ## Quick start
 
-Run [`./scripts/setup.sh`](scripts/setup.sh), then follow [docs/INSTALL.md](docs/INSTALL.md).
+**Just want the app?** Open the disk image, drag MySearch to Applications and open it. The app carries its own Python, so there is no
+clone, no `uv`, no Terminal. A setup assistant walks you through the background service, your folders, the model download
+(about 1.3 GB for the minimal set, only when you press the button) and Full Disk Access. Details, updating and uninstalling:
+[docs/INSTALL.md](docs/INSTALL.md#install-from-the-disk-image). Also as a Homebrew cask once one is published
+(template: [packaging/homebrew](packaging/homebrew)).
+
+**Want to read, run and change the code?** Run [`./scripts/setup.sh`](scripts/setup.sh), then follow [docs/INSTALL.md](docs/INSTALL.md).
 
 To see how it works inside, read [How MySearch works](docs/TECHNICAL.md).
+
+### What goes online
+
+Searching, indexing and the local models never do. MySearch makes three kinds of outbound request, and only these:
+
+1. **Model downloads** from Hugging Face, when you press *Download* in the setup assistant (or run `mse setup models`). The
+   background service stays offline; the download runs in a separate short-lived process.
+2. **A check for a newer release**, at most once a day: `GET https://api.github.com/repos/HeyitSaif/mysearch/releases/latest`,
+   carrying only `User-Agent: MySearch/<version>` and a fixed `Accept-Language: en`: no ID, no cookie, none of your data. It only
+   tells you ("Update available — 0.x.y" in Settings and the menu bar) and opens the release page; it never downloads or
+   installs anything. **On by default; switch it off in Settings > Mac App > Check for updates**, or run the app with
+   `MSE_NO_UPDATE_CHECK=1`. GitHub sees your IP address, as any website does.
+3. **Cloud answers for Ask**, only if you turn Ask on and choose a cloud model (off by default; see [Cloud models for Ask](#cloud-models-for-ask)).
 
 ## What it does
 
@@ -40,8 +59,8 @@ To see how it works inside, read [How MySearch works](docs/TECHNICAL.md).
 | Favourites | Mark the right file for a query (several allowed) and it comes first next time; hide noise for a query; very similar queries (cosine ≥ 0.90) give favourites a score boost. `mse fav`, the app, or the MCP tool `mark_best` |
 | Learning | After every night sync: known-item questions are built from the index, quality is measured on four sets (the gold sets in `eval/`, favourites, known items) into `quality.jsonl`, the ranking weights and re-ranker knobs are re-tuned, and applied only if the guardrails pass (weighted MRR +0.01, no hand-written gold set loses >0.01 MRR or any rank-1 hit, favourites not worse). `mse tune --rollback` undoes a change |
 | Ask (optional) | A short answer (2–5 sentences) to a question, written from the top search results only, each claim followed by a numbered citation that opens the document at its page or timestamp; says plainly when the documents don't answer. **While online a large cloud model writes it** (Claude by default, or any model behind an OpenAI-compatible endpoint; personal identifiers masked before anything leaves), **offline the local model does**. Folders can be kept local. Metadata-only files are never read, and one answer reads one folder unless you ask across `all`. **Off by default**: while off nothing is called or loaded. Settings → Ask, `mse ask`, `mse providers`, MCP tool `ask` (identifiers masked). See [Cloud models for Ask](#cloud-models-for-ask) and [docs/ask-models.md](docs/ask-models.md) |
-| File names | **Find a file by its name anywhere on the Mac, instantly** (fsearch-style): `mse files "invoice 2026"`, `/api/files/search`. A name index of the whole home folder, kept current by FSEvents (~0.3 s), typo-tolerant, with `ext:` `type:` `size:` `mtime:` `path:` `re:` `in:` filters; p50 about 5 ms in-process (9 ms end to end at `limit` 200) over 2 million entries. Names only, never contents, and never for agents. See [Find files by name](#find-files-by-name-whole-mac) |
-| Agents | MCP tools `search`, `get`, `multi_get`, `similar`, `collections`, `mark_best`, `sync`, `ask`; agents search the folder they work in unless they ask for `all`, a group or a list (or only that folder, with `MSE_LOCK=1`); personal identifiers are masked in everything sent to agents. `mse agents install <folder>` connects Claude Code, Cursor, Codex, Grok and OpenCode to a folder in one step |
+| File names | **Find a file by its name anywhere on the Mac, instantly** (fsearch-style): `mse files "invoice 2026"`, `/api/files/search`. A name index of the whole home folder, kept current by FSEvents (~30 ms), typo-tolerant, with `ext:` `type:` `size:` `mtime:` `path:` `re:` `in:` filters, globs (`*.pdf`, `**/invoices/*`) and smart case; p50 about 5 ms in-process (9 ms end to end at `limit` 200) over 2 million entries. Names only, never contents, and never for agents. See [Find files by name](#find-files-by-name-whole-mac) |
+| Agents | MCP tools `search` (with document filters: kind, amount, currency, party, document date), `get` (a single page), `multi_get`, `similar`, `collections`, `timeline`, `facets`, `mark_best`, `sync`, `ask`; results carry `meta:` and `cite:` lines; resources (the folder list, saved searches, a document by #docid) and three prompts; agents search the folder they work in unless they ask for `all`, a group or a list (or only that folder, with `MSE_LOCK=1`); personal identifiers are masked in everything sent to agents. `mse agents install <folder>` connects Claude Code, Cursor, Codex, Grok and OpenCode to a folder in one step. See [What an agent can use](#what-an-agent-can-use-mcp) |
 
 ## Models (all local, all converted here from official weights)
 
@@ -132,7 +151,7 @@ all: invoice                  everything marked Include in All, whatever tab is 
 ```
 
 - Names are case-insensitive and count only when they are known: `Note: the meeting` and `Re: Rechnung` stay ordinary text. An `in:` naming nothing known is an error (the app and Raycast wait while you type it).
-- The search filters `type after before path ext include exclude in kind has` and `all` are reserved: no folder, group or alias can be called that.
+- The search filters `type kind ext in after before path has include exclude doctype amount currency party docdate` and `all` are reserved: no folder, group or alias can be called that. (A folder or alias that was already called `amount`, `currency`, `party`, `docdate` or `doctype` keeps working as a name in `-c`, but its `name:` shortcut no longer does; give it another short name.)
 - **Aliases**: in Settings › Folders (a folder's *Short names*, a group's editor), or `mse alias add w work`, `mse alias rm w`, `mse aliases`. Each alias is unique across every folder name, group name and alias.
 - **Groups without a tab**: switch *Tab* off in Settings › Folders › Groups (or `mse group hide work` / `show`). The group stays in the Folders ▾ menu and in Raycast, and works by name and alias.
 - **Folders**: *In All* and *On* can be switched on each folder card, also while it is closed.
@@ -172,6 +191,11 @@ mse eval eval/gold_example.json -c work --configs hybrid,semantic,rerank -v
 mse fav "Acme invoice" '#87e569f1' | mse fav "x" '#…' --hide | --remove ; mse favs
 mse eval --feedback --configs hybrid,favourites          # favourites as questions, feedback application off
 mse tune [--apply | --rollback] | mse learn [--dry-run] | mse quality
+mse search "invoices over 500 EUR in 2025"               # plain language becomes filters (see Documents below)
+mse search "type:receipt party:cafe docdate:2025-03"      # document type, counterparty, document date
+mse docs facets | mse docs timeline --type receipt        # counts per type / counterparty / month; months with none
+mse docs meta '#4319a060' | mse docs reindex work       # the stored facts of one document | redo them for a folder
+mse saved add "Big invoices" "type:invoice amount:>500" -c work | mse saved list | mse saved run "Big invoices" | mse saved rm "Big invoices"
 mse status | mse doctor | mse ui | mse service install|uninstall|restart|status
 mse add ~/Documents/Foo --agents | mse remove foo --agents   # also connect / disconnect the folder's agents
 mse agents status [foo | --global] | mse agents install foo|--all|--global | mse agents remove foo|<path>
@@ -180,6 +204,60 @@ mse agents status [foo | --global] | mse agents install foo|--all|--global | mse
 `-c` (and `--in`, the MCP `collection` argument, the API's `c` / `in`) takes collection names, group names, aliases and `all`, mixed and comma separated. A shortcut in the query (`w: …`, `in:w`) overrides it; the API applies it unless `shortcuts=0` (`{"shortcuts": false}` for `/api/ask`), and reports it in the response's `scope.shortcut`. Groups expand to their members, duplicates are removed, unknown names are an error. In `eval`, `tune` and `learn` a group expands to its folders; in `sync`, a group syncs each member and `all` means every folder.
 
 When the CLI's output is piped (agents, scripts), personal identifiers are masked. In an interactive terminal you see everything.
+
+## Documents: what they are, and what they say
+
+MySearch reads every invoice, receipt, statement and letter once, on this Mac, and keeps a few facts about it next to its
+text: the **type**, the **document date**, the **amount** with its currency, the **counterparty** (who sent it) and its
+**reference** (its own number). No model, no network; the rules work in English and German and are cautious: an unclear
+document is `other`, an unclear fact is empty. The facts live in the folder's own database and go when the file goes, or when
+a file turns metadata-only.
+
+Types: `invoice` (credit notes too), `receipt`, `bank_statement`, `contract`, `letter`, `quote` (pro forma too), `reminder`
+(dunning), `payslip`, `tax_document`, `other`. What gets a type: PDFs, Office files, mail, scans (once OCR has run) and text
+or Markdown notes by their usual extensions; source code and data files never. A payslip or tax document never gets a
+reference, and no field ever holds an IBAN, a card, passport, permit, tax or personal ID number or a date of birth.
+
+| Filter | Example | Meaning |
+|---|---|---|
+| `type:` / `doctype:` | `type:invoice`, `type:receipt,invoice`, `type:Rechnung` | Document type, English or German names. `type:pdf` still means the file kind, and `type:other` the file kind *other*: use `doctype:other` for documents that are none of the above |
+| `amount:` | `amount:>500`, `amount:<=100`, `amount:100..200`, `amount:119` | The document's amount (an invoice's gross total, a receipt's total paid, a payslip's payout ...). Bank statements, letters and notes have none |
+| `currency:` | `currency:EUR`, `currency:USD,GBP` | ISO codes (about forty common ones such as EUR, USD, GBP, CHF, JPY, CAD, INR) and the signs `€`, `$`, `£`, `₹` |
+| `party:` | `party:acme`, `party:"muster logistik"` | The counterparty contains this text, ignoring case and accents. Comma = any of |
+| `docdate:` | `docdate:2025`, `docdate:2025-03`, `docdate:2025-01..2025-06`, `docdate:2025-01-01..` | The date *in the document*; `after:` and `before:` still use the file's date |
+
+Repeated filters of one kind mean *any of* (types, currencies, parties, dates); repeated `amount:` filters all have to hold
+(`amount:>100 amount:<500`). The filters combine with words (`widgets type:invoice party:acme`), and a query that has filters
+and **no words** lists the matching documents, newest first.
+
+Plain language is turned into filters only when it is unmistakable: a comparator (*over, above, more than, at least,
+under, below, less than, at most, between ... and*; *über, mehr als, mindestens, unter, weniger als, höchstens, zwischen ... und*) and a number that has a
+currency (`over 500 EUR`) or comes with a kind of document (`invoices over 500`). So `invoices over 500 EUR in 2025` becomes
+`type:invoice amount:>500 currency:EUR docdate:2025`. It happens only when nothing but filler words is left of the query once the amount, the kind of document and a date are taken out, so a question such as *when was the invoice over 500 EUR paid?* (what Ask sends) stays an ordinary search, and `temperature over 40 degrees`, `rent over 2025` and `invoices from March` are left as they were. When a document filter is on, a plain-language date such as *last month* or *in 2025* is the
+document date (`docdate:`); otherwise it is the file's date as before.
+
+`mse docs facets` and `GET /api/docs/facets` count documents per type, the most frequent counterparties and documents per
+month. `mse docs timeline --type receipt` and `GET /api/docs/timeline?type=receipt&from=2025-01&to=2025-12` give one bucket
+per month (count and the sum of the amounts per currency) **and the months that have none**, so "which months have no
+receipts" is a single call. Documents without a document date are counted separately (`undated`), never placed by the file's
+date. `GET /api/docs/<docid>/meta` returns one document's facts; every search result carries `meta` with
+`{doctype, confidence, doc_date, amount, currency, counterparty, reference}` (or `null`).
+
+**Saved searches** keep a query under a name: `mse saved add NAME QUERY [-c folder]`, `list`, `run`, `rm`; over HTTP
+`GET/POST /api/saved`, `PATCH/DELETE /api/saved/<id>`, `GET /api/saved/<id>/run`. They are stored as `saved_searches` in
+`config.json`; removing one removes only that definition, never a file or an index.
+
+**Settings** (`config.json` → `docmeta`, or `POST /api/settings`):
+
+| Key | Meaning |
+|---|---|
+| `enabled` | `false` stops deriving facts (rows already stored stay) |
+| `own_names` | Your own company names. A letterhead that is you is not taken as the counterparty (otherwise an outgoing invoice names you) |
+| `extra_org_suffixes` | The legal forms of your country, if the built-in international list lacks them: add them here, for example `["Ltda"]` |
+| `extra_keywords` | More words that mark a document type, per type, for example `{"tax_document": ["the name of your tax office"]}`; they count like the built-in ones |
+
+After changing the rules or these keys run `mse docs reindex <folder>`; new and changed files use them at once, and an index built before
+this feature is filled in over the next scans (500 files per scan, 20,000 per night run).
 
 ## Ask
 
@@ -246,8 +324,8 @@ heuristic). Every answer says who wrote it: `done.where`, `done.provider`, `done
 
 **What leaves the Mac, and what never does**
 
-- With `cloud_redact` (default on), personal identifiers (IBANs, passport / ID / permit / tax / social-security
-  numbers, dates of birth, MRZ lines; `mse/redact.py`) are masked in the passages and the earlier turns before the call;
+- With `cloud_redact` (default on), the passages and the earlier turns are masked before the call: national ID numbers
+  for 20+ countries (see `mse/redact.py`), passports, residence permits, tax IDs, IBANs, dates of birth and MRZ lines.
   `done.redacted` counts them. The question itself is sent as typed. The app still shows you the full sources.
 - A folder with **`ask_cloud` off** keeps every question whose scope includes it on the local model, whatever the route
   (`mse set notes ask_cloud=false`, `POST /api/collections/<name> {"ask_cloud": false}`). Asking across `all` while
@@ -351,13 +429,14 @@ POST /api/settings                      {"ask": {route, provider, model, cloud_r
 
 The collections above search what is *inside* your folders. This is the other half: **where is the file called …?**,
 anywhere on the Mac, in a few milliseconds, before you narrow it down to your indexed folders. It only ever indexes
-**names, sizes and dates** (never contents) in `macindex.db`, a SQLite file with an FTS5 trigram index.
+**names, sizes and dates** (never contents) in `macindex.db`, a SQLite file with an FTS5 trigram index (3-letter pieces only, no positions: a third the size of a positional one).
 
 ### Using it
 
     mse files "invoice acme"               # every file under your home folder (--scope mac, the default)
     mse files "mian ext:py" --json         # typos forgiven: finds main.py
     mse files "report type:pdf mtime:<7d size:>1mb in:~/Documents"
+    mse files "**/invoices/*.pdf 2025 !**/old/**"   # globs; "Report" (capital + small letters) is matched with its case
     mse files "report" --scope indexed -c work     # only the folders of the work group
     mse files status                       # entries, crawl progress, Full Disk Access
     mse files crawl [--force]              # start a crawl now (the service also does it, see below)
@@ -369,9 +448,11 @@ Query language (fsearch's, plus a few more; the full text is at the top of `mse/
 | Write | Means |
 |---|---|
 | `invoice 2026` | every word is in the name; words are fuzzy: substrings match, and **a word of 5+ letters forgives one typo** (insert, delete, substitute, swap: `recieve` finds `receive`), **a word of 4 letters forgives swapped neighbours** (`mian` finds `main`); shorter words are literal. Typos are looked for only when the literal search finds fewer results than asked for, and rank last |
+| `Report` · `iPhone` · `Café` | **smart case**: a word typed with a capital *and* a small letter is matched with its case (`Report` does not find `report.txt`); `report` and `REPORT` (all small or all capitals) match any case. A word matched with its case gets no typo tolerance. `mac_index.smart_case: false` turns it off |
 | `'exact` · `"two words"` | exactly that text, no typos |
 | `^prefix` · `suffix$` · `^whole$` | starts with · ends with · is the whole name (`.pdf$` is `ext:pdf`) |
-| `!word` · `!ext:tmp` · `!type:image` · `!path:cache` | must not match |
+| `!word` · `!ext:tmp` · `!type:image` · `!path:cache` · `!*.log` · `!**/old/**` | must not match (a word with a capital and a small letter excludes only that case) |
+| `*.pdf` · `report-*.docx` · `**/invoices/*` · `src/**/*.py` | **globs**, once a token has a `*` (`?` is then one character; `[` and `{` stay plain text; a quoted, `'exact` or `^`/`$` word stays plain text). `*.pdf` is `ext:pdf`. Without a `/` the glob must match the whole name (`report-*.docx`); with a `/` it is matched against the whole path: `*` and `?` stay inside one folder or name, `**/` is any number of folders (also none), it may start at any folder unless it begins with `/` or `~/`, and a trailing `/**` means everything below. Globs ignore case |
 | `ext:pdf,docx` | extensions |
 | `type:` / `kind:` | `folder file image pdf doc sheet slides audio video code archive app email font other`; an unknown word is an extension (`type:swift`) |
 | `size:>5mb` `size:<1kb` `size:1mb..2gb` `size:=0` | file sizes (1 KB = 1024 bytes; folders have none) |
@@ -384,7 +465,26 @@ Query language (fsearch's, plus a few more; the full text is at the top of `mse/
 
 Ranking: exact name (with or without extension) > prefix > word boundary > substring > typo; ties by how much of the
 name your words cover, recency and folder depth; a folder gets a small boost on an exact match. One- and two-letter
-queries match name prefixes only.
+queries match name prefixes only. As in fff, a match in the file *name* is worth more than one elsewhere: a name that is the
+query gets +40 %, a query inside the name +16 % (at most 30 points). Both grow with the score, so name matches keep
+their order among themselves. Two more rules are off by default and switched on in `mac_index` (below):
+`match_folder_names` lets a word that is not in a name be found in its folder path when two or more words come up short
+(such a result ranks below every name match), and `respect_gitignore` leaves out what a git repository's `.gitignore` /
+`.ignore` files ignore (read only for folders that passed the privacy rules, never stored).
+
+**Patterns with no literal text** (`re:^.{3}$`, `??*.t?t`) cannot ask the index anything, so the names are read in filter
+order and tested one by one until enough match or `regex_budget_ms` (150) is up; the answer then says **`partial: true`**.
+Such a scan returns the first matches it finds in that order (newest first, or by size or folder depth when you filter
+on those), not the best-scored of every name.
+
+**Files you open rank higher.** The app tells the service when you open a result (`POST /api/files/opened {path, query}`).
+That file gains up to 40 points (recency and frequency; the score halves every 14 days), and the file you opened most for
+*exactly that query* comes first for it, even if the plan's candidate window had not reached it. Kept in `frecency.db`
+next to the index as keyed hashes (no path, no query text), capped at 4000 files and 8000 query/file pairs, on this Mac
+only. The ranking shapes the order of every file-name search the service answers (`mse files` too), but no agent tool can
+list, read or change what is kept. `mac_index.frecency: false` stops recording and ranking, `POST /api/files/frecency/clear`
+forgets it all.
+Deleting `macindex.db` does not forget it; deleting `frecency.db` does.
 
 ### API (the app and the web UI use these)
 
@@ -393,8 +493,10 @@ queries match name prefixes only.
     {"items": [{"path", "name", "parent", "is_dir", "kind", "ext", "size", "mtime", "ctime", "score",
                 "match": [[start, end], ...], "collection"?}],
      "total", "ms", "scope": "mac" | "indexed", "truncated": bool,
-     "query": {"words": [{"text", "mode": "fuzzy|exact|prefix|suffix|whole", "not": bool}], "filters": {...}},
-     "shortcut"?: {"names", "tokens"}}
+     "query": {"words": [{"text", "mode": "fuzzy|exact|prefix|suffix|whole", "not": bool, "case"?: "sensitive"}],
+               "filters": {..., "glob"?: [...]}},
+     "shortcut"?: {"names", "tokens"}, "partial"?: true,
+     "offset"?, "limit"?, "has_more"?, "next_offset"?}     # the last four when the request has limit= or offset=
 
 `match` is character ranges in `name` (the displayed name, accents and all) to highlight. `kind` is one of the type
 words above; `mtime` / `ctime` are Unix seconds (`ctime` is the creation time). `collection` is set when the file is in
@@ -404,12 +506,26 @@ has just started, or the first crawl is still loading): the list is empty becaus
 nothing matches, and `GET /api/files/status` has the progress (`progress.fraction`, 0 to 1). `scope=indexed` restricts to the folders of the given (or all enabled) collections
 and groups. Errors in the query (bad regex, bad size or date, unknown folder name after `in:`) are `400 {"error"}`.
 
+**Pages.** `GET /api/files/search?q=…&limit=50` returns the first 50 and `has_more`; `…&offset=50&limit=150` returns
+the rest of what `limit=200` would have returned, in the same order (the candidates are planned for
+`max(offset + limit, 200)` rows, so any `offset + limit` up to 200 is one list; deeper pages are planned again). `offset`
+counts results the privacy rules let through. `next_offset` is `null` on the last page. A request without `limit` and
+`offset` gets the same answer shape as before. A `partial: true` answer (a scan that ran out of time) depends on how far
+the scan got, so its pages do not line up: show it as it is and do not ask for more.
+
+`POST /api/files/opened {"path", "query"?}` -> `{"recorded": bool, "reason"?}`; 400 for a path the search could not show
+(relative, blocked by the privacy rules, outside the searched folders). `GET /api/files/frecency` -> `{"enabled", "files",
+"pairs", "cap_files", "cap_pairs"}`; `POST /api/files/frecency/clear` -> `{"cleared": true}`.
+
 `GET /api/files/status` -> `{"enabled", "roots", "entries", "crawling", "progress": null | {"phase", "units_done",
 "units_total", "entries", "fraction", "current", "elapsed_s"}, "last_update", "full_disk_access": true|false|null,
 "excluded": [patterns], "state": "disabled|crawling|ready|not crawled|waiting", "searchable", "last_crawl",
 "helper_present", "watching", "events", "skipped_protected", "denied", "error", "python_path", "python_real_path",
 "exclude_entries": [{"entry", "kind": "folder|pattern", "path", "note"?, "invalid"?}], "hard_excluded": [{"label",
-"items"}]}` (the last three are for the settings screens, see "Managing what it skips"). `POST /api/files/crawl
+"items"}], "name_index": {"schema", "table", "upgrade": {"state": "idle|running|done|failed", "phase"?, "fraction"?,
+"elapsed_s"?, "entries"?, "error"?}, "upgrade_pending", "legacy_table", "changed_since_recount"}}` (the three before
+`name_index` are for the settings screens, see "Managing what it skips"; `name_index.upgrade` is the one-time replacement of
+the first index by the smaller one, see "Upgrading"). `POST /api/files/crawl
 {"force"?}` -> `{"started", "reason"?}`.
 
 `GET /api/tree?c=<collection>&path=<relative folder>` -> `{"collection", "path", "folders": [{"name", "path",
@@ -437,7 +553,9 @@ rules while it walks only to go faster.
 * **Excluded by default, yours to change** (`mac_index.exclude`): `~/Library/`. A root listed in `mac_index.roots` inside an excluded folder (say `~/Library/CloudStorage`) is
   crawled; the hard rules above still apply.
 * **Settings** (`config.json` → `mac_index`, or `POST /api/settings {"mac_index": {...}}`): `enabled` (true),
-  `roots` (your home folder by default), `exclude`, `skip_protected` (`auto` | `always` | `never`), `rescan_every_h` (24).
+  `roots` (your home folder by default), `exclude`, `skip_protected` (`auto` | `always` | `never`), `rescan_every_h` (24),
+  and the matching rules `smart_case` (true), `frecency` (true), `respect_gitignore` (false), `match_folder_names` (false)
+  and `regex_budget_ms` (150, 20 to 5000).
   How to change `roots` and `exclude` without editing the file: "Managing what it skips" below.
 * **Never for agents:** the MCP server has no tool for it and no route to it; a locked MCP session (`MSE_LOCK=1`)
   refuses an `in:` folder outside its collection; `mse files --scope mac` (and `status`, `crawl`, `exclude`, `roots`) refuse under
@@ -502,22 +620,61 @@ runs**: the launchd job starts `.venv/bin/python`, a symlink to
 `python3 -c "import os; print(os.path.realpath('.venv/bin/python'))"`; Homebrew changes the version folder on upgrade).
 The helper the service starts inherits that grant. Or set `skip_protected: never` and answer the one-time dialogs.
 
+### Upgrading from the first index
+
+A database made by an earlier version (schema 1: a positional trigram index) is replaced by the smaller one (schema 2:
+3-letter pieces only, plus a table of how common each piece is) the first time the service runs, in the background, with no
+button and no downtime. The old index keeps answering searches the whole time; the new one is built in chunks, merged into
+one segment, and one transaction then switches over, so a search never finds half an index. On a 2 M-name index the build
+takes about 6 s, during which changes from FSEvents wait in memory and are applied right after (writers wait, readers
+do not). `GET /api/files/status` -> `name_index.upgrade` shows `state` (`running`), `phase` and `fraction`. If the service
+stops in the middle, the old index is untouched and the next start begins the build again. A minute after the switch the
+old table is dropped; its pages stay in the file for the new index to reuse, so the file does not shrink by itself (the
+data in it is about 9 % smaller, the name index itself about two thirds). A downgrade to a version before this one cannot
+read a schema-2 database: delete `macindex.db` (derived data) and let the old version crawl again. Nothing else is touched:
+the per-folder document indexes are separate files.
+
 ### Measured (synthetic 2.0 M-entry index with realistic names, M4 Pro, warm cache, not a live disk)
 
-* **Query latency**, in-process, mixed set of 75 queries (1-2 characters, common substrings, rare words, two words,
-  typos, exact/prefix/suffix, filters, `in:`, regex, negation): `limit` 50 p50 **4.9 ms**, p95 10.9, p99 19; `limit` 20
-  p50 4.3; `limit` 200 p50 6.8 ms, p95 13. (Earlier, noisier runs on the same index gave p50 6.0 ms.)
-* **End to end** through the HTTP handler on loopback with the JSON decoded by the client, `limit` 200 (the API
-  default, 59 KB bodies): p50 **9.4 ms**, p95 15.5, max 22; `limit` 50: p50 7.3 ms.
-* **While a crawl is writing** in the same process (ingest throttled to half speed): `limit` 200 p50 13.4 ms, p95 26;
-  `limit` 50 p50 10.5 ms, p95 24, worst 72 ms. The first search of a rare shape after a restart is slower (cold pages).
-* Size: about 1 GB for 2 M entries.
+Before and after the speed work, on the same index and the same 247 queries, `limit` 200, in-process, 6 interleaved runs of
+each (the Mac was shared and busy, with a load average of 15 to 185 while this ran, so only paired numbers mean anything;
+the lists the two versions return are identical for all 235 distinct word, filter and typo queries):
+
+| query shape | p50 before | p50 after | p95 before | p95 after |
+|---|---|---|---|---|
+| 1 or 2 letters | 7.6 / 6.8 ms | 7.1 / 6.1 ms | 8.5 / 8.2 | 8.5 / 7.8 |
+| common word (tens of thousands of matches) | 9.3 | 8.5 | 12.3 | 10.2 |
+| mid-frequency word | 9.7 | 6.0 | 12.4 | 10.0 |
+| **rare word** | 11.2 | **1.3** | 20.9 | **3.4** |
+| **two or three words** | 18.5 | **5.2** | 55.7 | **12.4** |
+| `ext:` / `type:` / `size:` / `mtime:` + word | 4.2 / 5.2 / 3.9 | 1.6 / 3.0 / 1.5 | 38 / 34 / 45 | 48 / 35 / 5.0 |
+| `path:` / `in:` + word | 26.5 | 14.8 | 64 | 62 |
+| typo, 5+ letters | 9.7 | 4.9 | 17.9 | 9.5 |
+| `re:` | 6.0 | 4.8 | 729 | 153 |
+| all 6,225 queries | **8.6** | **6.0** | **37.9** | **21.1** |
+
+* **Typing a file name**, one search per keystroke (49 names): p50 per keystroke 10.7 ms -> **1.9 ms**, p95 38.7 -> 9.6; the
+  sum over a whole name (p50) 163 ms -> **50 ms**, p95 667 -> 95. `limit` 50: p50 5.4 -> 4.2 ms (the page the app shows first).
+* **End to end** through the HTTP handler on loopback with the JSON decoded by the client (busy Mac): `limit` 200 p50 11.3 ->
+  10.3 ms, p95 44 -> 32, p99 475 -> 71; `limit` 50 p50 11.3 -> 8.2.
+* **Eight threads searching at once** for 6 s: 54 -> 113 searches per second, p95 570 -> 179 ms; the process's dirty memory
+  210 -> 43 MB (the resident size stays near 6 GB in both, because every pooled connection maps the 1 GB file).
+* **Freshness** (the real helper, a file created in a watched folder until a search finds it): p50 **423 ms -> 28 ms** (min 18,
+  max 31) with the new helper (`--latency 0.05 --no-defer`); about 65 ms with an older helper that lacks `watch_nodefer`. A burst of 2,000
+  new files is searchable after 0.5 s at 0.37 s of CPU (was 0.62 s and 0.71 s). The first change after a restart costs 7 ms
+  to apply, not 330 ms (it no longer loads the whole typo vocabulary).
+* **Size**: the name index 126 MiB -> 42 MiB for 2 M names (`tri_stats` 0.2 MiB); the data in the database file 970 MiB -> 884 MiB.
+* **While a crawl is writing** in the same process (ingest throttled to half speed), measured on the first version: `limit` 200 p50 13.4 ms,
+  p95 26; `limit` 50 p50 10.5 ms, p95 24, worst 72 ms. The first search of a rare shape after a restart is slower (cold pages).
+* Queries that match more than 4000 names *and* carry a filter that leaves almost nothing (`ext:md json`) look 80,000 names deep, as
+  before; that path is about 20 % slower (48 vs 38 ms p95) because every name is checked with `instr()` where the old index
+  checked positions.
 * **Crawl speed.** The helper walked 17.9 k entries of this project in 0.5 s (about 35 k entries/s with disk I/O
   throttled, 80 k entries/s of CPU time): an estimate from one warm run, not a disk benchmark. Storing them (Python:
   rules check, name folding, SQLite): the first load is a bulk load, ~12 k entries/s plus ~40 s to build the indexes at
   the end, so **2 M entries take about 4-6 minutes in the background** (nothing is searchable until it ends). A later
   re-crawl costs ~24 k entries/s when nothing changed (about 90 s for 2 M, run daily at most) and ~5 k entries/s in the
-  worst case where every row changed. FSEvents changes reach the index in ~0.3 s (measured with the real helper).
+  worst case where every row changed.
 
 ### Install (after you approve it)
 
@@ -527,6 +684,23 @@ The helper the service starts inherits that grant. Or set `skip_protected: never
     mse files "readme"                   # searchable when the first crawl has finished (state: ready)
 
 Switch it off with `mac_index.enabled: false`; delete `macindex.db` (it is only derived data) to start over.
+
+## Find files by what is in them (whole disk)
+
+The whole-Mac name index above finds files by name. On top of it, the **whole-disk content search** describes, in the
+background and only while the Mac is idle, every picture (Vision labels, fast OCR of text-like pictures), PDF (first
+pages), document (first kilobytes) and video (poster frame) under the folders you choose, and searches those
+descriptions: "image of a zebra", "Rechnung Telekom", "photo of a beach". It is the light tier; the folders you add to
+the index (**Deep indexed** in the sidebar) keep the full pipeline (all text, scans, audio, video, English↔German,
+meaning). One search covers both: Quick Search lists the hits under **On this Mac**, the main window's Mac mode under
+**Contents on this Mac**.
+
+It never reaches anything the name index excludes (credential stores, secret file names, Keychains, Mail, browser
+profiles, `~/Library`), nor hidden folders, package insides, build and dependency folders, nested repositories,
+iCloud placeholders or symbolic links; every result is checked on disk and against the rules before it is shown.
+Settings → **Whole-disk Search**, `mse disk status | search | rescan`, `GET /api/disk/status`, `GET /api/disk/search`,
+`POST /api/disk/rescan`, the `wholedisk` block of the settings. The whole story, with the settings, the CLI and how
+to add a deep folder: **[docs/WHOLE_DISK.md](docs/WHOLE_DISK.md)**.
 
 ## Connecting agents
 
@@ -558,6 +732,87 @@ By hand:
 - **HTTP clients:** `POST http://127.0.0.1:8737/mcp` with header `X-MSE-Token: <token from config.json>`.
 - **Shell-only agents:** `mse search --json "…"` and `mse get '#docid'`.
 - **Per-folder lock (stdio):** env `MSE_CWD=<folder>` sets the default collection; adding `MSE_LOCK=1` limits the session to that collection only (other collections, `all`, groups or lists naming anything else, and outside paths are refused; a group or list containing only that collection is fine; a folder in no collection fails every call).
+
+### What an agent can use (MCP)
+
+Ten tools, three kinds of resource and three prompts, over stdio (`mse mcp`) and `POST /mcp`. The server speaks protocol
+`2025-06-18` and also accepts a client that asks for `2025-03-26` or `2024-11-05`; any other version gets `2025-06-18`.
+The names, required arguments and meaning of the existing tools are unchanged; every new argument is optional. The read-only
+tools carry `readOnlyHint: true`; `mark_best` and `sync` (which only write a favourite and queue indexing) carry
+`readOnlyHint: false, destructiveHint: false`.
+
+| Tool | Arguments | Returns |
+|---|---|---|
+| `search` | `query` (required; may be empty when document filters are set), `collection`, `limit`, `type`, `after`, `before`, `path`, `include`, `exclude`, `mode`, `precise`, and the document filters below | Ranked files: `#docid`, path, why it matched, snippets, and when known a `meta:` and a `cite:` line |
+| `get` | `ref` (required), `collection`, `page` (from 1), `max_chars` | The text of one file, or of one page; says so when a page has no extracted text |
+| `multi_get`, `similar`, `collections`, `mark_best`, `sync`, `ask` | as before | as before |
+| `timeline` | `collection`, `type` (kinds), `from`, `to` (`YYYY-MM`) | One line per month with the number of documents and the amounts per currency, the months with none (`gaps`), first and last month, and how many documents have no date |
+| `facets` | `collection`, `type` | Counts of kinds, the most frequent parties, months and currencies, and how many files are classified |
+
+**Document filters of `search`** narrow the results to what a document is. They are added to the query as the inline filters
+described under [Documents](#documents-what-they-are-and-what-they-say) (`doctype:`, `amount:`, `currency:`, `party:`, `docdate:`), after the folder check, so they work the same
+for the stdio server, the daemon and the lock. A query with filters and no words lists the matching documents, newest first
+(pass an empty `query`). Unclassified files never match a document filter.
+
+| Argument | Type | Written into the query as |
+|---|---|---|
+| `doctype` | list of `invoice`, `receipt`, `bank_statement`, `contract`, `letter`, `quote`, `reminder`, `payslip`, `tax_document`, `other` | `doctype:invoice doctype:receipt`: any of them |
+| `amount_min`, `amount_max` | number from 0 to 999999999999 (two decimals) | `amount:>=100.00 amount:<=500.00`: both limits hold; `amount_min` greater than `amount_max` is refused |
+| `currency` | three letters | `currency:EUR` |
+| `party` | text of up to 120 characters, without a comma, a double quote or a backslash | `party:Acme` or `party:"Acme Parts"` (contains, ignoring case and accents) |
+| `docdate_from`, `docdate_to` | `YYYY`, `YYYY-MM` or `YYYY-MM-DD`, a real calendar date | `docdate:2025-01..2025-06`; the end is inclusive, so `docdate_to` `2025-06` includes all of June |
+
+Bad input is an error result before anything is searched. With none of these arguments the query goes out unchanged. A `party`
+with spaces needs a `query` without an unbalanced quote or a trailing backslash, because the quoted name would be read
+wrongly; the call is refused then.
+
+**Citations.** A result with a hit on a page gets a `cite:` line such as `cite: Quarterly report p.2`
+(pages count from 1, as the page numbers shown in results do), and a recording with `cite: Supplier call @ 1:15`
+(`h:mm:ss` from one hour on). The title is the file's title, else its name; for a metadata-only file it is always the name,
+never the title. Quote the `cite:` line when you name a source. `meta:` looks like
+`meta: invoice · 2025-03-14 · 1234.00 EUR · party Acme Parts GmbH · ref INV-2025-0042`; unknown parts are left out.
+
+```
+1. [work] Invoices/acme-2025-03.pdf  #4319a060  (pdf, 2025-03-14, 2 pages; matched: keyword, semantic)
+   meta: invoice · 2025-03-14 · 1234.00 EUR · party Acme Parts GmbH · ref INV-2025-0042
+   cite: Acme invoice March p.2
+   p.2 … total amount due …
+```
+
+`get` with `page` prints `# path  (#docid, work, pdf, 2025-03-14, page 2)` and a `cite:` line; a page of 0 or less is an
+error, and a page without text says `page 9 has no extracted text` (and how many pages the document has).
+
+**Masking.** The existing masking of the whole text stays. Every new value that comes from a document or from your settings (a
+party, a reference, a title, a saved search's name and query) is also checked on its own: an IBAN-shaped or Luhn-valid
+number becomes a mask, any word with six or more digits in a row becomes `[id]` (so many invoice numbers are shown as
+`[id]`), and a reference the extractor would not store is masked whole. The switch is the same, *Mask personal identifiers for agents* in the
+settings (`agents.redact` in `config.json`, on by default): when it is off, nothing is changed. Further formats can be
+added as a list of `{name, regex}` under `agents.extra_id_patterns`; a pattern that can match nothing, nests repeats,
+uses back-references, is too long or is too slow on a short probe is skipped with a log line, and the built-in rules
+always run.
+
+**Resources** (`resources/list`, `resources/templates/list`, `resources/read`, all `text/plain`):
+
+| URI | Content |
+|---|---|
+| `mysearch://collections` | The same text as the `collections` tool |
+| `mysearch://saved/<id>` | A saved search's name, query and scope, and its results now (it runs as the `search` tool would) |
+| `mysearch://doc/<docid>` | The text of one document, as `get` returns it. `<docid>` is the 8 hexadecimal characters of a `#docid`; a path is never accepted |
+
+`resources/list` lists the collections resource and every saved search. A saved search that names no scope means every
+collection, as in the app. Under `MSE_LOCK=1` only the saved searches whose scope is nothing but the locked collection are
+listed (a scope shortcut in the query counts, and wins over the saved scope; a saved search for everything, for another
+collection or for a folder outside it is hidden), and reading a hidden one, or a document of another collection, answers
+exactly like a resource that does not exist.
+
+**Prompts** (`prompts/list`, `prompts/get`): `find-document` (`description`; optional `type`, `date`), `monthly-summary`
+(`month` as `YYYY-MM`; optional `collection`) and `missing-receipts` (`year`; optional `collection`). Each returns one user
+message that tells the agent which tools to call, in which order and what to report. Under the lock a `collection` argument
+other than the locked one is refused.
+
+Errors: `-32002` resource not found (also a resource the lock hides), `-32602` invalid parameters (a malformed docid, a missing
+or badly formatted prompt argument, an unknown prompt, a collection the lock refuses), `-32601` unknown method. Tool
+problems (bad arguments, a refused folder) come back as a tool result with `isError: true`, as before.
 
 ## Raycast
 
@@ -620,12 +875,16 @@ Credits: the command palette and the dual panes follow ideas from **Shuffle** (i
 `MySearch.app` can run the background service itself, so macOS Full Disk Access is granted to **MySearch.app** instead of
 Homebrew's Python. With the app installed in `/Applications`, `mse service install` writes a LaunchAgent that starts
 `/Applications/MySearch.app/Contents/MacOS/MySearch --daemon`; that supervisor (no window, no hot keys) runs
-`<project>/.venv/bin/python -m mse serve` as its child, forwards SIGTERM/SIGINT so the queue is saved, and exits with the
-child's status (launchd restarts it). `msehelper` is bundled in the app, so the file crawl belongs to the app too. The project
-folder comes from `service.project` in `~/Library/Application Support/MySearch/config.json` (without it, the app uses the clone it was built in, else `~/Developer/mysearch`, the folder docs/INSTALL.md tells you to clone to).
-Without the app, `mse service install` keeps the old Python LaunchAgent.
+`python -m mse serve` as its child, forwards SIGTERM/SIGINT so the queue is saved, and exits with the
+child's status (launchd restarts it). `msehelper` is bundled in the app, so the file crawl belongs to the app too.
+Which Python the supervisor starts, in this order: the project named by `service.project` in
+`~/Library/Application Support/MySearch/config.json` when it has a `.venv` (a clone; the developer's setup); else the runtime
+bundled in the app (`Contents/Resources/runtime/bin/python3`, with `mse` in `Contents/Resources/mse`), present when the app was
+built with `--bundle-runtime`; else the clone the app was built in, or `~/Developer/mysearch`.
+Without the app, `mse service install` keeps the old Python LaunchAgent. **A disk image built with `--bundle-runtime` needs no
+clone and no `uv` at all**: its setup assistant installs the LaunchAgent itself (see [docs/INSTALL.md](docs/INSTALL.md#install-from-the-disk-image)).
 
-1. **Build and sign:** `cd /path/to/mysearch && ./scripts/build_dmg.sh`. Click "Always Allow" if macOS asks whether codesign may use the key. The signing identity comes from `MSE_SIGN_IDENTITY`, `MSE_SIGN_SHA1` and `MSE_TEAM_ID` (or `scripts/sign.local.env`, see `scripts/sign.local.env.example`); without them the build is ad-hoc.
+1. **Build and sign:** `cd /path/to/mysearch && ./scripts/build_dmg.sh`; add `--bundle-runtime` for the version people can install without a clone. Click "Always Allow" if macOS asks whether codesign may use the key. The signing identity comes from `MSE_SIGN_IDENTITY`, `MSE_SIGN_SHA1` and `MSE_TEAM_ID` (or `scripts/sign.local.env`, see `scripts/sign.local.env.example`); without them the build is ad-hoc.
    (`--adhoc --out <folder>` makes an ad-hoc test build with no Keychain prompt.)
 2. **Install:** open `build/MySearch.dmg` and drag MySearch to Applications.
 3. **Grant access BEFORE switching the service:** System Settings > Privacy & Security > Full Disk Access > + > `/Applications/MySearch.app`, switched on.
@@ -674,8 +933,15 @@ The code is MIT-licensed, see [LICENSE](LICENSE). Model weights are not in this 
 you download them yourself, under their own terms. EmbeddingGemma: Apache-2.0. The Qwen3 models: Apache-2.0.
 Whisper: MIT. Third-party code and the licences of the main dependencies: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
+A disk image built with `--bundle-runtime` also contains GPL-licensed libraries (a GPL build of FFmpeg with x264, x265 and
+others, inside the opencv-python package). The notices say which, under what terms and where their source is, and a release
+of such an image carries that source as `MySearch-<version>-sources.tar.gz`: [docs/RELEASING.md](docs/RELEASING.md).
+
 ## Distributing the app
 
 The DMG that `scripts/build_dmg.sh` makes is for the Mac that built it. A build for other people needs a
-Developer ID certificate (`MSE_SIGN_IDENTITY`, `MSE_SIGN_SHA1`, `MSE_TEAM_ID`) and notarization by Apple, which the
-script does not do. An ad-hoc build (the default when no signing values are set) runs only on the machine that built it.
+Developer ID certificate and notarization by Apple. `scripts/notarize.sh` is the scaffold for that
+(`MSE_DEVELOPER_ID` and `MSE_NOTARY_PROFILE`; hardened runtime, the entitlements in `scripts/entitlements/`, `notarytool submit
+--wait`, stapling). It has not been run yet, because there is no Developer ID certificate; see
+[docs/INSTALL.md](docs/INSTALL.md#notarizing) for what it does and what is unverified. An ad-hoc build (the default when no signing
+values are set) runs only on the machine that built it. A Homebrew cask template is in [packaging/homebrew](packaging/homebrew).

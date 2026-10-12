@@ -1,0 +1,48 @@
+name: CI
+
+# Unit tests and an ad-hoc build of the helper and the app, on every push and pull request.
+# Nothing here needs a model, a secret or a network address other than the package indexes and GitHub.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      # Before "uv sync": the checkout holds only the tracked files, so the audit never walks the virtual environment.
+      # This runner has no private denylist (.oss-private is never published), so only the generic checks run here.
+      - name: Public-release audit (generic checks)
+        run: python3 scripts/oss_audit.py .
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.12.4"
+          enable-cache: false
+
+      - name: Install the locked environment (no models are downloaded)
+        run: uv sync --frozen
+
+      - name: Unit tests
+        run: uv run python -m unittest discover -s tests -t .
+
+      - name: Build the helper and the app (ad hoc, no signing identity)
+        run: ./scripts/build_dmg.sh --adhoc --out build/ci

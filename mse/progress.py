@@ -49,6 +49,7 @@ class _Folder:
         self.error_count = 0
         self.errors = deque(maxlen=ERRORS_KEEP)
         self.light = 0            # files the running scan still has to read
+        self.paused = None        # why the heavy pass or the embed loop is waiting (e.g. "user active"), None otherwise
 
 
 class Registry:
@@ -74,6 +75,13 @@ class Registry:
             f.started_at, f.finished_at = time.time(), None
             f.error_count = 0
             f.errors.clear()
+            f.paused = None
+
+    def pause(self, name: str, reason: str | None) -> None:
+        """The idle gate (indexer._wait_for_heavy_work) is holding this folder's heavy or embed work: `reason` is the
+        label to show ("user active", "on battery", ...); None when the work goes on."""
+        with self._lock:
+            self._folder(name).paused = reason
 
     def stage(self, name: str, stage: str, done: int = 0, total: int = 0, current: str = "") -> None:
         now = time.monotonic()
@@ -109,6 +117,7 @@ class Registry:
             f.stage = "idle"
             f.done = f.total = f.light = 0
             f.current, f.rate = "", None
+            f.paused = None
             f.finished_at = time.time()
 
     def _db_counts(self, name: str) -> dict:
@@ -118,18 +127,26 @@ class Registry:
             cached = self._counts.get(name)
         if cached and now - cached[0] < COUNT_TTL_S:
             return cached[1]
-        counts = {"heavy": 0, "embed": 0}
+        counts = {"heavy": 0, "embed": 0, "held": 0}
         try:
             if store.db_path(name).exists():
                 conn = store.connect(name, readonly=True)
                 try:
+                    # imported here: indexer imports this module. A file marked missing is not work until it is back.
+                    from . import indexer
                     counts["heavy"] = conn.execute(
-                        "SELECT COUNT(*) FROM files WHERE heavy IS NOT NULL AND mode='full'").fetchone()[0]
-                    counts["embed"] = conn.execute("SELECT COUNT(*) FROM items WHERE embedded=0").fetchone()[0]
+                        "SELECT COUNT(*) FROM files WHERE heavy IS NOT NULL AND mode='full'"
+                        + indexer._present(conn)).fetchone()[0]
+                    counts["embed"] = conn.execute(
+                        "SELECT COUNT(*) FROM items WHERE embedded=0" + store.embed_skip_items(conn)).fetchone()[0]
+                    try:                                 # its own guard: a failure here leaves the queue counts as they are
+                        counts["held"] = indexer.held_missing(conn)
+                    except Exception:
+                        counts["held"] = 0
                 finally:
                     conn.close()
         except Exception:
-            counts = {"heavy": 0, "embed": 0}          # busy or unreadable right now: show zero this time
+            counts = {"heavy": 0, "embed": 0, "held": 0}   # busy or unreadable right now: show zero this time
         with self._lock:
             self._counts[name] = (now, counts)
         return counts
@@ -148,6 +165,7 @@ class Registry:
                 done, total, current, rate = f.done, f.total, f.current, f.rate
                 error_count, recent = f.error_count, list(f.errors)
                 started_at, finished_at = f.started_at, f.finished_at
+                paused = f.paused
             pending = self._db_counts(name)
             busy = job is not None
             eta = round((total - done) / rate) if busy and rate and total > done else None
@@ -155,6 +173,7 @@ class Registry:
                 "job": job,
                 "stage": stage if busy else "idle",
                 "status": status,
+                "paused": paused if busy else None,     # why the idle gate is holding the work, e.g. "user active"
                 "done": done if busy else 0,
                 "total": total if busy else 0,
                 "percent": round(100.0 * done / total, 1) if busy and total else None,
@@ -164,7 +183,7 @@ class Registry:
                 "errors": {"count": error_count, "recent": recent},
                 # files still to read in this run: what is left of the extracting stage, counting down
                 "pending": {"light": max(0, total - done) if busy and stage == "extracting" else 0,
-                            "heavy": pending["heavy"], "embed": pending["embed"]},
+                            "heavy": pending["heavy"], "embed": pending["embed"], "held": pending["held"]},
                 "started_at": started_at,
                 "finished_at": finished_at,
             }
@@ -190,19 +209,25 @@ def format_line(name: str, e: dict) -> str:
             bits.append(f"{pend['embed']:,} to embed")
         if pend.get("heavy"):
             bits.append(f"{pend['heavy']:,} for OCR/media")
+        if pend.get("held"):
+            bits.append(f"{pend['held']:,} missing (held)")
         return f"{name:<14}" + "idle" + (" · " + " · ".join(bits) if bits else "") + tail
+    held = f" · {pend['held']:,} missing (held)" if pend.get("held") else ""
     line = f"{name:<14}" + _LABEL.get(e.get("stage"), e.get("stage") or "working")
     if e.get("total"):
         pct = f" ({e['percent']:.0f}%)" if e.get("percent") is not None else ""
         line += f" {e['done']:,}/{e['total']:,}{pct}"
-        if e.get("eta_s") is not None:
+        if e.get("eta_s") is not None and not e.get("paused"):
             line += f"  ~{format_eta(e['eta_s'])}"
-    return line + tail
+    if e.get("paused"):
+        line += f" · paused ({e['paused']})"
+    return line + held + tail
 
 
 REGISTRY = Registry()
 begin = REGISTRY.begin
 stage = REGISTRY.stage
+pause = REGISTRY.pause
 set_pending = REGISTRY.set_pending
 error = REGISTRY.error
 end = REGISTRY.end

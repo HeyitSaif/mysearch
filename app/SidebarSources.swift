@@ -20,6 +20,15 @@ enum SidebarSources {
     /// True while a section is put back to its remembered state, so that is not saved as a new choice.
     private static var restoring = false
 
+    // MARK: snapshot fixture
+
+    /// True in fixture mode (SnapshotFixture): the rows are fixed fictional ones, and nothing is read from or written to the
+    /// Mac's own recents, pins, sidebar memory, cloud drives or volumes.
+    static var fixture: Bool { SnapshotFixture.isActive }
+
+    /// The home folder: the fixture's in fixture mode, else the user's.
+    static var home: URL { SnapshotFixture.home ?? FileManager.default.homeDirectoryForCurrentUser }
+
     // MARK: helpers
 
     static func isDirectory(_ url: URL) -> Bool {
@@ -55,7 +64,8 @@ enum SidebarSources {
 
     /// iCloud Drive, and every folder in ~/Library/CloudStorage (Dropbox, Google Drive, OneDrive, ...). Each one only if it exists.
     static func cloudDriveNodes() -> [SidebarNode] {
-        let home = FileManager.default.homeDirectoryForCurrentUser
+        if fixture { return [] }                         // the fixture's cloud row comes from locationNodes()
+        let home = SidebarSources.home
         var nodes: [SidebarNode] = []
         let icloud = home.appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs", isDirectory: true)
         if isDirectory(icloud) {
@@ -114,6 +124,7 @@ enum SidebarSources {
 
     /// Every mounted volume except the boot volume (already listed under Locations). Hidden and unbrowsable volumes are skipped.
     static func volumeNodes() -> [SidebarNode] {
+        if fixture { return [] }
         let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: volumeKeys,
                                                          options: [.skipHiddenVolumes]) ?? []
         var nodes: [SidebarNode] = []
@@ -125,6 +136,19 @@ enum SidebarSources {
             nodes.append(SidebarNode(.place(title: title, url: url, symbol: network ? "network" : "externaldrive")))
         }
         return nodes
+    }
+
+    /// Locations, in order: the boot volume, cloud drives, mounted volumes. In fixture mode three fictional rows instead:
+    /// the Mac's own volume names and mounts are never read there.
+    static func locationNodes() -> [SidebarNode] {
+        if fixture {
+            return [SidebarNode(.place(title: "Fixture Disk", url: SnapshotFixture.child("disk") ?? home, symbol: "internaldrive")),
+                    SidebarNode(.place(title: "Fixture Cloud", url: SnapshotFixture.child("cloud") ?? home, symbol: "cloud")),
+                    SidebarNode(.place(title: "Fixture Drive", url: SnapshotFixture.child("drive") ?? home, symbol: "externaldrive"))]
+        }
+        let volume = (try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeLocalizedNameKey]))?.volumeLocalizedName
+        let boot = SidebarNode(.place(title: volume ?? "Macintosh HD", url: URL(fileURLWithPath: "/"), symbol: "internaldrive"))
+        return [boot] + cloudDriveNodes() + volumeNodes()
     }
 
     /// A removable, ejectable or network volume.
@@ -156,7 +180,8 @@ enum SidebarSources {
 
     /// The pinned folders that resolve now. A bookmark that does not resolve (an unplugged drive, say) is kept and simply not shown.
     static func pinnedURLs() -> [URL] {
-        pinData.compactMap { resolve($0) }
+        if fixture { return SnapshotFixture.project.map { [$0] } ?? [] }      // one fixed pin: the fictional project
+        return pinData.compactMap { resolve($0) }
     }
 
     static func isPinned(_ url: URL) -> Bool {
@@ -166,6 +191,7 @@ enum SidebarSources {
 
     /// Pins a folder to Favorites. Only a bookmark is stored; the folder itself is never touched.
     static func pin(_ url: URL) {
+        guard !fixture else { return }
         let target = url.standardizedFileURL
         guard isDirectory(target), !isPinned(target), let data = try? target.bookmarkData() else { return }
         pinData = pinData + [data]
@@ -173,6 +199,7 @@ enum SidebarSources {
 
     /// Removes the pin only. The folder stays exactly where it is.
     static func unpin(_ url: URL) {
+        guard !fixture else { return }
         let path = url.standardizedFileURL.path
         pinData = pinData.filter { resolve($0)?.path != path }
     }
@@ -183,7 +210,17 @@ enum SidebarSources {
 
     /// Favorites: the standard folders, then the pinned ones.
     static func favoriteNodes(home: URL) -> [SidebarNode] {
-        [
+        if fixture {
+            // the fictional standard folders, then the one fixed pin (Applications is the Mac's own, so it is not listed)
+            return [
+                SidebarNode(.place(title: "Home", url: home, symbol: "house")),
+                SidebarNode(.place(title: "Desktop", url: home.appendingPathComponent("Desktop"), symbol: "menubar.dock.rectangle")),
+                SidebarNode(.place(title: "Documents", url: home.appendingPathComponent("Documents"), symbol: "doc")),
+                SidebarNode(.place(title: "Downloads", url: home.appendingPathComponent("Downloads"), symbol: "arrow.down.circle")),
+                SidebarNode(.place(title: "Photos", url: home.appendingPathComponent("Photos"), symbol: "photo")),
+            ] + pinnedNodes()
+        }
+        return [
             SidebarNode(.place(title: "Home", url: home, symbol: "house")),
             SidebarNode(.place(title: "Desktop", url: home.appendingPathComponent("Desktop"), symbol: "menubar.dock.rectangle")),
             SidebarNode(.place(title: "Documents", url: home.appendingPathComponent("Documents"), symbol: "doc")),
@@ -196,6 +233,7 @@ enum SidebarSources {
 
     /// Remembers a folder the Navigator visited: newest first, no repeats, the last `recentLimit` kept.
     static func recordRecent(_ url: URL) {
+        guard !fixture else { return }
         let path = url.standardizedFileURL.path
         var paths = UserDefaults.standard.stringArray(forKey: recentsKey) ?? []
         paths.removeAll { $0 == path }
@@ -205,6 +243,14 @@ enum SidebarSources {
 
     /// The Recents rows: the remembered folders that still exist, or a note when there are none.
     static func recentChildren() -> [SidebarNode] {
+        if fixture, let home = SnapshotFixture.home {
+            // the fixed fictional recents: the project, the invoices, the notes and the photos
+            let rows: [(String, URL)] = [("Alpha", SnapshotFixture.project ?? home),
+                                         ("Invoices", home.appendingPathComponent("Documents/Invoices")),
+                                         ("Notes", home.appendingPathComponent("Documents/Notes")),
+                                         ("Photos", home.appendingPathComponent("Photos"))]
+            return rows.map { SidebarNode(.place(title: $0.0, url: $0.1, symbol: "clock")) }
+        }
         let paths = UserDefaults.standard.stringArray(forKey: recentsKey) ?? []
         let urls = paths.prefix(recentLimit).map { URL(fileURLWithPath: $0, isDirectory: true) }.filter { isDirectory($0) }
         guard !urls.isEmpty else { return [SidebarNode(.note("No recent folders"))] }
@@ -214,7 +260,8 @@ enum SidebarSources {
     // MARK: section memory (every section can be collapsed, and the state is kept)
 
     static func isOpen(_ title: String) -> Bool {
-        (UserDefaults.standard.object(forKey: sectionKeyPrefix + title) as? Bool) ?? true
+        if fixture { return true }                       // the fixture always shows every section open
+        return (UserDefaults.standard.object(forKey: sectionKeyPrefix + title) as? Bool) ?? true
     }
 
     /// Runs a reload or restore that the outline itself reports as expand, collapse or selection changes, so none of
@@ -243,7 +290,7 @@ enum SidebarSources {
 
     /// Saves a section the user opened or closed. Called from the outline's expand and collapse notifications.
     static func sectionChanged(_ note: Notification, open: Bool) {
-        guard !restoring, let node = note.userInfo?["NSObject"] as? SidebarNode, node.isSection else { return }
+        guard !restoring, !fixture, let node = note.userInfo?["NSObject"] as? SidebarNode, node.isSection else { return }
         UserDefaults.standard.set(open, forKey: sectionKeyPrefix + node.title)
     }
 }
@@ -313,18 +360,16 @@ extension SidebarViewController {
     }
 
     func reloadFavorites() {
-        refreshSection("Favorites", SidebarSources.favoriteNodes(home: FileManager.default.homeDirectoryForCurrentUser))
+        refreshSection("Favorites", SidebarSources.favoriteNodes(home: SidebarSources.home))
     }
 
     func reloadRecents() {
         refreshSection("Recents", SidebarSources.recentChildren())
     }
 
-    /// Rebuilds Locations: the boot volume, then cloud drives, then mounted volumes.
+    /// Rebuilds Locations: the boot volume, then cloud drives, then mounted volumes (the fixed rows in fixture mode).
     func reloadLocations() {
-        guard let node = sectionNode("Locations") else { return }
-        let boot = node.children.filter { $0.placeURL?.path == "/" }
-        refreshSection("Locations", boot + SidebarSources.cloudDriveNodes() + SidebarSources.volumeNodes())
+        refreshSection("Locations", SidebarSources.locationNodes())
     }
 
     /// Replaces one section's rows. The selection callback is silenced: a row that is rebuilt must not reset the search scope.
@@ -386,10 +431,12 @@ extension SidebarViewController {
         guard let url = node.placeURL, (outline.parent(forItem: node) as? SidebarNode)?.title == "Locations",
               SidebarSources.isVolumeRoot(url), SidebarSources.canEject(url) else { return }
         let button = SidebarEjectButton(frame: .zero)
-        button.image = NSImage(systemSymbolName: "eject.fill", accessibilityDescription: "Eject")
+        button.image = NSImage(systemSymbolName: "eject.fill", accessibilityDescription: "Eject")?
+            .withSymbolConfiguration(MSEStyle.symbolConfig)
         button.isBordered = false
         button.imagePosition = .imageOnly
-        button.contentTintColor = .secondaryLabelColor
+        button.contentTintColor = MSEStyle.secondary
+        (cell as? SidebarCell)?.secondaryViews.append(button)
         button.toolTip = "Eject “\(node.title)”"
         button.translatesAutoresizingMaskIntoConstraints = false
         button.onPress = { [weak self] in self?.eject(url, name: node.title) }

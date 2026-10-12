@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Used by scripts/build_dmg.sh with the hardened flag (and so by scripts/notarize.sh) for MySearch.app itself.
+	     Nothing else is needed: the app is not sandboxed, WebKit's own processes carry their own entitlements, and the
+	     Keychain and the network need none. NOTE: the signing tools parse this file strictly, so a comment must never
+	     contain two hyphens in a row. -->
+
+	<!-- "Open in..." starts Terminal (Launchers.swift) through Apple Events; the hardened runtime blocks that unless
+	     this is set. Info.plist carries the NSAppleEventsUsageDescription that the consent prompt shows. -->
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>

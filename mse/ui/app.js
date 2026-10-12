@@ -194,7 +194,8 @@ function setScope(id, additive) {
    The same rules as config.scope_shortcut in the service, which applies them (the query goes as typed). This copy
    only draws the chip, marks the shortcut in the field and suggests names; it never decides where a search runs. */
 
-const RESERVED = new Set(["type", "kind", "ext", "in", "after", "before", "path", "has", "include", "exclude"]);   // config.FILTER_KEYS
+const RESERVED = new Set(["type", "kind", "ext", "in", "after", "before", "path", "has", "include", "exclude",
+                             "doctype", "amount", "currency", "party", "docdate"]);   // config.FILTER_KEYS
 const SC_PREFIX = /^\s*([\w-]+(?:\s*,\s*[\w-]+)*):(?=\s|["'“„]|$)/;
 const SC_IN = /(?<!\S)in:(?:"([^"]*)"|([\w-]+(?:,[\w-]+)*))(?=\s|$)/gi;
 const SC_QUOTED = /"[^"]*"|“[^”]*”|„[^“”]*[“”]/g;
@@ -1030,7 +1031,7 @@ function highlighter() {
 }
 
 const MAIL_FIELD = /^(Subject|From|To|Cc|Bcc|Reply-To|Date|Sent|Attachments):[ \t]*(.*)$/i;
-const NUMERIC = /^[-+−]?(?:[$€£]\s?)?\d[\d.,'\s]*(?:\s?(?:%|€|EUR|AED|USD|PKR|\$))?$/i;
+const NUMERIC = /^[-+−]?(?:[$€£]\s?)?\d[\d.,'\s]*(?:\s?(?:%|€|\$|[A-Z]{3}))?$/i;
 const trimBlank = (lines) => { let a = 0, b = lines.length; while (a < b && !lines[a].trim()) a++; while (b > a && !lines[b - 1].trim()) b--; return lines.slice(a, b); };
 
 /* The document text with structure: "## " headings, spreadsheets ("Sheet: …" sections of "a | b | c" rows) as tables,

@@ -19,8 +19,16 @@ final class SidebarNode: NSObject {
     var children: [SidebarNode] = []
     /// Set on the rows of the Tags section: selecting one lists the files with that colour tag (Tags.swift).
     var tagColor: TagColor?
+    /// Set on the rows of the Saved section (SavedSearches.swift). Such a row is a place row whose URL is no folder, so the
+    /// folder code never takes it for one; selecting it runs the saved search.
+    var savedSearch: SavedSearch?
 
     init(_ kind: Kind) { self.kind = kind }
+
+    convenience init(saved s: SavedSearch) {
+        self.init(.place(title: s.name, url: URL(fileURLWithPath: "/.mysearch-saved/\(s.id)"), symbol: "magnifyingglass"))
+        savedSearch = s
+    }
 
     var isSection: Bool { if case .section = kind { return true }; return false }
     var canBeSelected: Bool {
@@ -75,24 +83,47 @@ enum SidebarColors {
     }
 }
 
-/// The sidebar's outline. Its content is drawn without vibrancy, so the labels keep their real colour and the
-/// accent-tinted icons never wash out to a "disabled" grey (in an inactive or off-screen window too).
+/// The sidebar's outline. Before macOS 26 its content is drawn without vibrancy, so the labels keep their real colour and
+/// the accent-tinted icons never wash out to a "disabled" grey (in an inactive or off-screen window too). On macOS 26 and
+/// later the system's own source-list material and vibrancy are kept.
 final class SidebarOutlineView: NSOutlineView {
-    override var allowsVibrancy: Bool { false }
+    override var allowsVibrancy: Bool {
+        if #available(macOS 26, *) {
+            return super.allowsVibrancy
+        } else {
+            return false
+        }
+    }
 }
 
-/// A sidebar cell whose icon is tinted with the accent colour (white on a selected row), so the rows never look
-/// disabled, whether or not the window is key.
+/// A sidebar cell. Before macOS 26 its icon is tinted with the accent colour (white on a selected row), so the rows never
+/// look disabled, whether or not the window is key. On macOS 26 and later the system tints the icon and recolours it on
+/// selection, so nothing is set here.
 @MainActor
 final class SidebarCell: NSTableCellView {
+    /// The secondary-coloured parts of the row (a group's member count, the eject button). A selected row (the accent colour)
+    /// takes white for them; a custom colour is not swapped for white by AppKit, as the system label colours are.
+    var secondaryViews: [NSView] = []
+
     override var backgroundStyle: NSView.BackgroundStyle {
-        didSet { applyTint() }
+        didSet {
+            applyTint()
+            let colour = MSEStyle.secondary(on: backgroundStyle)
+            for case let label as NSTextField in secondaryViews { label.textColor = colour }
+            for case let button as NSButton in secondaryViews { button.contentTintColor = colour }
+        }
     }
 
     func applyTint() {
-        let color: NSColor = backgroundStyle == .emphasized ? .alternateSelectedControlTextColor : SidebarColors.accent
-        imageView?.contentTintColor = color
-        imageView?.symbolConfiguration = NSImage.SymbolConfiguration(paletteColors: [color])
+        if #available(macOS 26, *) {
+            // system colours: the source list tints the symbol itself
+        } else {
+            let color: NSColor = backgroundStyle == .emphasized ? .alternateSelectedControlTextColor : SidebarColors.accent
+            imageView?.contentTintColor = color
+            // the size and weight stay MSEStyle.symbolConfig's; only the colour layer is added (an inactive or off-screen
+            // window greys a plain tint, a palette colour does not)
+            imageView?.symbolConfiguration = MSEStyle.symbolConfig.applying(NSImage.SymbolConfiguration(paletteColors: [color]))
+        }
     }
 }
 
@@ -109,6 +140,8 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     let outline = SidebarOutlineView()                  // internal: SidebarSources.swift refreshes sections
     var roots: [SidebarNode] = []
     private var indexedRoot: SidebarNode!
+    /// The Saved section: the saved searches (SavedSearches.swift). It is in `roots` only while there are some.
+    private var savedRoot: SidebarNode!
     var suppressCallback = false                        // internal: SidebarSources.swift refreshes sections silently
     /// The groups by id, with the label, aliases and tab flag the sidebar and its menus need (see GroupEditor.swift).
     private var details: [String: GroupDetail] = [:]
@@ -157,18 +190,16 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     private func buildRoots() {
-        let fm = FileManager.default
-        let home = fm.homeDirectoryForCurrentUser
+        let home = SidebarSources.home                       // the fixture's home in snapshot fixture mode
         let favorites = SidebarNode(.section("Favorites"))
         favorites.children = SidebarSources.favoriteNodes(home: home)      // the standard folders, then pinned ones
         let recents = SidebarNode(.section("Recents"))
         recents.children = SidebarSources.recentChildren()
         indexedRoot = SidebarNode(.section("Indexed"))
         indexedRoot.children = [SidebarNode(.note("Loading…"))]
-        let volume = (try? URL(fileURLWithPath: "/").resourceValues(forKeys: [.volumeLocalizedNameKey]))?.volumeLocalizedName
+        savedRoot = SidebarNode(.section("Saved"))
         let locations = SidebarNode(.section("Locations"))
-        let boot = SidebarNode(.place(title: volume ?? "Macintosh HD", url: URL(fileURLWithPath: "/"), symbol: "internaldrive"))
-        locations.children = [boot] + SidebarSources.cloudDriveNodes() + SidebarSources.volumeNodes()
+        locations.children = SidebarSources.locationNodes()  // the boot volume, cloud drives, mounted volumes
         let tags = SidebarNode(.section("Tags"))
         tags.children = TagColor.menuOrder.map { color in
             // A place whose URL is no real folder, so highlight(folder:) and Pin to Sidebar never match it.
@@ -179,6 +210,83 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         roots = [favorites, recents, indexedRoot, locations, tags]
         outline.reloadData()
         for r in roots { SidebarSources.applySectionState(outline, r) }
+        observeSaved()
+        reloadSaved()
+    }
+
+    /// Fetches the saved searches and lists them under Saved. Counts as loading, as the Indexed list does; a failed fetch
+    /// keeps what was listed.
+    func reloadSaved() {
+        onLoading?(true)
+        Task {
+            defer { onLoading?(false) }
+            guard let items = try? await SavedSearchStore.load() else { return }
+            showSaved(items)
+        }
+    }
+
+    /// The Saved section lists these searches, and is shown only while there are some. The rest of the sidebar keeps its
+    /// selection: a list that changes in place is reloaded as one item.
+    func showSaved(_ items: [SavedSearch]) {
+        guard let savedRoot else { return }
+        // the selected rows are remembered and selected again, so a change to the list keeps the folder highlight
+        let picked = outline.selectedRowIndexes.compactMap { outline.item(atRow: $0) as? SidebarNode }
+        savedRoot.children = items.map { SidebarNode(saved: $0) }
+        let shown = roots.contains { $0 === savedRoot }
+        if !items.isEmpty && !shown {
+            guard let at = roots.firstIndex(where: { $0 === indexedRoot }) else { return }
+            roots.insert(savedRoot, at: at + 1)
+            reloadKeeping(picked)
+        } else if items.isEmpty && shown {
+            roots.removeAll { $0 === savedRoot }
+            reloadKeeping(picked)
+        } else if shown {
+            outline.reloadItem(savedRoot, reloadChildren: true)
+            SidebarSources.applySectionState(outline, savedRoot)
+            outline.sizeLastColumnToFit()
+            reselect(picked)
+        }
+    }
+
+    /// Reloads the outline, restores the sections' open state and the selection (quietly: nothing is re-run), and refits
+    /// the one column (a reload alone leaves a row cut one width short).
+    private func reloadKeeping(_ picked: [SidebarNode]) {
+        outline.reloadData()
+        for r in roots { SidebarSources.applySectionState(outline, r) }
+        reselect(picked)
+        outline.sizeLastColumnToFit()
+    }
+
+    private func reselect(_ picked: [SidebarNode]) {
+        let rows = IndexSet(picked.compactMap { node -> Int? in
+            let row = outline.row(forItem: node)
+            return row >= 0 ? row : nil
+        })
+        suppressCallback = true
+        if rows.isEmpty { outline.deselectAll(nil) } else { outline.selectRowIndexes(rows, byExtendingSelection: false) }
+        suppressCallback = false
+        outline.sizeLastColumnToFit()
+    }
+
+    /// Snapshot and test hook: how many saved searches the Saved section lists.
+    var savedCount: Int { savedRoot?.children.count ?? 0 }
+
+    /// Snapshot hook: a click on the saved search at `index`, as the user makes it (the selection callback runs, so the
+    /// search runs in the window with its folders).
+    func selectSavedForSnapshot(_ index: Int) {
+        guard let savedRoot, savedRoot.children.indices.contains(index) else { return }
+        let node = savedRoot.children[index]
+        outline.expandItem(savedRoot)
+        let row = outline.row(forItem: node)
+        guard row >= 0 else { return }
+        outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+    }
+
+    /// The saved searches change (saved, renamed, edited, deleted): the section lists them again.
+    private func observeSaved() {
+        observers.append(NotificationCenter.default.addObserver(forName: SavedSearchStore.didChange, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reloadSaved() }
+        })
     }
 
     /// Fetches the collections and groups from the service and shows them under Indexed.
@@ -195,6 +303,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
                 indexedRoot.children = [SidebarNode(.note("Search service not running"))]
                 outline.reloadItem(indexedRoot, reloadChildren: true)
                 SidebarSources.applySectionState(outline, indexedRoot)
+                outline.sizeLastColumnToFit()     // as showIndexed: the reload must not leave the column stale
             }
         }
     }
@@ -212,6 +321,10 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         indexedRoot.children = nodes.isEmpty ? [SidebarNode(.note("No collections yet"))] : nodes
         outline.reloadItem(indexedRoot, reloadChildren: true)
         SidebarSources.applySectionState(outline, indexedRoot)
+        // Refit after the reload: the new rows can widen the outline past the sidebar, and only a refit brings the column back
+        // to the clip view (reloadKeeping does the same). Without it the selection runs past the sidebar edge, depending on
+        // whether Saved or Indexed loaded last.
+        outline.sizeLastColumnToFit()
     }
 
     /// Selects the favorite or location that is this folder, without reporting it back as a user choice.
@@ -263,17 +376,31 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let node = item as? SidebarNode else { return nil }
         if node.isSection {
-            let label = NSTextField(labelWithString: node.title.uppercased())
-            label.font = .systemFont(ofSize: 11, weight: .semibold)
-            label.textColor = .secondaryLabelColor
-            guard node === indexedRoot else { return label }
-            // Indexed: the "+" in the header starts a new group.
+            // The header is the section's own title ("Favorites", "Recents", "Indexed", "Saved", "Locations", "Tags"), as written.
+            // The Indexed section is shown as "Deep indexed"; its key stays "Indexed" (isOpen, applySectionState).
+            let label = NSTextField(labelWithString: node === indexedRoot ? "Deep indexed" : node.title)
+            label.font = MSEStyle.sectionHeaderFont
+            label.textColor = MSEStyle.secondary
+            // The label sits in a view of its own, not as the row itself: AppKit restyles a bare label that is the whole row
+            // of a source-list group (it draws it in a pale system grey, 1.96:1 on the sidebar in light, whatever its
+            // textColor is) and leaves a label inside another view as it was set.
             let header = NSView()
-            let plus = NSButton(image: NSImage(systemSymbolName: "plus", accessibilityDescription: "New Group") ?? NSImage(),
-                                target: self, action: #selector(newGroupTapped))
+            guard node === indexedRoot else {
+                label.translatesAutoresizingMaskIntoConstraints = false
+                header.addSubview(label)
+                NSLayoutConstraint.activate([
+                    label.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 2),
+                    label.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+                ])
+                return header
+            }
+            // Indexed: the "+" in the header offers New Group… and Deep-index a Folder… (indexedPlusTapped).
+            let plusImage = NSImage(systemSymbolName: "plus", accessibilityDescription: "New Group")?
+                .withSymbolConfiguration(MSEStyle.symbolConfig)
+            let plus = NSButton(image: plusImage ?? NSImage(), target: self, action: #selector(indexedPlusTapped(_:)))
             plus.isBordered = false
-            plus.toolTip = "New Group…"
-            plus.contentTintColor = .secondaryLabelColor
+            plus.toolTip = "New Group or Deep-index a Folder"
+            plus.contentTintColor = MSEStyle.secondary
             label.translatesAutoresizingMaskIntoConstraints = false
             plus.translatesAutoresizingMaskIntoConstraints = false
             header.addSubview(label)
@@ -289,14 +416,19 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         }
         let cell = SidebarCell()
         let image = NSImageView()
-        image.image = NSImage(systemSymbolName: node.symbol, accessibilityDescription: node.title)
+        image.image = NSImage(systemSymbolName: node.symbol, accessibilityDescription: node.title)?
+            .withSymbolConfiguration(MSEStyle.symbolConfig)
         if let color = node.tagColor { image.image = TagStore.swatch(color, diameter: 12) }      // a coloured dot, not tinted
         image.translatesAutoresizingMaskIntoConstraints = false
         let text = NSTextField(labelWithString: node.title)
         text.lineBreakMode = .byTruncatingTail
         text.translatesAutoresizingMaskIntoConstraints = false
-        text.textColor = SidebarColors.label
-        if case .note = node.kind { text.textColor = .secondaryLabelColor; text.font = .systemFont(ofSize: 12) }
+        if #available(macOS 26, *) {
+            // the system label colour and vibrancy
+        } else {
+            text.textColor = SidebarColors.label
+        }
+        if case .note = node.kind { text.textColor = MSEStyle.secondary; text.font = .systemFont(ofSize: 12) }
         cell.addSubview(image)
         cell.addSubview(text)
         cell.imageView = image
@@ -362,6 +494,10 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             TagResultsController.shared.show(color, in: view.window)
             return
         }
+        if let s = selected.first(where: { $0.savedSearch != nil })?.savedSearch {   // a saved search runs in this window (SearchView)
+            NotificationCenter.default.post(name: SavedSearchStore.picked, object: view.window, userInfo: ["saved": s])
+            return
+        }
         if selected.isEmpty { onIndexedSelection?([]); return }        // nothing picked: every indexed folder
         let indexed = selected.filter { $0.isIndexedRow }
         if !indexed.isEmpty {
@@ -404,6 +540,9 @@ extension SidebarViewController: NSMenuDelegate {
         observers.append(center.addObserver(forName: GroupNotes.changed, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.reloadIndexed() }
         })
+        observers.append(center.addObserver(forName: .deepIndexChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reloadIndexed() }
+        })
         observers.append(center.addObserver(forName: GroupNotes.new, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.newGroupTapped() }
         })
@@ -413,17 +552,56 @@ extension SidebarViewController: NSMenuDelegate {
         GroupEditorSheet.present(on: view.window ?? NSApp.mainWindow)
     }
 
+    /// The "+" in the Indexed header: New Group… (as before) and Deep-index a Folder….
+    @objc func indexedPlusTapped(_ sender: NSButton) {
+        let menu = NSMenu()
+        menu.addItem(menuItem("New Group…") { [weak self] in self?.newGroupTapped() })
+        menu.addItem(menuItem("Deep-index a Folder…") { [weak self] in self?.chooseDeepFolder() })
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height + 2), in: sender)
+    }
+
+    /// Deep-index a folder chosen in an Open panel: the same POST /api/collections the Folders pane's add flow sends.
+    func chooseDeepFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Deep-index"
+        panel.message = "Choose a folder to deep-index: full search of all its text, scans, audio and English↔German matching."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        deepIndex(url.path)
+    }
+
+    /// Deep-indexes a folder from the app (the "+" menu, a folder's context menu) and reloads the Indexed list.
+    func deepIndex(_ path: String) {
+        Task { @MainActor [weak self] in
+            do {
+                try await MSEClient.shared.deepIndex(path: path)
+                NotificationCenter.default.post(name: .deepIndexChanged, object: nil)
+                self?.reloadIndexed()
+            } catch {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "The folder was not added for deep indexing"
+                alert.informativeText = SW.clean(error)
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+        }
+    }
+
     /// The member count under a group's name ("3", or "3 · hidden" when it has no tab of its own).
     func addMemberCount(to cell: NSView, text: NSTextField, group g: IndexedGroup) {
         let n = g.members.count
         let hidden = details[g.name]?.hidden ?? false
         let count = NSTextField(labelWithString: hidden ? "\(n) · hidden" : "\(n)")
         count.font = .systemFont(ofSize: 11)
-        count.textColor = .secondaryLabelColor
+        count.textColor = MSEStyle.secondary
         count.alignment = .right
         count.translatesAutoresizingMaskIntoConstraints = false
         count.setContentHuggingPriority(.required, for: .horizontal)
         cell.addSubview(count)
+        (cell as? SidebarCell)?.secondaryViews.append(count)
         NSLayoutConstraint.activate([
             count.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -6),
             count.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
@@ -449,6 +627,13 @@ extension SidebarViewController: NSMenuDelegate {
         menu.removeAllItems()
         let row = outline.clickedRow
         guard row >= 0, let node = outline.item(atRow: row) as? SidebarNode else { return }
+        if let s = node.savedSearch {
+            menu.addItem(menuItem("Rename…") { [weak self] in self?.renameSaved(s) })
+            menu.addItem(menuItem("Edit Query…") { [weak self] in self?.editSavedQuery(s) })
+            menu.addItem(.separator())
+            menu.addItem(menuItem("Delete Saved Search…") { [weak self] in self?.deleteSaved(s) })
+            return
+        }
         switch node.kind {
         case .group(let g):
             guard let d = details[g.name] else { return }
@@ -483,7 +668,54 @@ extension SidebarViewController: NSMenuDelegate {
                 menu.addItem(menuItem("Remove from “\(d.label)”…") { [weak self] in self?.removeFromGroup(c.name, d) })
             }
         default:
+            if node === indexedRoot {
+                menu.addItem(menuItem("Deep-index a Folder…") { [weak self] in self?.chooseDeepFolder() })
+                return
+            }
+            if let folder = placeFolder(node), !indexedFolderPaths().contains(folder.path) {
+                menu.addItem(menuItem("Deep-index this Folder") { [weak self] in self?.deepIndex(folder.path) })
+                menu.addItem(.separator())
+            }
             addPlaceItems(node, to: menu)                    // Pin to Sidebar / Remove from Sidebar (SidebarSources.swift)
+        }
+    }
+
+    /// The folder a sidebar place row stands for, when it is a real folder (not a saved search, not a volume's note).
+    private func placeFolder(_ node: SidebarNode) -> URL? {
+        guard node.savedSearch == nil, case .place(_, let url, _) = node.kind, SidebarSources.isDirectory(url) else { return nil }
+        return url
+    }
+
+    /// The paths of the deep-indexed folders the Indexed list shows.
+    private func indexedFolderPaths() -> Set<String> {
+        Set((indexedRoot?.children ?? []).compactMap { node -> String? in
+            if case .collection(let c) = node.kind { return c.path }
+            return nil
+        })
+    }
+
+    // Saved searches: each change goes to the service, and the list is read again on its notification (SavedSearches.swift).
+    private func renameSaved(_ s: SavedSearch) {
+        guard let win = view.window else { return }
+        SavedSearchStore.askName(title: "Rename Saved Search", value: s.name, button: "Rename", in: win) { [weak self] name in
+            guard let name else { return }
+            self?.attempt { try await SavedSearchStore.rename(s, to: name) }
+        }
+    }
+
+    private func editSavedQuery(_ s: SavedSearch) {
+        guard let win = view.window else { return }
+        SavedSearchStore.askName(title: "Edit Query", value: s.query, button: "Save", in: win) { [weak self] query in
+            guard let query else { return }
+            self?.attempt { try await SavedSearchStore.editQuery(s, to: query) }
+        }
+    }
+
+    private func deleteSaved(_ s: SavedSearch) {
+        guard let win = view.window else { return }
+        SavedSearchStore.confirmDelete(s, in: win) { [weak self] yes in
+            guard yes else { return }
+            self?.attempt { try await SavedSearchStore.remove(s) }
         }
     }
 

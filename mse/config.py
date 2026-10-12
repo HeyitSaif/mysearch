@@ -34,6 +34,26 @@ DEFAULTS = {
         "learn_nightly": True,       # after the night sync: measure search quality, re-tune, apply if safe (learn.py)
     },
     "worker": {"idle_unload_min": 10, "batch_text": 16, "batch_media": 4},
+    # Smart indexing (indexer._Scope). A collection may override index_code, respect_gitignore and skip_nested_repos
+    # (null inherits). skip_nested_repos: leave out nested repositories (clones, linked git worktrees) of a collection.
+    # priority: when the heavy pass (OCR, page renders, pictures, audio/video) and the embed loop may run outside a
+    # manual "Sync now" or the night run (jobs.heavy_work_allowed): low = AC power and 60 s without input; balanced =
+    # 5 s without input and (AC power or 60 s idle); always = never paused. Sync now and the night run always pass
+    # "always", so they are never paused.
+    "indexing": {"respect_gitignore": True, "index_code": False, "extra_excludes": [], "skip_nested_repos": True,
+                 "priority": "balanced"},
+    # The media rules a collection inherits when its own media.<key> is null (indexer._media). Measured on an M4 Pro:
+    # pdf_page_images   scanned_only (page images only for scanned pages; a text PDF keeps its text layer and thumbnail,
+    #                   saving the 0.27 s page-1 image embed of every text PDF) | all (the old behaviour: page 1 and the
+    #                   scanned pages, per media.pdf_pages) | none
+    # scan_page_images  true (the old behaviour: a scanned page gets OCR and a page-image embed, 0.65 s per page) |
+    #                   false (OCR text only, 0.35 s per page)
+    # image_ocr         auto (a cheap text-likelihood probe first; full OCR only when the picture holds text) | always
+    #                   (the old behaviour: OCR every picture, 0.58 s each) | never
+    # video_mode        segments (the old behaviour: one 30 s clip embed per segment, 8.6 s per minute of video) |
+    #                   poster (one poster frame at 10 % of the duration plus the transcript; quality untested)
+    "media": {"pdf_page_images": "scanned_only", "scan_page_images": True, "image_ocr": "auto",
+              "video_mode": "segments"},
     # 1-bit index + 16x exact re-scoring: 99% identical top-10 to exact search on real data, ~10x faster.
     "search": {"limit": 20, "vector_mode": "binary", "oversample": 16,
                # Cross-encoder re-ranking for `precise` requests (rank fusion, close calls only, see rerank.py):
@@ -57,6 +77,12 @@ DEFAULTS = {
     # Access is granted (auto) -- always | never | auto.
     "mac_index": {"enabled": True, "roots": [str(Path.home())], "exclude": ["~/Library/"],
                   "skip_protected": "auto", "rescan_every_h": 24},
+    # Whole-disk content index (mse/wholedisk.py): what files contain, across the roots, described in the background.
+    # priority: "low" describes only on AC power after 60 s without input; "balanced" also on battery after 60 s
+    # without input, and on AC power at any idle time above 5 s. images / documents: describe pictures / documents and
+    # videos. ocr_images: read the text of pictures that look like text. max_text_kb: text kept per file.
+    "wholedisk": {"enabled": True, "roots": [str(Path.home())], "extra_excludes": [], "priority": "low",
+                  "images": True, "documents": True, "ocr_images": True, "max_text_kb": 8},
     # Ask mode (mse/ask.py): a short cited answer from the top results, by a cloud model while online (see
     # ASK_CLOUD_DEFAULTS below) or the small local model. Off: no model is called or loaded; switching off unloads the
     # local one at once. Its other knobs (route, provider, model, local_model, max_tokens, ...) default in
@@ -66,6 +92,16 @@ DEFAULTS = {
     # Named sets of collections searched together, e.g. {"name": "work", "label": "Work",
     # "collections": ["notes", "projects"]}. A group searches exactly its members (in_global is ignored).
     "groups": [],
+    # Saved searches (search box queries kept by name): [{"id", "name", "query", "collection"}]. The query is exactly what
+    # the search box takes, filters included; "collection" is a scope (a folder, group, alias, comma list, "all" or empty).
+    # Removing one removes only this definition, never a file.
+    "saved_searches": [],
+    # Document understanding (mse/docmeta.py): type, date, amount, counterparty of every document, derived on this Mac.
+    # own_names: your own company names, so a letterhead that is you is not taken as the counterparty.
+    # extra_org_suffixes: legal forms of your country that the built-in international list lacks (["XY Ltda"]).
+    # extra_keywords: more words per document type ({"tax_document": ["name of your tax office"]}), counted like the
+    # built-in ones. After a change, `mse docs reindex <folder>` applies them to what is already indexed.
+    "docmeta": {"enabled": True, "own_names": [], "extra_org_suffixes": [], "extra_keywords": {}},
 }
 
 # ---- Ask with cloud models (mse/providers.py, mse/cloud.py). These are defaults only: they are never written into
@@ -187,8 +223,16 @@ COLLECTION_DEFAULTS = {
         "video": True,
         "transcribe": True,       # speech → text with timestamps (Whisper), for audio and video
         "max_media_minutes": 90,
+        # null inherits the global media.<key> (DEFAULTS["media"] above); a value overrides it for this folder
+        "pdf_page_images": None,  # scanned_only | all | none
+        "scan_page_images": None, # true | false
+        "image_ocr": None,        # auto | always | never
+        "video_mode": None,       # segments | poster
     },
     "max_file_mb": 200,
+    "index_code": None,           # null inherits indexing.index_code; true or false overrides it for this folder
+    "respect_gitignore": None,    # null inherits indexing.respect_gitignore
+    "skip_nested_repos": None,    # null inherits indexing.skip_nested_repos
 }
 
 # Per-folder starting rules, keyed by the folder's name, read from <data>/presets.json when a folder is added.
@@ -361,7 +405,7 @@ def add_collection(path: str, name: str | None = None, **settings) -> dict:
 
 def update_collection(name: str, changes: dict) -> dict:
     allowed = {"description", "in_global", "enabled", "exclude", "metadata_only", "contexts", "media", "max_file_mb",
-               "aliases", "ask_cloud"}
+               "aliases", "ask_cloud", "index_code", "respect_gitignore", "skip_nested_repos"}
     with _lock:
         cfg = load()
         coll = get_collection(cfg, name)
@@ -372,6 +416,9 @@ def update_collection(name: str, changes: dict) -> dict:
                 raise ValueError(f"cannot change '{k}'")
             if k == "ask_cloud" and not isinstance(v, bool):
                 raise ValueError("ask_cloud must be true or false")
+            if k in ("index_code", "respect_gitignore", "skip_nested_repos") and v is not None \
+                    and not isinstance(v, bool):
+                raise ValueError(f"{k} must be true, false or null (inherit the global setting)")
             if k == "aliases":                 # short names for the scope shortcut ("w: invoice"); [] removes them
                 aliases = check_aliases(cfg, v, "folder", name)
                 if aliases:
@@ -379,6 +426,10 @@ def update_collection(name: str, changes: dict) -> dict:
                 else:
                     coll.pop("aliases", None)
                 continue
+            if k == "media":
+                if not isinstance(v, dict):
+                    raise ValueError("media must be an object")
+                v = {**v, **check_media(v, per_collection=True)}
             coll[k] = _merge(coll[k], v) if isinstance(v, dict) and k == "media" else v
         save(cfg)
         return coll
@@ -398,7 +449,8 @@ def remove_collection(name: str) -> dict:
 
 
 def update_settings(changes: dict) -> dict:
-    allowed = {"schedule", "worker", "search", "translation", "agents", "ask", "finetune", "mac_index"}
+    allowed = {"schedule", "worker", "search", "translation", "agents", "ask", "finetune", "mac_index", "docmeta",
+               "indexing", "wholedisk", "media"}
     with _lock:
         cfg = load()
         old_local = (cfg.get("ask") or {}).get("local_model")
@@ -410,12 +462,196 @@ def update_settings(changes: dict) -> dict:
             if k == "mac_index":
                 from . import macindex
                 v = macindex.check_settings(v)
+            if k == "wholedisk":
+                from . import wholedisk
+                v = wholedisk.check_settings(v)
+            if k == "docmeta":
+                v = check_docmeta(v)
+            if k == "indexing":
+                v = check_indexing(v)
+            if k == "media":
+                v = check_media(v, per_collection=False)
             cfg[k] = _merge(cfg[k], v)
         save(cfg)
     if "ask" in changes and (not cfg["ask"].get("enabled", False)
                              or ("local_model" in changes["ask"] and cfg["ask"].get("local_model") != old_local)):
         _unload_ask()            # switched off, or another local model chosen: the next local answer loads the new one            # outside the lock: it may wait a few seconds for an answer in progress
     return cfg
+
+
+# indexing settings: the keys the indexer reads. The numeric ones keep the limits the indexer already applies.
+INDEXING_BOOLS = ("respect_gitignore", "index_code", "skip_nested_repos")
+INDEXING_NUMBERS = {                 # key: (lowest, highest, whole number?)
+    "workers": (1, 16, True), "file_timeout_s": (10, 7200, False), "reader_timeout_s": (5, 7200, False),
+    "xver_per_scan": (0, 100000, True), "xver_per_night": (0, 10000000, True),
+    "missing_grace_h": (0, 8760, False), "mass_missing_ratio": (0, 10, False), "mass_missing_min": (0, 10000000, True),
+}
+
+
+def check_indexing(v: dict) -> dict:
+    """indexing settings, only the keys given. respect_gitignore and index_code: booleans. extra_excludes: patterns or
+    folder names (no "!" negation, which the matcher does not have). prune_dirs: folder names, or null for the built-in
+    list (a folder the walk always skips, such as node_modules, cannot be brought back by this list)."""
+    from .ignore import PRUNE_NAME_OK, compile_pattern
+    if not isinstance(v, dict):
+        raise ValueError("indexing must be an object")
+    out = {}
+    for k, val in v.items():
+        if k in INDEXING_BOOLS:
+            if not isinstance(val, bool):
+                raise ValueError(f"indexing.{k} must be true or false")
+            out[k] = val
+        elif k == "extra_excludes":
+            if not isinstance(val, list) or len(val) > 200:
+                raise ValueError("indexing.extra_excludes must be a list of up to 200 patterns")
+            for pat in val:
+                if not isinstance(pat, str) or not pat.strip() or len(pat) > 300 or "\x00" in pat:
+                    raise ValueError("indexing.extra_excludes: each pattern is text of 1 to 300 characters")
+                if pat.strip().startswith("!"):
+                    raise ValueError(f"indexing.extra_excludes: negation ('!') is not supported: {pat!r}")
+                try:
+                    compile_pattern(pat)
+                except re.error as e:
+                    raise ValueError(f"indexing.extra_excludes: {pat!r} is not a valid pattern ({e})") from None
+            out[k] = list(val)
+        elif k == "prune_dirs":
+            if val is None:
+                out[k] = None
+            else:
+                if not isinstance(val, list) or len(val) > 200:
+                    raise ValueError("indexing.prune_dirs must be a list of folder names, or null")
+                for n in val:
+                    if not isinstance(n, str) or n in (".", "..") or not re.match(PRUNE_NAME_OK, n):
+                        raise ValueError(f"indexing.prune_dirs: {n!r} is not a plain folder name")
+                out[k] = sorted(set(val))
+        elif k in INDEXING_NUMBERS:
+            lo, hi, whole = INDEXING_NUMBERS[k]
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not lo <= val <= hi:
+                raise ValueError(f"indexing.{k} must be a number from {lo} to {hi}")
+            out[k] = int(val) if whole else float(val)
+        elif k == "priority":
+            if val not in PRIORITIES:
+                raise ValueError(f"indexing.priority must be one of: {', '.join(PRIORITIES)}")
+            out[k] = val
+        else:
+            raise ValueError(f"cannot change 'indexing.{k}'")
+    return out
+
+
+# ---- media rules (DEFAULTS["media"], COLLECTION_DEFAULTS["media"]; applied by indexer._media / extract)
+PRIORITIES = ("low", "balanced", "always")
+MEDIA_CHOICES = {                    # key: the values it takes (True/False for a switch)
+    "pdf_page_images": ("scanned_only", "all", "none"),
+    "scan_page_images": (True, False),
+    "image_ocr": ("auto", "always", "never"),
+    "video_mode": ("segments", "poster"),
+}
+
+
+def check_media(v: dict, per_collection: bool) -> dict:
+    """The media rules that have a global default (MEDIA_CHOICES), only the keys given. Per collection, null means
+    'inherit the global value'. Other media keys (images, pdf_pages, audio ...) are a collection's own and pass through
+    update_collection unchanged, as before. Returns the checked keys only."""
+    if not isinstance(v, dict):
+        raise ValueError("media must be an object")
+    out = {}
+    for k, val in v.items():
+        if k not in MEDIA_CHOICES:
+            if per_collection:
+                continue                                  # a collection's own media key: not this function's business
+            raise ValueError(f"cannot change 'media.{k}' (global media keys: {', '.join(MEDIA_CHOICES)})")
+        choices = MEDIA_CHOICES[k]
+        if val is None and per_collection:
+            out[k] = None
+        elif choices == (True, False):
+            if not isinstance(val, bool):
+                raise ValueError(f"media.{k} must be true or false" + (" or null (inherit)" if per_collection else ""))
+            out[k] = val
+        elif isinstance(val, bool) or val not in choices:
+            raise ValueError(f"media.{k} must be one of: {', '.join(choices)}"
+                             + (", or null (inherit the global setting)" if per_collection else ""))
+        else:
+            out[k] = val
+    return out
+
+
+def effective_media(coll: dict, cfg: dict | None = None) -> dict:
+    """The media rules that apply to one collection: its own media dict, with every MEDIA_CHOICES key that is null (or
+    missing) filled from the global media settings, and those from DEFAULTS. What extract.light() and extract.heavy()
+    read."""
+    media = dict(coll.get("media") or {})
+    glob = (cfg or {}).get("media") if cfg is not None else None
+    if glob is None:
+        try:
+            glob = load().get("media") or {}
+        except Exception:
+            glob = {}
+    for k, choices in MEDIA_CHOICES.items():
+        if media.get(k) is None:
+            g = glob.get(k)
+            media[k] = g if g is not None and (g in choices) else DEFAULTS["media"][k]
+    return media
+
+
+def check_docmeta(v: dict) -> dict:
+    """docmeta settings: {enabled: bool, own_names: [str]} (only the keys given)."""
+    out = {}
+    if "enabled" in v:
+        if not isinstance(v["enabled"], bool):
+            raise ValueError("docmeta.enabled must be true or false")
+        out["enabled"] = v["enabled"]
+    if "own_names" in v:
+        names = v["own_names"]
+        if isinstance(names, str):
+            names = [n for n in names.split(",")]
+        if not isinstance(names, list) or any(not isinstance(n, str) for n in names):
+            raise ValueError("docmeta.own_names must be a list of company names")
+        clean = []
+        for n in names:
+            n = n.strip()
+            if n and len(n) <= 120 and n.lower() not in [c.lower() for c in clean]:
+                clean.append(n)
+        if len(clean) > 50:
+            raise ValueError("docmeta.own_names: at most 50 names")
+        out["own_names"] = clean
+    if "extra_org_suffixes" in v:
+        suff = v["extra_org_suffixes"]
+        if isinstance(suff, str):
+            suff = suff.split(",")
+        if not isinstance(suff, list) or any(not isinstance(x, str) for x in suff):
+            raise ValueError("docmeta.extra_org_suffixes must be a list of legal forms")
+        clean = []
+        for x in suff:
+            x = x.strip()
+            if x and len(x) <= 30 and x not in clean:
+                clean.append(x)
+        if len(clean) > 100:
+            raise ValueError("docmeta.extra_org_suffixes: at most 100 forms")
+        out["extra_org_suffixes"] = clean
+    if "extra_keywords" in v:
+        kws = v["extra_keywords"]
+        if not isinstance(kws, dict):
+            raise ValueError("docmeta.extra_keywords must be {document type: [words]}")
+        from . import docmeta
+        clean_kw = {}
+        for t, words in kws.items():
+            if t not in docmeta.DOCTYPES or t == "other":
+                raise ValueError(f"docmeta.extra_keywords: '{t}' is not a document type "
+                                 f"({', '.join(x for x in docmeta.DOCTYPES if x != 'other')})")
+            if not isinstance(words, list) or any(not isinstance(x, str) for x in words):
+                raise ValueError(f"docmeta.extra_keywords.{t} must be a list of words or phrases")
+            ws = []
+            for x in words:
+                x = x.strip()
+                if x and len(x) <= 80 and x.lower() not in [w.lower() for w in ws]:
+                    ws.append(x)
+            if len(ws) > 100:
+                raise ValueError(f"docmeta.extra_keywords.{t}: at most 100 entries")
+            clean_kw[t] = ws
+        out["extra_keywords"] = clean_kw
+    from . import docmeta
+    docmeta.reset_settings_cache()
+    return out
 
 
 def check_key_file(v) -> str | None:
@@ -571,7 +807,9 @@ def _unload_ask() -> None:
 
 # The inline filter keys of the search box (search.parse: "type:pdf", "in:work" ...) and "all" are never the
 # name or alias of a folder or group, so a scope shortcut can never be mistaken for a filter or vice versa.
-FILTER_KEYS = frozenset({"type", "kind", "ext", "in", "after", "before", "path", "has", "include", "exclude"})
+FILTER_KEYS = frozenset({"type", "kind", "ext", "in", "after", "before", "path", "has", "include", "exclude",
+                         # what a document is (mse/docmeta.py): doctype: is type: for document types only
+                         "doctype", "amount", "currency", "party", "docdate"})
 RESERVED_SCOPE_NAMES = frozenset({"all"} | FILTER_KEYS)
 _SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
@@ -823,6 +1061,108 @@ def resolve_scope(cfg: dict, spec, strict: bool = True) -> dict:
 
 def known_scope_names(cfg: dict) -> list[str]:
     return ["all"] + [c["name"] for c in cfg["collections"]] + [g["name"] for g in cfg.get("groups") or []]
+
+
+# ------------------------------------------------------------------ saved searches
+#
+# A saved search is a query kept under a name: {"id", "name", "query", "collection", "created_at", "updated_at"}. The id is
+# generated and never changes. Only the definition is stored; deleting one touches no file and no index.
+
+SAVED_MAX = 200
+
+
+def _norm_saved(x) -> dict | None:
+    if not isinstance(x, dict) or not x.get("id") or not isinstance(x.get("name"), str):
+        return None
+    return {"id": str(x["id"]), "name": x["name"], "query": str(x.get("query") or ""),
+            "collection": x.get("collection") or None,
+            "created_at": x.get("created_at"), "updated_at": x.get("updated_at")}
+
+
+def saved_searches(cfg: dict | None = None) -> list[dict]:
+    cfg = cfg or load()
+    return [n for n in (_norm_saved(x) for x in cfg.get("saved_searches") or []) if n]
+
+
+def get_saved(saved_id: str, cfg: dict | None = None) -> dict | None:
+    return next((s for s in saved_searches(cfg) if s["id"] == saved_id), None)
+
+
+def _check_saved(cfg: dict, name, query, collection) -> tuple[str, str, str | None]:
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("a saved search needs a name")
+    name = re.sub(r"\s+", " ", name).strip()
+    if len(name) > 120:
+        raise ValueError("the name is longer than 120 characters")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("a saved search needs a query")
+    query = query.strip()
+    if len(query) > 2000:
+        raise ValueError("the query is longer than 2000 characters")
+    from . import search
+    search.validate_query(query)                         # a malformed filter is refused here, not at the first run
+    coll = None
+    if collection not in (None, ""):
+        tokens = scope_tokens(collection)
+        if not tokens:
+            raise ValueError("collection: name a folder, group or alias, or leave it empty")
+        resolve_scope(cfg, tokens)                        # unknown names -> ValueError
+        coll = ",".join(tokens)
+    return name, query, coll
+
+
+def add_saved(name, query, collection=None) -> dict:
+    with _lock:
+        cfg = load()
+        name, query, coll = _check_saved(cfg, name, query, collection)
+        items = saved_searches(cfg)
+        if len(items) >= SAVED_MAX:
+            raise ValueError(f"at most {SAVED_MAX} saved searches")
+        if any(s["name"].lower() == name.lower() for s in items):
+            raise ValueError(f"a saved search named '{name}' exists")
+        ids = {s["id"] for s in items}
+        sid = secrets.token_hex(4)
+        while sid in ids:
+            sid = secrets.token_hex(4)
+        now = time.time()
+        item = {"id": sid, "name": name, "query": query, "collection": coll, "created_at": now, "updated_at": now}
+        cfg["saved_searches"] = items + [item]
+        save(cfg)
+        return item
+
+
+def update_saved(saved_id: str, changes: dict) -> dict:
+    """Change name, query and/or collection of a saved search. KeyError when there is none with that id."""
+    unknown = set(changes) - {"name", "query", "collection"}
+    if unknown:
+        raise ValueError(f"cannot change {', '.join(sorted(unknown))}")
+    with _lock:
+        cfg = load()
+        items = saved_searches(cfg)
+        cur = next((s for s in items if s["id"] == saved_id), None)
+        if cur is None:
+            raise KeyError(f"no saved search with id '{saved_id}'")
+        name, query, coll = _check_saved(cfg, changes.get("name", cur["name"]), changes.get("query", cur["query"]),
+                                         changes.get("collection", cur["collection"]))
+        if any(s["name"].lower() == name.lower() and s["id"] != saved_id for s in items):
+            raise ValueError(f"a saved search named '{name}' exists")
+        cur.update(name=name, query=query, collection=coll, updated_at=time.time())
+        cfg["saved_searches"] = items
+        save(cfg)
+        return cur
+
+
+def remove_saved(saved_id: str) -> dict:
+    """Remove the definition only. KeyError when there is none with that id."""
+    with _lock:
+        cfg = load()
+        items = saved_searches(cfg)
+        cur = next((s for s in items if s["id"] == saved_id), None)
+        if cur is None:
+            raise KeyError(f"no saved search with id '{saved_id}'")
+        cfg["saved_searches"] = [s for s in items if s["id"] != saved_id]
+        save(cfg)
+        return cur
 
 
 # ------------------------------------------------------------------ the scope shortcut in a query

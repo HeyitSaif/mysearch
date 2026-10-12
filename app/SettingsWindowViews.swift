@@ -309,15 +309,17 @@ struct SWSidebar: View {
                 .padding(.horizontal, 8).padding(.bottom, 8)
             }
 
-            Divider()
-            VStack(alignment: .leading, spacing: 4) {
-                Button { m.openClassic?(nil) } label: {
-                    Label("Classic Settings…", systemImage: "rectangle.on.rectangle")
+            if m.classicOn {                  // off: no Classic Settings entry here (ClassicUI.swift)
+                Divider()
+                VStack(alignment: .leading, spacing: 4) {
+                    Button { m.openClassic?(nil) } label: {
+                        Label("Classic Settings…", systemImage: "rectangle.on.rectangle")
+                    }
+                    .buttonStyle(.link).font(.callout)
+                    Text("The old web settings, until this window is complete.").font(.caption2).foregroundStyle(.secondary)
                 }
-                .buttonStyle(.link).font(.callout)
-                Text("The old web settings, until this window is complete.").font(.caption2).foregroundStyle(.secondary)
+                .padding(12).frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(12).frame(maxWidth: .infinity, alignment: .leading)
         }
         .background(.regularMaterial)
     }
@@ -358,7 +360,7 @@ struct SWSidebarRow: View {
 struct SWSearchResults: View {
     @EnvironmentObject var m: SWModel
     var body: some View {
-        let hits = SWIndex.matches(m.query)
+        let hits = SWIndex.matches(m.query).filter { m.sectionsShown.contains($0.section) }
         if hits.isEmpty {
             Text("Nothing in Settings matches “\(m.query)”.").font(.callout).foregroundStyle(.secondary).padding(10)
         } else {
@@ -405,13 +407,16 @@ struct SWDetail: View {
         case .folders: SWFoldersView()
         case .groups: SWGroupsView()
         case .search: SWSearchSettingsView()
+        case .indexing: SWIndexingView()          // SettingsIndexing.swift
         case .schedule: SWScheduleView()
         case .ask: SWAskView()
         case .wholeMac: SWWholeMacView()
+        case .wholeDisk: SWWholeDiskView()      // SettingsWholeDisk.swift
         case .favourites: SWFavouritesView()
         case .agents: SWAgentsView()
         case .privacy: SWPrivacyView()
         case .macApp: SWMacAppView()
+        case .advanced: SWAdvancedView()          // SettingsAdvanced.swift
         case .about: SWAboutView()
         }
     }

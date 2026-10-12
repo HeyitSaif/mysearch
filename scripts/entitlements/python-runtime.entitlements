@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Used by scripts/bundle_runtime.sh (sign, with the hardened flag) for the bundled Python interpreter,
+	     MySearch.app/Contents/Resources/runtime/bin/python3.X. An entitlement counts on the main executable of a process,
+	     so this is the only file that carries them: the extension modules and libraries loaded into it are signed without.
+	     The reasoning and what was and was not verified are in docs/INSTALL.md, section Notarizing. NOTE: the signing tools
+	     parse this file strictly, so a comment must never contain two hyphens in a row. -->
+
+	<!-- Library validation makes a hardened process refuse any library signed by another team. Every Mach-O file of the
+	     runtime is signed by scripts/bundle_runtime.sh with the same identity as the app, so a Developer ID build should
+	     pass without this key (not yet tried). It is here because an ad hoc signed runtime fails to import numpy without it
+	     (checked: different Team IDs), and as the safety net for a wheel library that could not be re-signed. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+
+	<!-- Not set, on purpose. Add one only if a notarized build fails at run time with a code signing or JIT error:
+	       com.apple.security.cs.allow-unsigned-executable-memory   writable and executable memory (some native wheels)
+	       com.apple.security.cs.allow-jit                          MAP_JIT memory (libffi closures, code generators)
+	     With the hardened runtime on and only the key above, the interpreter imported numpy, scipy, cv2, PIL, mlx,
+	     mlx_vlm, mlx_lm, transformers, cryptography and sqlite-vec, ran an MLX operation on the GPU and a ctypes callback. -->
+</dict>
+</plist>

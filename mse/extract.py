@@ -3,6 +3,9 @@
 light()            cheap, runs during the day: text formats, Office and OpenDocument, e-mail (single messages and
                    mbox), e-books, notebooks, archive member lists, iWork previews, the PDF text layer.
 heavy()            expensive, runs at night or on "Sync now": OCR, PDF page images, picture OCR, audio/video segments.
+                   What it does per file is decided in light() from the media rules (config.MEDIA_CHOICES: page images
+                   for scanned pages only, picture OCR only when the helper's probe finds text, video as segments or
+                   one poster frame) and stored in the file's heavy spec, so a file already indexed is never redone.
 transcript_items() speech to text for audio and video; long silences are cut out before Whisper runs.
 
 EXTRACTOR_VERSION names the extensions whose extraction changed or is newly supported. The indexer re-reads only
@@ -38,6 +41,22 @@ TEXT_EXT = {
     "bash", "sql", "swift", "go", "rs", "java", "kt", "c", "h", "cpp", "hpp", "cs", "rb", "php", "r", "tex", "bib",
     "vtt", "srt", "log", "ics", "vcf", "css", "scss", "mdx", "ipynb",
 }
+# Source code: a kind of its own. Indexed by name only, unless indexing.index_code is on (indexer). Markdown, text,
+# csv, json, yaml, html, xml and notebooks stay documents.
+CODE_EXT = {
+    "py", "pyi", "js", "mjs", "cjs", "jsx", "ts", "tsx", "swift", "go", "rs", "java", "kt", "kts", "scala", "c", "h",
+    "cc", "cxx", "cpp", "hpp", "cs", "rb", "php", "sh", "zsh", "bash", "sql", "css", "scss", "less", "m", "mm", "lua",
+    "pl", "dart", "vue", "svelte", "ex", "exs", "r", "map",
+}
+CODE_NAMES = {"package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "poetry.lock", "Cargo.lock",
+              "Podfile.lock", "Gemfile.lock", "composer.lock"}
+
+
+def is_code_name(name: str) -> bool:
+    """A lockfile or a minified bundle, by its name (the extension alone does not say)."""
+    return name in CODE_NAMES or name.lower().endswith((".min.js", ".min.css"))
+
+
 TEXTUTIL_EXT = {"doc", "docx", "docm", "dotx", "rtf", "rtfd", "odt", "wordml", "webarchive"}
 SHEET_EXT = {"xlsx", "xlsm"}
 SLIDE_EXT = {"pptx", "pptm"}
@@ -82,6 +101,8 @@ def kind_of(ext: str) -> str:
     ext = ext.lower()
     if ext == "pdf":
         return "pdf"
+    if ext in CODE_EXT:
+        return "code"
     if ext in TEXT_EXT or ext in EPUB_EXT:
         return "text"
     if ext in TEXTUTIL_EXT or ext in SHEET_EXT or ext in SLIDE_EXT or ext in OPENDOC_EXT or ext in IWORK_EXT:
@@ -739,12 +760,45 @@ def _pdf_light(p: Path, media: dict) -> tuple[str | None, int | None, list[dict]
         visual = sorted(set([1] + scanned))[:cap] if pages else []
     else:
         visual = []
+    visual = page_images(visual, scanned, media)
     heavy = {"thumb": True}
     if scanned:
         heavy["ocr"] = scanned[:max(cap, 100)]
     if visual:
         heavy["visual"] = visual
     return title, pages, sections, heavy
+
+
+def page_images(visual: list[int], scanned: list[int], media: dict) -> list[int]:
+    """Which of the pages the pdf_pages policy chose (`visual`) get a page image, and with it an image embedding, under
+    media.pdf_page_images and media.scan_page_images (config.MEDIA_CHOICES; a missing key means the default).
+
+    scanned_only (the default): only the pages the OCR test flagged, so a PDF with a text layer renders no page image at
+    all (measured: the page-1 image embed cost every text PDF 0.27 s and found nothing its text does not say). all: every
+    page the policy chose, the old behaviour. none: no page image. scan_page_images false drops the scanned pages from
+    either list: such a page is OCRed and nothing more (0.35 s instead of 0.65 s per page). The thumbnail is not a page
+    image and is rendered whatever these say."""
+    mode = media.get("pdf_page_images") or "scanned_only"
+    if mode == "none":
+        visual = []
+    elif mode == "scanned_only":
+        want = set(scanned)
+        visual = [p for p in visual if p in want]
+    if media.get("scan_page_images", True) is False:
+        drop = set(scanned)
+        visual = [p for p in visual if p not in drop]
+    return visual
+
+
+def image_ocr_mode(media: dict):
+    """The `ocr` entry of a picture's heavy spec: True (OCR every picture, media.image_ocr "always"), False ("never") or
+    "auto" (the default: the helper's cheap probe decides per picture, see _image_has_text)."""
+    mode = media.get("image_ocr") or "auto"
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    return "auto"
 
 
 # ------------------------------------------------------------------ light
@@ -794,11 +848,13 @@ def light(p: Path, kind: str, ext: str, media: dict) -> dict:
     elif kind == "pdf":
         title, pages, sections, heavy = _pdf_light(p, media)
     elif kind == "image" and media.get("images", True):
-        heavy = {"image": True, "ocr": True, "thumb": True}
+        heavy = {"image": True, "ocr": image_ocr_mode(media), "thumb": True}
     elif kind == "audio" and media.get("audio", True):
         heavy = {"audio": True}
     elif kind == "video" and media.get("video", True):
         heavy = {"video": True, "thumb": True}
+        if media.get("video_mode") == "poster":
+            heavy["poster"] = True          # one poster frame instead of a clip embed per 30 s segment (heavy())
     elif kind == "other":
         arch = _archive_kind(p, ext)
         if arch:
@@ -845,11 +901,41 @@ def _pdf_heavy(pdf: Path, spec: dict, work: Path, thumb_file: Path, media: dict)
     return items, thumb
 
 
-def _image_heavy(src: Path, work: Path, thumb_file: Path, ocr: bool, media: dict) -> tuple[list[dict], bool]:
+_probe_supported: bool | None = None     # whether the installed helper has the `probe` command (None: not asked yet)
+# The probe reads a copy whose long side is at most this. Measured on generated pictures: at 512 px a 26 px caption in a
+# 1600 x 1200 picture is missed (and the full OCR, at 3000 px, reads it); at 768 px it is seen, at the same 0.06 s.
+PROBE_MAX_PX = 768
+
+
+def _image_has_text(src: Path) -> bool:
+    """The cheap pre-check of media.image_ocr "auto": the helper's `probe` reads a copy at most PROBE_MAX_PX wide with
+    Vision's fast recogniser and reports text_likely (at least one line of two or more letters or digits read with a
+    confidence of 0.5 or more). Only a picture that likely holds text gets the full OCR (measured: 0.58 s per picture,
+    text or not, before this gate; the probe costs about 0.06 s). An older helper without `probe`, or a probe that
+    fails for this picture, means OCR as before, so the gate falls back to the old behaviour, never to less. Text the
+    probe cannot see at PROBE_MAX_PX is not OCRed: that is the trade."""
+    global _probe_supported
+    if _probe_supported is False:
+        return True
+    try:
+        res = helper("probe", str(src), "--max-px", str(PROBE_MAX_PX), timeout=60)
+    except RuntimeError as e:
+        if "unknown command" in str(e):
+            _probe_supported = False
+        return True
+    _probe_supported = True
+    return bool(res.get("text_likely"))
+
+
+def _image_heavy(src: Path, work: Path, thumb_file: Path, ocr, media: dict) -> tuple[list[dict], bool]:
+    """The picture's embedding copy and thumbnail, and its OCR text: `ocr` True = always, False = never, "auto" = only
+    when _image_has_text says the picture likely holds text (the spec's `ocr` entry, image_ocr_mode)."""
     out = work / "image.jpg"
     res = helper("image", str(src), "--out", str(out), "--max-px", "1024", "--thumb", str(thumb_file),
                  "--thumb-px", "420", timeout=120)
     items = [{"modality": "image", "media": str(out)}]
+    if ocr == "auto":
+        ocr = _image_has_text(src)
     if ocr:
         text = (helper("ocr", str(src), *_ocr_args(media), timeout=300).get("items") or [{}])[0].get("text") or ""
         if len(text.strip()) >= 8:
@@ -868,6 +954,35 @@ def _ffprobe_duration(p: Path) -> tuple[float | None, bool, bool]:
         return float(d["format"]["duration"]), "video" in types, "audio" in types
     except Exception:
         return None, False, False
+
+
+VIDEO_SEGMENT_S = 30.0       # media.video_mode "segments": one clip embed per this many seconds (8.6 s of work per minute)
+VIDEO_POSTER_AT = 0.10       # media.video_mode "poster": the one frame embedded, at this share of the duration
+
+
+def _video_segments(p: Path, work: Path, duration: float, limit: float) -> list[dict]:
+    """One low-resolution 1 fps clip per VIDEO_SEGMENT_S, each embedded as a video item (the old, default behaviour)."""
+    items, step, t = [], VIDEO_SEGMENT_S, 0.0
+    while t < limit:
+        seg = work / f"v-{int(t)}.mp4"
+        r = run(["ffmpeg", "-v", "error", "-y", "-ss", str(t), "-t", str(step), "-i", str(p), "-an",
+                 "-vf", "fps=1,scale=448:-2", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", str(seg)], 300)
+        if r.returncode == 0 and seg.exists() and seg.stat().st_size > 0:
+            items.append({"modality": "video", "t0": t, "t1": min(t + step, duration), "media": str(seg)})
+        t += step
+    return items
+
+
+def _video_poster(p: Path, work: Path, duration: float) -> list[dict]:
+    """media.video_mode "poster": one frame at VIDEO_POSTER_AT of the duration, embedded as a picture (an image item that
+    carries the frame's time). What the video says comes from the transcript passages, which are unchanged."""
+    at = round(max(0.0, min(VIDEO_POSTER_AT * duration, duration - 0.5)), 1)
+    poster = work / "poster.jpg"
+    r = run(["ffmpeg", "-v", "error", "-y", "-ss", str(at), "-i", str(p), "-frames:v", "1", "-vf", "scale=448:-2",
+             str(poster)], 120)
+    if r.returncode != 0 or not poster.exists() or poster.stat().st_size == 0:
+        return []
+    return [{"modality": "image", "t0": at, "t1": at, "media": str(poster), "heading": "Poster frame"}]
 
 
 def heavy(p: Path, kind: str, spec: dict, coll: str, file_id: int, media: dict) -> dict:
@@ -893,23 +1008,18 @@ def heavy(p: Path, kind: str, spec: dict, coll: str, file_id: int, media: dict) 
                 items, thumb = _image_heavy(img, work, thumb_file, bool(spec.get("ocr_image")), media)
 
     elif kind == "image":
-        items, thumb = _image_heavy(p, work, thumb_file, bool(spec.get("ocr")), media)
+        ocr = spec.get("ocr")
+        items, thumb = _image_heavy(p, work, thumb_file, ocr if ocr == "auto" else bool(ocr), media)
 
     elif kind in ("audio", "video"):
         duration, has_video, has_audio = _ffprobe_duration(p)
         if duration and shutil.which("ffmpeg"):
             limit = min(duration, float(media.get("max_media_minutes", 60)) * 60)
             if kind == "video" and has_video:
-                step = 30.0
-                t = 0.0
-                while t < limit:
-                    seg = work / f"v-{int(t)}.mp4"
-                    r = run(["ffmpeg", "-v", "error", "-y", "-ss", str(t), "-t", str(step), "-i", str(p), "-an",
-                             "-vf", "fps=1,scale=448:-2", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
-                             str(seg)], 300)
-                    if r.returncode == 0 and seg.exists() and seg.stat().st_size > 0:
-                        items.append({"modality": "video", "t0": t, "t1": min(t + step, duration), "media": str(seg)})
-                    t += step
+                if spec.get("poster"):
+                    items += _video_poster(p, work, duration)
+                else:
+                    items += _video_segments(p, work, duration, limit)
                 r = run(["ffmpeg", "-v", "error", "-y", "-ss", str(min(1.0, duration / 2)), "-i", str(p),
                          "-frames:v", "1", "-vf", "scale=420:-2", str(thumb_file)], 120)
                 thumb = r.returncode == 0 and thumb_file.exists()

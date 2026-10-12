@@ -1,0 +1,1287 @@
+{
+ "corpus_version": 2,
+ "today": "2026-11-02",
+ "conventions": "LABELLING CONVENTIONS (applied strictly to every document)\n- doctype: invoice (incl. credit notes), receipt (till receipt, payment confirmation, paid receipt/Quittung), bank_statement (account statement, bank export), contract (agreement, Vertrag, NDA, lease), letter (formal correspondence that is none of the others), quote (offer/Angebot/quotation/proforma), reminder (payment reminder, dunning, Mahnung, final notice), payslip, tax_document (tax assessment, tax return, VAT return, Steuerbescheid), other (everything else, incl. notes, meeting minutes, order confirmations, delivery notes, newsletters, ledgers, recipes, code, identity documents).\n- doc_date: the date the document was issued/written, ISO \"YYYY-MM-DD\". Statements: the statement date, else the period end. Contracts: the date printed as the date of the agreement (signature/\"dated\") else the effective date. Payslip: \"YYYY-MM\" (the pay period month) unless an exact issue date is printed. Letters: the letter date. Receipts: the purchase date. Never a due date, delivery/service date, validity date, birth date, or ID expiry. null when the document has no issue date. For e-mails see below.\n- amount: a float with a dot decimal, the amount that identifies the document's value: invoice = the gross total of the invoice (negative for credit notes); receipt = the total paid; quote = the gross total offered; reminder = the total the sender demands now (a \"total claim / Gesamtforderung / total due\" line including fees if present, else the open invoice amount); payslip = the net payout (Auszahlungsbetrag / net pay); tax_document = the amount to pay or refund if one is printed (positive number), else null; contract = null unless one single contract value is explicitly labelled; letter, bank_statement, other = null. Keep the sign as printed.\n- currency: ISO code (EUR, USD, GBP, CHF, JPY, SEK) of that amount, null when amount is null.\n- counterparty: the issuing/sending party exactly as printed in the letterhead / sender block / From display name (keep the legal-form suffix: \"Beispiel Handels GmbH\"); for a person sender, the person's name; null if no sender is identifiable (e.g. a bare till slip with no shop name, or a note).\n- reference: the document's own number as printed (invoice no., order/reference no., contract no., quote no.); null if none. ALWAYS null for payslip, tax_document, identity-like documents and other. Never an IBAN, a card number, a tax ID, a personal ID.\n- lang: \"en\" or \"de\" (the main language).\n- Expected for e-mails: doc_date = the date of the Date header (ISO), counterparty = the From display name (without the address), doctype by what the mail IS (an invoice mail whose body carries the invoice data is an invoice; a payment-reminder mail is a reminder; a newsletter/chat/meeting mail is other), amount/reference from the body when present.\n\nANNOTATION DECISIONS (round 2: additions and points the convention text leaves open; evaluators should be aware of them)\n1. Reference means the document's OWN printed number only. A reminder or letter that merely cites an invoice or contract number of another document gets reference null unless it prints its own number (Mahnung Nr., Reminder no., Unser Zeichen, Our ref, Aktenzeichen). Round-2 examples: the final notice for two invoices (collections/final_notice_2026-03.pdf) and the two-invoice reminder mail (Mail/AR/Reminder 2 invoices overdue.eml) have reference null; the cancellation letter that cites 'Ihre Vertragsnummer 2210-77' has reference null.\n2. If a receipt or online-order receipt prints only an order number or booking reference (no separate receipt number), that is its reference.\n3. bank_statement: reference only for an explicitly labelled statement number (Auszugsnummer 01/2026 -> \"01/2026\"), else null. doc_date = statement date, else period end. Three statements print a period but no statement date (the Quarzbank PDF, the Foo Credit CSV, the Kontoumsaetze XLSX); their label is the period end. A statement export without a bank name (the XLSX) has counterparty null.\n4. Identity-like document (identity card scan): doctype other and EVERY other field null, including lang (null). Exactly one document has lang null.\n5. Order confirmations and delivery notes are doctype other even when they print prices and totals: amount null, reference null, doc_date and counterparty kept.\n6. Contracts: amount only where one single contract value is explicitly labelled (the Austrian Werkvertrag: 'Gesamtwert des Vertrags: EUR 24.000,00'). Monthly rent, an annual salary, hourly rates and 'fees as agreed' stay null. A contract without letterhead (the .txt cooperation agreement) uses the first-named party as counterparty.\n7. Invoice amount = the gross total of the invoice after discount lines (Rabatt, discount) and including shipping/freight, but BEFORE deposits (Anzahlung), payments received, or an offered early-payment discount (Skonto). A final invoice with 'abzgl. Anzahlung' is labelled with the full gross total, not the remaining balance.\n8. Amounts in another currency that are marked as information (approx., equivalent, indicative, entspricht ca., Gegenwert) are never the label. The label is the currency of the document's own total line (e.g. GBP total with EUR information; SEK receipt with EUR information; USD reminder with EUR information).\n9. Receipt amount = the total paid printed on the receipt, including tip and after vouchers or discount codes (restaurant 69.40 EUR; online order 95.15 EUR). A paid receipt (Quittung) for a deposit is labelled with the deposit paid. A remittance advice sent by the payer is treated as a payment confirmation (receipt); its counterparty is the payer who issued it and its amount is the total remitted.\n10. A restaurant slip headed RECHNUNG that says paid by card is a receipt (paid receipt). A pro forma invoice is a quote. A Kostenvoranschlag / cost estimate is a quote with the gross estimate as amount; a quote with a quantity discount is labelled with the gross total after discount (Swiss offer rounded to 5 Rappen as printed).\n11. Reminder amount = the total demanded now (Gesamtforderung, Total zu zahlen, Total now due, Total overdue, Gesamtbetrag) including fees and interest; for reminders listing two invoices it is the combined claim.\n12. A cancellation notice (Kündigung) and a reservation confirmation are letters, not contracts. Letters from private persons start with the recipient block, then the sender block; the counterparty is the person named in the sender block.\n13. Tax documents: self-prepared returns/computations (UK VAT return, personal income tax calculation, corporate tax computation) have the taxpayer printed in the heading as counterparty; authority-issued documents (municipal tax invoice, notice of assessment) have the authority. amount = balance payable or expected refund, as a positive number.\n14. Payslip doc_date is \"YYYY-MM\"; the one payslip that prints \"Issued: 27 February 2026\" is labelled with that full ISO date. Equivalents in another currency (EUR) are not labels.\n15. Counterparty keeps the printed capitalisation (NORDLICHT MUSTER GMBH vs Maple Test Corp.).\n16. E-mail doc_date is the calendar date of the Date header in the header's own UTC offset; no mail is timed near midnight. Several mails carry HTML-ish leftovers (tags, &nbsp; entities, quoted-printable escapes such as =C3=BC) exactly as an extractor that does not strip them would deliver; the counterparty is still the From display name.\n17. Swiss and Austrian conventions are used in several documents: d.m.yyyy dates, 'Jänner', 'Fr. 18.50' and CHF with apostrophe thousands separators, a euro sign before the amount, UID numbers, MWST. Slash dates are only used where unambiguous (14/02/2026).\n18. Mixed-language documents are labelled with the main language of the body: the Italian/English invoice, the DE/EN cooperation agreement, the EN/DE shipping notice and the letter with English body and German salutation are 'en'; the mixed reminder mail with German body is 'de'.\n19. OCR-style noise (swapped l/1 and O/0, missing umlauts, joined or split words, broken letters) appears in 22 documents (all 14 image scans and 8 PDFs, verified by searching the text for the inserted tokens); it never touches the tokens of counterparty, reference, amount or date, and labels are the clean printed values.\n20. Documents with exactly one date-like string: the fuel receipt (03-Apr-2026) and the letter dated 31 July 2026. Dates earlier or later than the document date (invoice, delivery, due, validity, contract end, event, ID expiry) are distractors and never the label.\n",
+ "docs": [
+  {
+   "id": "h201",
+   "filename": "export/kontoauszug_2026-01_CH.csv",
+   "ext": "csv",
+   "kind": "text",
+   "text": "Bergbank Probe AG;Kontoauszug\nAuszugsdatum;31.01.2026\nKonto;00-000000-0\nDatum;Text;Belastung;Gutschrift;Saldo\n05.01.2026;Miete Atelier;1'650.00;;4'820.35\n12.01.2026;Gutschrift Kunde Hafenstrasse Demo GmbH;;2'400.00;7'220.35\n15.01.2026;Zahlung Seeblick Demo AG;1'150.00;;6'070.35\n22.01.2026;Lastschrift Strom;184.60;;5'885.75\n28.01.2026;Gutschrift Bergkristall Probe AG;;2'845.60;8'731.35\n31.01.2026;Kontoführung;12.00;;8'719.35",
+   "expected": {
+    "doctype": "bank_statement",
+    "doc_date": "2026-01-31",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Bergbank Probe AG",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h202",
+   "filename": "Mahnung_AT_M-26-009.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Probehof Naturprodukte GmbH\nHofgasse 1 · 1099 Beispielhausen\nUID ATU00000000\n\nMahnung Nr. M/26/009\n27. Februar 2026\n\nRechnung Nr. 2026/012 vom 10. Jänner 2026     € 284,00\nMahnspesen                                      € 8,00\nVerzugszinsen                                   € 3,17\nGesamtbetrag                                  € 295,17\n\nWir ersuchen um Überweisung innerhalb von 7 Tagen.",
+   "expected": {
+    "doctype": "reminder",
+    "doc_date": "2026-02-27",
+    "amount": 295.17,
+    "currency": "EUR",
+    "counterparty": "Probehof Naturprodukte GmbH",
+    "reference": "M/26/009",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h203",
+   "filename": "quotes/BW-Q-0551.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Brightwater Test Ltd\n21 Specimen Quay, Sampleton SA9 3ZZ\nsales@mail.example.com | 020 7946 0555\n\nQUOTATION BW-Q-0551\nQuote date: 18 May 2026\nValid until: 30 June 2026\n\nFor: Foxglove Example Ltd\n\nWebsite redesign, design phase                 £2,100.00\nWebsite redesign, build and testing            £3,000.00\nNet                                            £5,100.00\nVAT 20%                                        £1,020.00\nTotal (incl. VAT)                              £6,120.00\n\nInformation only: approx. EUR 7,140.20 at 1.1667. Our offer is in pounds sterling.",
+   "expected": {
+    "doctype": "quote",
+    "doc_date": "2026-05-18",
+    "amount": 6120.0,
+    "currency": "GBP",
+    "counterparty": "Brightwater Test Ltd",
+    "reference": "BW-Q-0551",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h204",
+   "filename": "HR/Employment_Agreement_EMP-2025-017.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Cobalt Demo S.L.\nCalle Muestra 10, 00000 Ejemplo\npeople@mail.example.com\n\nEMPLOYMENT AGREEMENT\nContract ref: EMP-2025-017\nDate: 1 July 2025\n\nEmployer: Cobalt Demo S.L.\nEmployee: Jonas Test\n\nPosition: Operations Analyst, full time.\nStart of employment: 1 September 2025, six-month probation period.\nThe employee receives an annual gross salary of EUR 62,000 in twelve monthly instalments.\nAnnual leave: 25 working days.\nNotice: one month during probation, afterwards three months to the end of a calendar month.\n\nEmployer signature: ____________     Employee signature: ____________",
+   "expected": {
+    "doctype": "contract",
+    "doc_date": "2025-07-01",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Cobalt Demo S.L.",
+    "reference": "EMP-2025-017",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h205",
+   "filename": "billing/MT-90417.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Maple Test Corp.\n310 Placeholder Boulevard, Exampletown, EX 00010\nbilling@mail.example.com\n\nBILL TO                          INVOICE\nHarbor Sample LLC                No. MT-90417\n44 Placeholder Way               Date: Apr 9, 2026\nExampletown, EX 00011            Ship date: Apr 7, 2026\nAttn: Accounts Payable           Due: Apr 24, 2026\n\nQty  Item                         Unit        Line\n  6  Rack mount kit                410.00   2,460.00\n 40  Cable bundle                   48.00   1,920.00\n\nSubtotal                       $4,380.00\nDiscount (5%)                   -$219.00\nShipping and handling              $85.00\nSales tax (6%)                    $254.76\nTotal due                      $4,500.76\n\nThank you. Late payments accrue 1.5% interest per month.",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-04-09",
+    "amount": 4500.76,
+    "currency": "USD",
+    "counterparty": "Maple Test Corp.",
+    "reference": "MT-90417",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h206",
+   "filename": "Privat/Beanstandung_Bestellung_77410.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Tannenwald Test AG\nKundenservice\nPostfach 18\n8000 Probestadt\n\nSabine Probe\nLerchenweg 12\n10117 Musterstadt\nsabine.probe@mail.example.com\n\nMusterstadt, 03.02.2026\n\nBetreff: Bestellung 77410 - Beanstandung der Lieferung\n\nSehr geehrte Damen und Herren,\n\ndie am 28.01.2026 gelieferte Ware (ein Burostuhl zum Preis von 389,00 EUR) ist mit einem Defekt an der Ruckenlehne eingetroffen. Ich bitte Sie, mir innerhalb von zwei W0chen einen Ersatz zu senden oder den Kaufpreis zu erstatten.\n\nFotos des Schadens l1egen bei.\n\nMit freundlichen Grüßen\nSabine Probe",
+   "expected": {
+    "doctype": "letter",
+    "doc_date": "2026-02-03",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Sabine Probe",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h207",
+   "filename": "tax/VAT_return_Q1_2026.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Foxglove Example Ltd\n12 Specimen Lane, Sampleton SA5 1AB\n\nVAT RETURN - QUARTER ENDED 31 MARCH 2026\nPrepared on 14 April 2026\nPrepared by: Finance team\n\nBox 1  VAT due on sales                   £9,420.50\nBox 4  VAT reclaimed on purchases         £4,608.20\nBox 5  Net VAT payable                    £4,812.30\n\nPayment due by 7 May 2026 (online).\nDraft for submission. Figures agree to the sales and purchase ledgers.",
+   "expected": {
+    "doctype": "tax_document",
+    "doc_date": "2026-04-14",
+    "amount": 4812.3,
+    "currency": "GBP",
+    "counterparty": "Foxglove Example Ltd",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h208",
+   "filename": "Behoerden/Anhoerung_OA-2026-0198.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Stadt Beispielhausen · Ordnungsamt\nRathausgasse 5 · 10119 Beispielhausen\nordnungsamt@mail.example.com\n\nAktenzeichen: OA-2026-0198\nBeispielhausen, 09.02.2026\n\nHerrn\nJonas Test\nParkallee 6\n10117 Beispielhausen\n\nAnhörung\n\nSehr geehrter Herr Test,\n\nIhnen wird vorgeworfen, am 30.01.2026 ein Fahrzeug im eingeschrankten Ha1teverbot abgestellt zu haben. Wir beabsichtigen, ein Verwarnungsge1d von 55,00 EUR festzusetzen. Sie konnen sich innerha1b von zwei Wochen schriftlich ausern.\n\nMit freundlichen Grüßen\nIm Auftrag",
+   "expected": {
+    "doctype": "letter",
+    "doc_date": "2026-02-09",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Stadt Beispielhausen · Ordnungsamt",
+    "reference": "OA-2026-0198",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h209",
+   "filename": "Contracts/SA-26-009_Service_Agreement.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Kestrel Example LLP\n5 Specimen Row, Sampleton SA7 2XY\n\nSERVICE AGREEMENT\nAgreement no.\nSA-26-009\nDated\n5 January 2026\nProvider\nKestrel Example LLP\nClient\nHarbor Sample LLC\nServices\nAdvisory services on process design and reporting, delivered by named consultants on request of the Client.\nDuration\nTwelve months from the date above, renewing automatically for further twelve-month periods unless either party gives sixty days' written notice.\nFees\nAs agreed in the order form signed for each engagement.\nConfidentiality\nEach party keeps the other's non-public information confidential during and after the agreement.\nLiability\nEach party's liability is limited to the extent permitted by law.\nGoverning law\nThe law of the Provider's registered office.\n\nSigned for the Provider: ______________\nSigned for the Client: ______________",
+   "expected": {
+    "doctype": "contract",
+    "doc_date": "2026-01-05",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Kestrel Example LLP",
+    "reference": "SA-26-009",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h210",
+   "filename": "scans/Hausverwaltung_Dez2025.jpg",
+   "ext": "jpg",
+   "kind": "image",
+   "text": "Hausverwaltung Probeweg GmbH\nProbeweg 21 - 10115 Musterstadt\n\nUnser Zeichen: HV/2025/311\nMusterstadt, 05.12.2025\n\nAn die Mieter des Hauses Seeweg 14\n\nAnkundigung der Nebenkostenabrechnung 2025\n\nSehr geehrte Mieterinnen und Mieter,\ndie Abrechnung der Betriebskosten fur 2025 erhalten Sie\nim Marz. Fur Ihre Wohnung erwarten wir voraussichtlich\neine Nachzahlung von 312,40 EUR.\n\nMit freundlichen GruBen\nHausverwaltung Probeweg GmbH",
+   "expected": {
+    "doctype": "letter",
+    "doc_date": "2025-12-05",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Hausverwaltung Probeweg GmbH",
+    "reference": "HV/2025/311",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h211",
+   "filename": "Mail/2026-03/Rechnung Nr. 8841 Heizungswartung.eml",
+   "ext": "eml",
+   "kind": "email",
+   "text": "Subject: Rechnung Nr. 8841 - Heizungswartung\nFrom: Seeblick Demo AG <buchhaltung@mail.example.com>\nTo: Frau Beispiel <m.beispiel@example.com>\nDate: Thu, 12 Mar 2026 09:41:00 +0100\nAttachments: Rechnung_8841.pdf\n\nGr=C3=BCezi Frau Beispiel,<br>\n<br>\nanbei die Rechnung Nr. <b>8841</b> f=C3=BCr die Heizungswartung vom 3.3.2026.<br>\nRechnungsbetrag: Fr. 1'150.00 inkl. 8.1 % MWST<br>\nZahlbar innert 30 Tagen.<br>\n<br>\nFreundliche Gr=C3=BCsse<br>\nSeeblick Demo AG<br>\n&nbsp;",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-03-12",
+    "amount": 1150.0,
+    "currency": "CHF",
+    "counterparty": "Seeblick Demo AG",
+    "reference": "8841",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h212",
+   "filename": "Vertraege/AT/Werkvertrag_WV-26-004.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Zimmerei Probeholz GmbH\nHolzstraße 7 · 1099 Beispielhausen · Österreich\noffice@mail.example.com\n\nWERKVERTRAG\nVertragsnummer WV-26/004\nBeispielhausen, 20. Jänner 2026\n\nWerkunternehmer: Zimmerei Probeholz GmbH\nBesteller: Probehof Naturprodukte GmbH\n\nGegenstand: Errichtung eines Holzlagers (Dachstuhl und Fassade) am Standort Hofgasse 1.\nBaubeginn: 2. März 2026. Fertigstellung bis 30. Juni 2026.\nGesamtwert des Vertrags: € 24.000,00 inkl. USt, pauschal.\nAbnahme erfolgt schriftlich. Gewährleistung nach den gesetzlichen Bestimmungen.\n\nUnterschrift Werkunternehmer: __________   Unterschrift Besteller: __________",
+   "expected": {
+    "doctype": "contract",
+    "doc_date": "2026-01-20",
+    "amount": 24000.0,
+    "currency": "EUR",
+    "counterparty": "Zimmerei Probeholz GmbH",
+    "reference": "WV-26/004",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h213",
+   "filename": "Vertraege/Dienstleistungsvertrag_Tannenwald.docx",
+   "ext": "docx",
+   "kind": "office",
+   "text": "Tannenwald Test AG\nProbeallee 3\n8000 Probestadt\n\nDIENSTLEISTUNGSVERTRAG\n\nProbestadt, 12.11.2025\n\nzwischen der Tannenwald Test AG (nachfolgend \"Auftragnehmerin\") und der Hafenstrasse Demo GmbH (nachfolgend \"Auftraggeberin\")\n\n1. Gegenstand\nDie Auftragnehmerin erbringt Beratungsleistungen im Bereich Betriebsorganisation nach Weisung der Auftraggeberin.\n\n2. Dauer\nDer Vertrag beginnt am 01.12.2025 und endet am 30.11.2026, sofern er nicht schriftlich verlängert wird.\n\n3. Vergütung\nDie Vergütung richtet sich nach den jeweils vereinbarten Einzelaufträgen.\n\n4. Vertraulichkeit\nBeide Parteien behandeln vertrauliche Informationen auch nach Vertragsende geheim.\n\n5. Schlussbestimmungen\nÄnderungen bedürfen der Schriftform. Gerichtsstand ist Probestadt.",
+   "expected": {
+    "doctype": "contract",
+    "doc_date": "2025-11-12",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Tannenwald Test AG",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h214",
+   "filename": "scan_20260105.png",
+   "ext": "png",
+   "kind": "image",
+   "text": "MARKT BEISPIELHOF GMBH\nHauptplatz 2, 1099 Beispielhausen\nUID ATU00000000\nBrot 1kg          3,40\nKase 250g         4,95\nSchinken          6,25\nApfelsaft         2,10\nJoghurt 4x        3,20\nSUMME EUR        19,90\nBAR              20,00\nRÜCKGELD          0,10\n05.01.26 11:17\nDanke fur Ihren Einkauf",
+   "expected": {
+    "doctype": "receipt",
+    "doc_date": "2026-01-05",
+    "amount": 19.9,
+    "currency": "EUR",
+    "counterparty": "MARKT BEISPIELHOF GMBH",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h215",
+   "filename": "Lohn/AT/Gehaltsabrechnung_Jaenner_2026.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Tannenwald Test GmbH\nProbegasse 5 · 1099 Beispielhausen\n\nGEHALTSABRECHNUNG Jänner 2026\nDienstnehmerin: Lucia Example\nGeburtsdatum: 05.09.1993\nSV-Nummer: 0000 050993\n\nBruttobezug                         € 3.150,00\nSV-Beitrag Dienstnehmer             € -570,78\nLohnsteuer                          € -261,56\nAuszahlungsbetrag                   € 2.317,66",
+   "expected": {
+    "doctype": "payslip",
+    "doc_date": "2026-01",
+    "amount": 2317.66,
+    "currency": "EUR",
+    "counterparty": "Tannenwald Test GmbH",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h216",
+   "filename": "Mail/News/Spring offers.eml",
+   "ext": "eml",
+   "kind": "email",
+   "text": "Subject: Spring offers at Orchid Sample\nFrom: Orchid Sample Newsletter <news@mail.example.com>\nTo: subscribers@mail.example.com\nDate: Wed, 8 Apr 2026 06:00:00 +0000\n\n<div style=\"width:600px;margin:0 auto\">\n<h1>Spring offers</h1>\n<p>Save up to 25% on hydraulic fittings until the end of April.</p>\n<a href=\"https://www.orchid-sample.example.com/spring\">View offers</a>\n<p style=\"font-size:10px\">You receive this mail because you subscribed. <a href=\"#\">Unsubscribe</a></p>\n</div>",
+   "expected": {
+    "doctype": "other",
+    "doc_date": "2026-04-08",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Orchid Sample Newsletter",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h217",
+   "filename": "Proforma/PI-2026-017.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "FOO LOGISTICS OY\nSatamakatu 3, 00000 Esimerkki, Finland\nexport@mail.example.com\n\nPROFORMA INVOICE PI-2026-017\nDate: 2026-05-12\nThis document is not a tax invoice and is not a request for payment.\n\nConsignee: Bar Fabrik AB\nGoods: pallet racking components, 6 pallets\n\nValue of goods                        EUR 8,900.00\nPacking and export documents           EUR 460.00\nInsurance                              EUR 500.00\nTotal value                           EUR 9,860.00",
+   "expected": {
+    "doctype": "quote",
+    "doc_date": "2026-05-12",
+    "amount": 9860.0,
+    "currency": "EUR",
+    "counterparty": "FOO LOGISTICS OY",
+    "reference": "PI-2026-017",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h218",
+   "filename": "scans/statement_feb.jpg",
+   "ext": "jpg",
+   "kind": "image",
+   "text": "Sample Savings Bank PLC\nStatement date: 28 Feb 2026\nAccount: Savings Plus\n\nOpening balance        £12,400.00\n03 Feb  Interest             £10.34\n14 Feb  Transfer in         £500.00\n21 Feb  Transfer out        £150.00\nCl0sing balance        £12,760.34\nPage 1 of 1",
+   "expected": {
+    "doctype": "bank_statement",
+    "doc_date": "2026-02-28",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Sample Savings Bank PLC",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h219",
+   "filename": "Mail/Support/Re Your complaint.eml",
+   "ext": "eml",
+   "kind": "email",
+   "text": "Subject: Re: Your complaint - case CC-26-0418\nFrom: Harbor Test Bank PLC <customercare@mail.example.com>\nTo: Jules Specimen <jules.specimen@example.com>\nDate: Thu, 2 Apr 2026 11:48:00 +0100\n\n<p>Dear Mr Example,</p>\n<p>Thank you for contacting us about the fee charged to your account on 18 March 2026.</p>\n<p>We have reviewed your complaint (our reference: <b>CC-26-0418</b>) and we are sorry for the confusion. The fee was applied in error and will be reversed within five working days.</p>\n<p>Yours sincerely,<br>Customer Care<br>Harbor Test Bank PLC</p>\n<p style=\"color:#888;font-size:11px\">This message is confidential.&nbsp;</p>",
+   "expected": {
+    "doctype": "letter",
+    "doc_date": "2026-04-02",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Harbor Test Bank PLC",
+    "reference": "CC-26-0418",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h220",
+   "filename": "Wohnung/Kaution_Rueckzahlung.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Herrn\nHans Demo\nProbeweg 3\n10115 Musterstadt\n\nMarta Beispiel\nFlat 4, 12 Sample Court\nSampleton SA2 8PP\nmarta.beispiel@mail.example.com\n\n31 July 2026\n\nSubject: Return of rental deposit\n\nSehr geehrter Herr Demo,\n\nI am writing in English because my German is limited, please excuse this. My tenancy ended last month and the flat was handed over in good condition. I kindly ask you to return my deposit to the account I gave you at the handover.\n\nMit freundlichen Grüßen / Kind regards\nMarta Beispiel",
+   "expected": {
+    "doctype": "letter",
+    "doc_date": "2026-07-31",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Marta Beispiel",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h221",
+   "filename": "docs/CX-200_datasheet.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Cobalt Demo S.L.\nCalle Muestra 10, 00000 Ejemplo\n\nDATASHEET CX-200 CONTROLLER\nIssued: 20 January 2026\n\nSupply voltage        12-24 V DC\nOperating temperature -20 to 60 C\nInterfaces            2 x RS-485, 1 x Ethernet\nHousing               IP54\n\nList price            EUR 249.00 / USD 269.00\nVolume price (50+)    EUR 219.00 / USD 237.00\n\nPrices exclude VAT and shipping. Specifications may change without notice.",
+   "expected": {
+    "doctype": "other",
+    "doc_date": "2026-01-20",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Cobalt Demo S.L.",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h222",
+   "filename": "Offerten/Offerte_26-0207.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Seeblick Demo AG\nSeeweg 20 · 9999 Probestadt · Schweiz\nofferten@mail.example.com\n\nOFFERTE Nr. 26-0207\nDatum 2.3.2026\nGültig bis 30.4.2026\n\nHeizungsregelunq Modernisierunq         1   6'800.00\nM0ntage (Std.)                           40   3'920.00\nEntsorgung                                1     825.00\nSumme                                          11'545.00\nMengenrabat t 5 %                               -577.25\nZwischentotal                                  10'967.75\nMWST 8.1 %                                       888.39\nRundung                                           0.01\nTotal CHF 11'856.15",
+   "expected": {
+    "doctype": "quote",
+    "doc_date": "2026-03-02",
+    "amount": 11856.15,
+    "currency": "CHF",
+    "counterparty": "Seeblick Demo AG",
+    "reference": "26-0207",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h223",
+   "filename": "AP/remittance/RA-2026-0331.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Sample Retail Corp.\nAccounts Payable · 900 Demo Parkway · Exampleton, EX 00020\nap@mail.example.com\n\nREMITTANCE ADVICE\nAdvice no.\nRA-2026-0331\nPayment date\n2026-03-31\nSupplier\nFoo Components Inc\n\nWe have today transferred CAD 6,420.00 to your account in settlement of the invoices below.\n\nInvoice      Amount\nINV-2201     CAD 3,500.00\nINV-2208     CAD 2,920.00",
+   "expected": {
+    "doctype": "receipt",
+    "doc_date": "2026-03-31",
+    "amount": 6420.0,
+    "currency": "CAD",
+    "counterparty": "Sample Retail Corp.",
+    "reference": "RA-2026-0331",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h224",
+   "filename": "Gehalt/2026/Abrechnung_02-2026.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Sonnenwerk Muster GmbH · Lichtstraße 5 · 10179 Musterstadt\n\nENTGELTABRECHNUNG 02/2026\nName: Sabine Probe                     Personal-Nr.: 004471\nGeb.-Datum: 17.04.1989                 Steuerklasse: 1\nSteuer-ID: 00234567890                 SV-Nr.: 00 170489 X 000\n\nBrutto                                  3.950,00\nLohnsteuer                               -521,00\nKrankenversicherung                      -323,90\nRentenbeitrag (gesetzlich)               -367,35\nArbeitslosenversicherung                  -51,35\nPflegeversicherung                        -72,09\nAuszahlungsbetrag                      2.614,31 EUR",
+   "expected": {
+    "doctype": "payslip",
+    "doc_date": "2026-02",
+    "amount": 2614.31,
+    "currency": "EUR",
+    "counterparty": "Sonnenwerk Muster GmbH",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h225",
+   "filename": "notes/negotiation_notes.md",
+   "ext": "md",
+   "kind": "text",
+   "text": "# Notes after the call with the supplier\n\n2026-02-11\n\nThey offered EUR 12,000 for the first phase and said the invoice would follow after delivery. I asked for 30 percent upfront; they will come back with a revised quote. The contract draft mentions a notice period of three months. Receipts for the sample units are still missing.\n\nNext step: ask finance whether a deposit of EUR 3,600 is acceptable.",
+   "expected": {
+    "doctype": "other",
+    "doc_date": "2026-02-11",
+    "amount": null,
+    "currency": null,
+    "counterparty": null,
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h226",
+   "filename": "Wohnung/Mietvertrag_MV25-117.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Liegenschaften Probestadt AG\nBahnhofweg 4 · 9999 Probestadt\nverwaltung@mail.example.com\n\nMIETVERTRAG FÜR WOHNRAUM\nVertrag MV 25/117\nProbestadt, 1.12.2025\n\nVermieterin: Liegenschaften Probestadt AG\nMieterin: Lucia Example\n\nMietobjekt: 3-Zimmer-Wohnung, 2. Stock, Seeweg 14\nMietbeginn: 1.2.2026\nMietzins netto: Fr. 1'650.00 pro Monat\nAkonto Nebenkosten: Fr. 220.00 pro Monat\nKundigungsfrist: drei Monate auf Ende eines Monats, ausser Ende Dezember\n\nDie Mieterin hat eine Mietkaut1on auf ein gesperrtes K0nto zu leisten.\nEs gelten die allgemeinen Bestimmungen der beiliegenden Beilage.\n\nUnterschrift Vermieterin: ____________   Unterschrift Mieterin: ____________",
+   "expected": {
+    "doctype": "contract",
+    "doc_date": "2025-12-01",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Liegenschaften Probestadt AG",
+    "reference": "MV 25/117",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h227",
+   "filename": "Kontoumsaetze_Feb26.xlsx",
+   "ext": "xlsx",
+   "kind": "office",
+   "text": "Kontoumsätze vom 01.02.2026 bis 28.02.2026\nBuchungstag\tText\tBetrag\tSaldo\n02.02.2026\tMiete Büro\t-1.250,00\t8.150,00\n05.02.2026\tZahlungseingang Quarzwerk Beispiel KG\t1.088,20\t9.238,20\n09.02.2026\tKartenzahlung Tankstelle\t-61,45\t9.176,75\n13.02.2026\tLastschrift Versicherung\t-142,10\t9.034,65\n20.02.2026\tÜberweisung Steuerberatung\t-357,00\t8.677,65\n26.02.2026\tEntgelt\t-4,90\t8.672,75",
+   "expected": {
+    "doctype": "bank_statement",
+    "doc_date": "2026-02-28",
+    "amount": null,
+    "currency": null,
+    "counterparty": null,
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h228",
+   "filename": "Mail/AR/Reminder 2 invoices overdue.eml",
+   "ext": "eml",
+   "kind": "email",
+   "text": "Subject: Reminder: 2 invoices overdue\nFrom: Maple Test Corp. <accounts@mail.example.com>\nTo: ap@mail.example.com\nDate: Fri, 20 Mar 2026 14:30:00 -0500\n\n<p>Hello,</p>\n<p>our records show two open invoices:</p>\n<ul><li>Invoice 2204 &ndash; CAD&nbsp;1,150.00 (due 2026-03-01)</li>\n<li>Invoice 2219 &ndash; CAD&nbsp;1,000.00 (due 2026-03-10)</li></ul>\n<p><b>Total overdue: CAD&nbsp;2,150.00</b></p>\n<p>Please pay at your earliest convenience.</p>\n<p>Maple Test Corp. &middot; Accounts</p>",
+   "expected": {
+    "doctype": "reminder",
+    "doc_date": "2026-03-20",
+    "amount": 2150.0,
+    "currency": "CAD",
+    "counterparty": "Maple Test Corp.",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h229",
+   "filename": "Mail/Kalender/Einladung Abstimmung Projekt Nordlicht.eml",
+   "ext": "eml",
+   "kind": "email",
+   "text": "Subject: Einladung: Abstimmung Projekt Nordlicht, 21.04.2026\nFrom: Hans Demo <hans.demo@example.com>\nTo: team@mail.example.com\nDate: Tue, 14 Apr 2026 16:22:00 +0200\n\n<p>Hallo zusammen,</p>\n<p>ich lade euch zur Abstimmung am <b>21.04.2026 um 14:00 Uhr</b> ein.<br>\nOrt: Raum 3 oder per Video.</p>\n<p>Themen:&nbsp;Zeitplan, offene Rechnungen, Budget</p>\n<p>Viele Grüße<br>Hans</p>",
+   "expected": {
+    "doctype": "other",
+    "doc_date": "2026-04-14",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Hans Demo",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h230",
+   "filename": "scans/payslip_feb.jpg",
+   "ext": "jpg",
+   "kind": "image",
+   "text": "Orchard Demo Oy\nMerikatu 8, 00000 Esimerkki, Finland\nPAYSLIP - February 2026\nEmployee: Aino Specimen\nTax ID: 00 000 000 000\nDate of birth: 11-Sep-1990\nGr0ss pay                   3,600.00\nTyEL pension (7.15 %)        -257.40\nUnemployment ins. (0.79 %)    -28.44\nWithh0lding tax              -612.00\nNet pay                 EUR  2,702.16",
+   "expected": {
+    "doctype": "payslip",
+    "doc_date": "2026-02",
+    "amount": 2702.16,
+    "currency": "EUR",
+    "counterparty": "Orchard Demo Oy",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h231",
+   "filename": "scans/Flyer_Strassenfest.jpg",
+   "ext": "jpg",
+   "kind": "image",
+   "text": "EINLADUNG ZUM STRASSENFEST\nSamstag, 20. Juni 2026, ab 14 Uhr\nProbeweg zwischen Nr. 10 und Nr. 30\n\nEs gibt Kaffee und Kuchen, Musik und\neinen Flohmarkt fur Kinder. Anmeldung\nvon Ständen bis Ende Mai bei der\nAnwohnerinitiative Probeweg.\n\nWir freuen uns auf Sie!\nAnwohnerinitiative Probeweg",
+   "expected": {
+    "doctype": "other",
+    "doc_date": null,
+    "amount": null,
+    "currency": null,
+    "counterparty": "Anwohnerinitiative Probeweg",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h232",
+   "filename": "Quittungen/Anzahlung_114.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Schreinerei Probeholz e.K.\nHolzweg 6 · 10119 Musterstadt\n\nQUITTUNG Nr. 114                      Datum: 05.01.2026\nBetrag: 2.000,00 EUR                  Auftrag Nr.: 26-051\n\nin Worten: zweitausend Euro\nZweck: Anzahlung auf die Einbauküche laut Auftrag\n\nDen Betrag habe ich bar erhalten.\nUnterschrift: ________________",
+   "expected": {
+    "doctype": "receipt",
+    "doc_date": "2026-01-05",
+    "amount": 2000.0,
+    "currency": "EUR",
+    "counterparty": "Schreinerei Probeholz e.K.",
+    "reference": "114",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h233",
+   "filename": "Angebote/AN-26-0112.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Quarzwerk Beispiel KG\nSteinbruchweg 9 · 10179 Musterstadt\nvertrieb@mail.example.com\n\nANGEBOT AN-26-0112\nGesamtsumme brutto 8.925,00 EUR (netto 7.500,00 EUR zzgl. 19 % USt)\nGültig bis 31.03.2026\nDatum 02.03.2026\n\nPositionen\nFassadenreinigung (m²)   300 x 12,50 = 3.750,00\nGerüststellung pauschal   1 x 2.400,00 = 2.400,00\nSchutzanstrich (m²)   300 x 4,50 = 1.350,00\n\nBei Auftragserteilung bitten wir um Rücksendung einer unterschriebenen Kopie.",
+   "expected": {
+    "doctype": "quote",
+    "doc_date": "2026-03-02",
+    "amount": 8925.0,
+    "currency": "EUR",
+    "counterparty": "Quarzwerk Beispiel KG",
+    "reference": "AN-26-0112",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h234",
+   "filename": "Angebote/Kostenvoranschlag_KV-26-77.docx",
+   "ext": "docx",
+   "kind": "office",
+   "text": "Elektro Probe e.K.\nWerkstr. 12\n10119 Musterstadt\n\nKostenvoranschlag Nr. KV-26-77\nMusterstadt, 14.03.2026\n\nSehr geehrte Frau Beispiel,\n\ngerne reparieren wir Ihre Waschmaschine. Die voraussichtlichen Kosten betragen brutto 238,00 EUR (netto 200,00 EUR zzgl. 19 % MwSt.), davon 120,00 EUR für Ersatzteile.\n\nDieser Kostenvoranschlag ist 14 Tage gültig. Er ist unverbindlich.\n\nMit freundlichen Grüßen\nElektro Probe e.K.",
+   "expected": {
+    "doctype": "quote",
+    "doc_date": "2026-03-14",
+    "amount": 238.0,
+    "currency": "EUR",
+    "counterparty": "Elektro Probe e.K.",
+    "reference": "KV-26-77",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h235",
+   "filename": "Mail/Orders/Ihr Paket ist unterwegs.eml",
+   "ext": "eml",
+   "kind": "email",
+   "text": "Subject: Your parcel / Ihr Paket ist unterwegs\nFrom: Delta Beispiel Shipping <shipping@mail.example.com>\nTo: einkauf@mail.example.com\nDate: Wed, 11 Mar 2026 13:02:00 +0100\n\nHello / Guten Tag,\n\nyour order DB-2026-052 has left our warehouse. Ihre Bestellung DB-2026-052 hat unser Lager verlassen.\n\nOrder total / Bestellwert: EUR 2,430.25\nTracking / Sendungsnummer: ZZ000333444\nEstimated delivery / Voraussichtliche Lieferung: 13 March 2026\n\nDelta Beispiel AS",
+   "expected": {
+    "doctype": "other",
+    "doc_date": "2026-03-11",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Delta Beispiel Shipping",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h236",
+   "filename": "tickets/ferry_receipt.png",
+   "ext": "png",
+   "kind": "image",
+   "text": "Coastal Ferries AS\nThank you for booking with us.\nYou paid NOK 34.50 in total for 2 adult foot passengers\n(Harbour Quay to Sample lsland), booking ref CF-8841-X.\nJourney date: 2 May 2026\nReceipt issued 20 April 2026\nKeep this receipt for your records.",
+   "expected": {
+    "doctype": "receipt",
+    "doc_date": "2026-04-20",
+    "amount": 34.5,
+    "currency": "NOK",
+    "counterparty": "Coastal Ferries AS",
+    "reference": "CF-8841-X",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h237",
+   "filename": "statements/HTB_May2026.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "HARBOR TEST BANK PLC\n14 Specimen Row, Sampleton SA1 1AA\nBusiness banking 0800 000 0000\n\nACCOUNT STATEMENT - GBP\nDate of statement: 31 May 2026\nAccount holder: Kestrel Example LLP\nIBAN GB82 WEST 1234 5698 7654 32\n\nOpening balance                           1,110.00\n05 May  DIRECT DEBIT SAMPLE WATER                      48.20 DR    1,061.80\n07 May  CREDIT FOUNDRY TEST RETAIL LTD              1,250.00 CR    2,311.80\n11 May  CARD PURCHASE PAPER SUPPLY CO                  96.40 DR    2,215.40\n15 May  FASTER PAYMENT FROM BRIGHTFIELD TEST LTD    3,780.00 CR    5,995.40\n20 May  STANDING ORDER OFFICE RENT                  1,100.00 DR    4,895.40\n26 May  ACCOUNT FEE                                     8.00 DR    4,887.40\nClosing balance                            4,887.40\nPage 1 of 1",
+   "expected": {
+    "doctype": "bank_statement",
+    "doc_date": "2026-05-31",
+    "amount": null,
+    "currency": null,
+    "counterparty": "HARBOR TEST BANK PLC",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h238",
+   "filename": "Lieferscheine/LS-26-1190.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "QUARZWERK BEISPIEL KG\nSteinbruchweg 9 · 10179 Musterstadt\n\nLIEFERSCHEIN LS-26-1190\nDatum: 06.03.2026\nKunde: Hafenstrasse Demo GmbH\n\nArtikel               Menge   Einzelpreis   Wert\nQuarzsand 0/2 (t)        12        64,00   768,00\nSplitt 2/5 (t)            8        70,50   564,00\nWarenwert                                1.332,00 EUR\n\nWare in einwandfreiem Zustand erhalten: ______________",
+   "expected": {
+    "doctype": "other",
+    "doc_date": "2026-03-06",
+    "amount": null,
+    "currency": null,
+    "counterparty": "QUARZWERK BEISPIEL KG",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h239",
+   "filename": "Mail/AR/Payment reminder Zahlungserinnerung 4410-26.eml",
+   "ext": "eml",
+   "kind": "email",
+   "text": "Subject: Payment reminder / Zahlungserinnerung 4410-26\nFrom: Foo Logistics Oy <ar@mail.example.com>\nTo: einkauf@mail.example.com\nDate: Tue, 28 Apr 2026 09:05:00 +0300\n\nGuten Tag,\n\nzu unserer Rechnung 4410-26 vom 02.03.2026 ist noch kein Zahlungseingang zu verzeichnen.\n\nMahnnummer: ZE-USD-26-02\nOffener Betrag: USD 3,264.00 (entspricht ca. EUR 3.020,00 zum heutigen Kurs)\n\nBitte überweisen Sie den Betrag in US-Dollar. / Please pay in US dollars.\n\nFreundliche Grüße / Kind regards\nFoo Logistics Oy",
+   "expected": {
+    "doctype": "reminder",
+    "doc_date": "2026-04-28",
+    "amount": 3264.0,
+    "currency": "USD",
+    "counterparty": "Foo Logistics Oy",
+    "reference": "ZE-USD-26-02",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h240",
+   "filename": "Invoices/DB-2026-052.xlsx",
+   "ext": "xlsx",
+   "kind": "office",
+   "text": "Delta Beispiel AS\tIndustrigata 5\t0000 Eksempelby\nInvoice\tDB-2026-052\nDate\t2026-03-10\nDelivery date\t2026-03-05\nDue date\t2026-04-09\nBill to\tCobalt Demo S.L.\nItem\tQty\tUnit price\tAmount\nSensor module S-12\t50\t36.00\t1,800.00\nMounting plates\t50\t4.20\t210.00\nDiscount 8 %\t\t\t-160.80\nFreight\t\t\t95.00\nNet total\t\t\t1,944.20\nVAT 25 %\t\t\t486.05\nTotal EUR\t\t\t2,430.25\nEquivalent in USD (information only, rate 1.0828)\t\t\t2,631.47",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-03-10",
+    "amount": 2430.25,
+    "currency": "EUR",
+    "counterparty": "Delta Beispiel AS",
+    "reference": "DB-2026-052",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h241",
+   "filename": "Clients/Brightfield/KE-2026-0231.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Kestrel Example LLP\n5 Specimen Row, Sampleton SA7 2XY, United Kingdom\naccounts@mail.example.com | 020 7946 0888\n\nINVOICE KE/2026/0231                 Invoice date: 18 March 2026\nClient: Brightfield Test Ltd         Service period: March 2026\n                                      Payment due: 17 April 2026\n\nStrategy workshop (2 days)       2 x £1,200.00      £2,400.00\nReport and recommendations       1 x   £750.00        £750.00\n\nNet total                                           £3,150.00\nVAT 20%                                               £630.00\nTotal due                                           £3,780.00\n\nFor information only: approx. EUR 4,410.13 at 1.1667. Payment is due in pounds sterling.",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-03-18",
+    "amount": 3780.0,
+    "currency": "GBP",
+    "counterparty": "Kestrel Example LLP",
+    "reference": "KE/2026/0231",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h242",
+   "filename": "downloads/foo_credit_june.csv",
+   "ext": "csv",
+   "kind": "text",
+   "text": "Account provider,Foo Credit Co.\nFrom,2025-06-01\nTo,2025-06-30\nBooking date,Value date,Text,Amount\n2025-06-02,2025-06-02,Card payment Demo Coffee Roasters,-37.90\n2025-06-05,2025-06-05,Transfer in Maple Test Corp.,4500.76\n2025-06-11,2025-06-11,Direct debit Cloud hosting,-89.00\n2025-06-19,2025-06-19,Card payment Coastal Ferries PLC,-34.50\n2025-06-24,2025-06-24,Transfer out Rent,-950.00\n2025-06-30,2025-06-30,Interest,0.42",
+   "expected": {
+    "doctype": "bank_statement",
+    "doc_date": "2025-06-30",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Foo Credit Co.",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h243",
+   "filename": "Corporate/bank_details_notice.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Pinewood Muster BV                      Our ref: PM/LEG/2026/12\nHoofdweg 12                             Date: 20 April 2026\n1000 AA Probedam                        Your ref: -\n\nTo our customers and suppliers\n\nSubject: Notice of change of bank details\n\nPlease note that, with effect from 1 June 2026, all payments to Pinewood Muster BV must be made to our new account:\n\nIBAN NL91 ABNA 0417 1643 00\n\nPayments to the old account will be forwarded for a transition period only. Please update your records and confirm by reply if you have questions.\n\nYours faithfully,\nManagement\nPinewood Muster BV",
+   "expected": {
+    "doctype": "letter",
+    "doc_date": "2026-04-20",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Pinewood Muster BV",
+    "reference": "PM/LEG/2026/12",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h244",
+   "filename": "scans/ausweis_vorne.png",
+   "ext": "png",
+   "kind": "image",
+   "text": "IDENTITY CARD / AUSWEISKARTE\nSurname / Name        PR0BE\nGiven names           SABINE\nDate of birth         17.04.1985\nCard no.              X00000000\nValid until           12.08.2031\nNationality           UTO\n\nIDUTOX00000000<<<<<<<<<<<<<<<\n8504171F3108126UTO<<<<<<<<<<<4\nPROBE<<SABINE<<<<<<<<<<<<<<<<<",
+   "expected": {
+    "doctype": "other",
+    "doc_date": null,
+    "amount": null,
+    "currency": null,
+    "counterparty": null,
+    "reference": null,
+    "lang": null
+   }
+  },
+  {
+   "id": "h245",
+   "filename": "Mail/Orders/Your receipt from Demo Coffee Roasters.eml",
+   "ext": "eml",
+   "kind": "email",
+   "text": "Subject: Your receipt from Demo Coffee Roasters\nFrom: Demo Coffee Roasters <orders@mail.example.com>\nTo: Jules Specimen <jules.specimen@example.com>\nDate: Wed, 6 May 2026 19:03:12 +0000\n\n<table width=\"100%\" style=\"font-size:13px\">\n<tr><td colspan=\"2\"><b>Thanks for your order #DC-5521</b></td></tr>\n<tr><td>Subtotal</td><td align=\"right\">$36.00</td></tr>\n<tr><td>Discount (WELCOME10)</td><td align=\"right\">-$3.60</td></tr>\n<tr><td>Shipping</td><td align=\"right\">$5.50</td></tr>\n<tr><td><b>Total paid</b></td><td align=\"right\"><b>$37.90</b></td></tr>\n</table>\n<p>&nbsp;</p>\n<p>Paid by card on 2026-05-06.</p>",
+   "expected": {
+    "doctype": "receipt",
+    "doc_date": "2026-05-06",
+    "amount": 37.9,
+    "currency": "USD",
+    "counterparty": "Demo Coffee Roasters",
+    "reference": "DC-5521",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h246",
+   "filename": "scans/Angebot_Maler_0511.jpg",
+   "ext": "jpg",
+   "kind": "image",
+   "text": "Malerbetrieb Muster OHG\nFarbenweg 8 - 10115 Musterstadt\n\nAngebot Nr 26/041\nvom 11.05.2026\ngultig bis 11.06.2026\n\nWande streichen 120 m2 a 14,50      1.740,00\nDecken streichen 45 m2 a 12,90        580,50\nAbdeckmaterial pauschal                120,00\nSpachtelarbeiten                       464,37\nNetto                               2.904,87\n19 % MwSt                            551,93\nGesamt                           3.456,80 €\n\nWir bedanken uns fur Ihre Anfrage.",
+   "expected": {
+    "doctype": "quote",
+    "doc_date": "2026-05-11",
+    "amount": 3456.8,
+    "currency": "EUR",
+    "counterparty": "Malerbetrieb Muster OHG",
+    "reference": "26/041",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h247",
+   "filename": "Mahnungen/FB-M-0455.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Fliesenwerk Beispiel KG\nBrennofenweg 3 · 10179 Musterstadt\nbuchhaltung@mail.example.com\n\n2. MAHNUNG Nr. FB-M-0455\nGesamtforderung: 2.095,50 EUR\nZahlen Sie bitte bis zum 07.03.2026.\n\nDatum: 25.02.2026\nKunde: Hafenstrasse Demo GmbH\n\nOffene Posten:\nRechnung 26-0120 vom 12.01.2026                 840,00 EUR\nRechnung 26-0188 vom 02.02.2026               1.245,50 EUR\nMahngebühren (2 x 5,00 EUR)                      10,00 EUR\n\nBei weiterem Zahlungsverzug behalten wir uns rechtliche Schritte vor.",
+   "expected": {
+    "doctype": "reminder",
+    "doc_date": "2026-02-25",
+    "amount": 2095.5,
+    "currency": "EUR",
+    "counterparty": "Fliesenwerk Beispiel KG",
+    "reference": "FB-M-0455",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h248",
+   "filename": "Payroll/payslip_feb26_issued.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "FOXGLOVE EXAMPLE LTD\n12 Specimen Lane, Sampleton SA5 1AB\n\nPAYSLIP - February 2026\nIssued: 27 February 2026\nEmployee: Tomas Sample\nDate of birth: 03 Sep 1990\nNI number: QQ 12 34 56 C\n\nGross pay                         3,400.00\nIncome tax                         -420.20\nEmployee NI                        -176.35\nPension                            -170.00\nNet pay                           £2,633.45",
+   "expected": {
+    "doctype": "payslip",
+    "doc_date": "2026-02-27",
+    "amount": 2633.45,
+    "currency": "GBP",
+    "counterparty": "FOXGLOVE EXAMPLE LTD",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h249",
+   "filename": "scans/Zahlungserinnerung_ZE-26-004.jpg",
+   "ext": "jpg",
+   "kind": "image",
+   "text": "Elektro Probe e.K.\nWerkstr. 12 - 10119 Musterstadt\n\nZahlungserinnerung ZE-26-004\nDatum: 31.03.2026\n\nSehr geehrte Darnen und Herren,\nzu unserer Rechnung 26-0044 vom 02.03.2026 steht noch\nder Betrag von 318,75 EUR aus. Wir bitten Sie, diesen\nbis zum 15.04.2026 zu uberweisen.\n\nMit freundlichen GruBen\nElektro Probe e.K.",
+   "expected": {
+    "doctype": "reminder",
+    "doc_date": "2026-03-31",
+    "amount": 318.75,
+    "currency": "EUR",
+    "counterparty": "Elektro Probe e.K.",
+    "reference": "ZE-26-004",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h250",
+   "filename": "hr/payslip_2026-03.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Linden Demo Hotel AB\nHamngatan 3, Sampleton, Sweden\n\nPAYSLIP - March 2026\nEmployee: Jonas Test        Position: Front Office Supervisor\n\nMonthly salary                   SEK 32,500.00\nEvening and weekend supplement   SEK  2,150.00\nGross pay                        SEK 34,650.00\nPreliminary tax (28 %)          -SEK  9,702.00\n\nNet pay SEK 24,948.00 (approx. EUR 2,227.50 for information)\nPaid into the employee's bank account on the 25th.",
+   "expected": {
+    "doctype": "payslip",
+    "doc_date": "2026-03",
+    "amount": 24948.0,
+    "currency": "SEK",
+    "counterparty": "Linden Demo Hotel AB",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h251",
+   "filename": "Mail/Billing/Invoice 2026-0719 - March services.eml",
+   "ext": "eml",
+   "kind": "email",
+   "text": "Subject: Invoice 2026-0719 - March services\nFrom: Pinewood Muster BV <billing@mail.example.com>\nTo: Tomas Sample <tomas.sample@example.com>\nDate: Wed, 1 Apr 2026 08:12:44 +0200\nAttachments: invoice_2026-0719.pdf\n\n<html><body>\n<div style=\"font-family:Arial,sans-serif;font-size:14px\">\n<p>Hi&nbsp;Tomas,</p>\n<p>Your invoice <b>2026-0719</b> dated 2026-03-31 is ready. A PDF copy is attached.</p>\n<table border=\"0\" cellpadding=\"4\">\n<tr><td>Net&nbsp;amount</td><td>EUR&nbsp;1,500.00</td></tr>\n<tr><td>VAT&nbsp;21%</td><td>EUR&nbsp;315.00</td></tr>\n<tr><td><b>Total&nbsp;due</b></td><td><b>EUR&nbsp;1,815.00</b></td></tr>\n</table>\n<p>Please pay within 14 days.<br>Kind regards,<br>Pinewood Muster BV</p>\n</div></body></html>",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-04-01",
+    "amount": 1815.0,
+    "currency": "EUR",
+    "counterparty": "Pinewood Muster BV",
+    "reference": "2026-0719",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h252",
+   "filename": "Orders/OC-26-0331.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Maple Test Corp.\n310 Placeholder Boulevard, Exampletown, EX 00010\n\nORDER CONFIRMATION OC-26-0331\nDate: 2026-03-30\nCustomer PO: HS-4471\n\nItem                    Qty      Price      Total\nRack mount kit            6    $410.00  $2,460.00\nCable bundle              8     $48.00    $384.00\nInstallation service      1    $136.00    $136.00\n\nOrder total: $2,980.00\nEstimated ship date: 2026-04-14. This is not an invoice.",
+   "expected": {
+    "doctype": "other",
+    "doc_date": "2026-03-30",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Maple Test Corp.",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h253",
+   "filename": "scans/fuel_0403.jpg",
+   "ext": "jpg",
+   "kind": "image",
+   "text": "Roadside Fuel Stop Ltd\nHighway Km 14, Sampletown\nPetrol 20 L @ 272.00       5,440\nEngine oi1 1 pc            1,850\nTOTAL ISK 7,290\nCash\n03-Apr-2026 18:12\nThank y0u",
+   "expected": {
+    "doctype": "receipt",
+    "doc_date": "2026-04-03",
+    "amount": 7290.0,
+    "currency": "ISK",
+    "counterparty": "Roadside Fuel Stop Ltd",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h254",
+   "filename": "Kooperationsvereinbarung_KV-2026-03.txt",
+   "ext": "txt",
+   "kind": "text",
+   "text": "Kooperationsvereinbarung / Cooperation Agreement\nNr. KV-2026-03\nVom 3 March 2026\n\nZwischen / Between:\nFoo Logistics Oy (\"Partner A\") and Bar Fabrik AB (\"Partner B\")\n\n1. Zweck / Purpose\nThe partners cooperate on joint delivery of spare parts to customers in northern Europe.\n2. Aufgabenverteilung / Responsibilities\nPartner A handles transport and warehousing, Partner B handles production and quality control.\n3. Dauer / Duration\nDie Vereinbarung gilt bis auf Weiteres. Either partner may terminate with three months' notice.\n4. Vertraulichkeit / Confidentiality\nBoth partners keep all business information confidential.\n\nUnterschriften / Signatures: ______________   ______________",
+   "expected": {
+    "doctype": "contract",
+    "doc_date": "2026-03-03",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Foo Logistics Oy",
+    "reference": "KV-2026-03",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h255",
+   "filename": "Bank/Quarzbank_Umsatz_2026-04.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Quarzbank AG\nBankhaus Probeplatz 1 · 10115 Musterstadt\nservice@mail.example.com\n\nUmsatzübersicht Geschäftskonto\nZeitraum: 01.04.2026 - 30.04.2026\nAnfangssaldo                                              7.420,35\nDatum   Buchungstext                                   Soll      Haben\n03.04.  Miete Büro Probeweg                          1.250,00           \n06.04.  Zahlungseingang Hafenstrasse Demo GmbH                  3.480,00\n09.04.  Lastschrift Nordlicht Muster GmbH            1.088,20           \n14.04.  Kartenzahlung Elektro Probe e.K.               318,75           \n17.04.  Gutschrift Kiesel & Probe OHG                             640,00\n22.04.  Entgelt Kontoführung                             9,90           \n28.04.  SEPA-Überweisung Tannenwald Test AG          2.376,00           \n30.04.  Zinsgutschrift                                              1,86\nEndsaldo                                                  6.499,36\nSeite 1 von 1",
+   "expected": {
+    "doctype": "bank_statement",
+    "doc_date": "2026-04-30",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Quarzbank AG",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h256",
+   "filename": "export/zeiten_maerz.csv",
+   "ext": "csv",
+   "kind": "text",
+   "text": "Datum;Projekt;Stunden;Bemerkung\n02.03.2026;Nordlicht;7,5;Konzept\n03.03.2026;Nordlicht;8,0;Workshop\n04.03.2026;Hafenstrasse;6,0;Beratung\n09.03.2026;Nordlicht;7,0;Umsetzung\n10.03.2026;Hafenstrasse;5,5;Bericht",
+   "expected": {
+    "doctype": "other",
+    "doc_date": null,
+    "amount": null,
+    "currency": null,
+    "counterparty": null,
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h257",
+   "filename": "Personal/resignation.txt",
+   "ext": "txt",
+   "kind": "text",
+   "text": "To:\nCobalt Demo S.L.\nHuman Resources\nCalle Muestra 10\n00000 Ejemplo\n\nFrom:\nLucia Example\nRose Lane 2\nSampleton SA1 6TT\nlucia.example@mail.example.com\n\n1 June 2026\n\nDear Sir or Madam,\n\nI hereby resign from my position as Operations Analyst with effect from the end of my notice period. Thank you for the opportunities and support during my time with the company.\n\nYours faithfully,\nLucia Example",
+   "expected": {
+    "doctype": "letter",
+    "doc_date": "2026-06-01",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Lucia Example",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h258",
+   "filename": "collections/final_notice_2026-03.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Zebra Demo Pty Ltd\nAccounts Receivable\n88 Specimen Street, Exampleton, EX 00030\n\nFINAL NOTICE   12 March 2026\n\nCustomer: Granite Test Logistics Corp.\n\nOverdue invoices: INV-884 (AUD 3,100.00, due 2026-01-30) and INV-891 (AUD 2,000.00, due 2026-02-14).\nLate fees applied: AUD 140.00.\n\nTOTAL NOW DUE: AUD 5,240.00\n\nPayment must reach us within 5 business days.",
+   "expected": {
+    "doctype": "reminder",
+    "doc_date": "2026-03-12",
+    "amount": 5240.0,
+    "currency": "AUD",
+    "counterparty": "Zebra Demo Pty Ltd",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h259",
+   "filename": "belege/CH/baeckerei_0314.jpg",
+   "ext": "jpg",
+   "kind": "image",
+   "text": "BÄCKEREI TESTHOF\nDorfstrasse 4, 9999 Probedorf\nZopf 500g              Fr. 4.60\nGipfel i 4x            Fr. 5.20\nKaffee                 Fr. 4.50\nMinera1 5dl            Fr. 4.20\n-----------------------------\nTotal Fr. 18.50\nBar                    Fr. 20.00\nRückgeld               Fr. 1.50\n14.3.2026 08:42\nBesten Dank!",
+   "expected": {
+    "doctype": "receipt",
+    "doc_date": "2026-03-14",
+    "amount": 18.5,
+    "currency": "CHF",
+    "counterparty": "BÄCKEREI TESTHOF",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h260",
+   "filename": "scans/2025-09-21_obsthof.jpg",
+   "ext": "jpg",
+   "kind": "image",
+   "text": "Obsthof Probe e.K.\nAm Hang 4 - 10117 Musterstadt\nTel 0000 767676\n\nRechnunQ Nr 0993\nDatum 21.09.2025\nLieferschein-Nr 4410\nZahlbar b1s 05.10.2025\n\nAepfel 120 kg a 1,80       216,00\nBirnen  80 kg a 2,10       168,00\nSumme Ware (7 % MwSt)      384,00\nMwSt 7 %                    26,88\nPfandkisten 10 a 5,00       50,00\nRechnungsbetraQ          460,88 EUR\nBei Zahlung bis 28.09.2025 2 % Skonto (9,22 EUR)",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2025-09-21",
+    "amount": 460.88,
+    "currency": "EUR",
+    "counterparty": "Obsthof Probe e.K.",
+    "reference": "0993",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h261",
+   "filename": "receipts/online/CD-77412.png",
+   "ext": "png",
+   "kind": "image",
+   "text": "Cobalt Demo S.L.\nCalle Muestra 10, 00000 Ejemplo\nReceipt - Order CD-77412\n10 Apr 2026\nItems (3)                  €98.00\nDiscount code SAVE10       -€9.80\nShipping                    €6.95\nSubtotai after discount    €88.20\nTotal paid                 €95.15\nPaid by card. VAT incl. 21%\nThanks for shopping with us",
+   "expected": {
+    "doctype": "receipt",
+    "doc_date": "2026-04-10",
+    "amount": 95.15,
+    "currency": "EUR",
+    "counterparty": "Cobalt Demo S.L.",
+    "reference": "CD-77412",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h262",
+   "filename": "Mail/Sales/Quotation Q-26-0905.eml",
+   "ext": "eml",
+   "kind": "email",
+   "text": "Subject: Quotation Q-26-0905 - hosting setup\nFrom: Maple Test Corp. <sales@mail.example.com>\nTo: ops@mail.example.com\nDate: Wed, 24 Jun 2026 15:20:00 -0400\nAttachments: Q-26-0905.pdf\n\n<p>Hello,</p>\n<p>thanks for your interest. Our quotation <b>Q-26-0905</b> for the hosting setup:</p>\n<table>\n<tr><td>Setup and migration</td><td>CAD 2,400.00</td></tr>\n<tr><td>12 months managed hosting</td><td>CAD 1,200.00</td></tr>\n<tr><td><b>Total</b></td><td><b>CAD 3,600.00</b></td></tr>\n</table>\n<p>The offer is valid until 2026-07-15.</p>\n<p>Maple Test Corp.&nbsp;|&nbsp;Sales</p>",
+   "expected": {
+    "doctype": "quote",
+    "doc_date": "2026-06-24",
+    "amount": 3600.0,
+    "currency": "CAD",
+    "counterparty": "Maple Test Corp.",
+    "reference": "Q-26-0905",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h263",
+   "filename": "Spesen/2026-02/Gasthaus_Testhirsch.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Gasthaus Zum Testhirsch e.K.\nMarktstraße 8 · 10117 Musterstadt\n\nRECHNUNG Nr. 20517   Tisch 7\n21.02.2026 19:55\n\n2 Schnitzel Wiener Art           33,60\n2 Bier 0,5 l                      9,60\n1 Salat gemischt                  7,20\n2 Tiramisu                       11,60\n2 Kaffee                          6,40\nZwischensumme                    68,40\nGutschein                        -5,00\nTrinkgeld                         6,00\nGesamtbetrag                  69,40 EUR\n\nBezahlt mit Karte. Vielen Dank für Ihren Besuch!\nPreise inkl. MwSt.",
+   "expected": {
+    "doctype": "receipt",
+    "doc_date": "2026-02-21",
+    "amount": 69.4,
+    "currency": "EUR",
+    "counterparty": "Gasthaus Zum Testhirsch e.K.",
+    "reference": "20517",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h264",
+   "filename": "Eingang/NL-26-00418.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "NORDLICHT MUSTER GMBH\nProbeweg 7\n10115 Musterstadt\nservice@mail.example.com\n\nRechnung\nNr.\nNL-26-00418\nDatum\n03.02.2026\nLieferung\n28.01.2026\nFällig\n17.02.2026\nKunde\nQuarzwerk Beispiel KG\n\nBezeichnung\nMenge\nPreis\nBetrag\nLaborwaage Typ 3\n2\n412,00\n824,00\nKalibrierset\n3\n58,50\n175,50\nRabatt 10 % auf Warenwert\n-99,95\nVersand\n14,90\nNetto\n914,45\nUSt 19 %\n173,75\nBrutto\n1.088,20 EUR",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-02-03",
+    "amount": 1088.2,
+    "currency": "EUR",
+    "counterparty": "NORDLICHT MUSTER GMBH",
+    "reference": "NL-26-00418",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h265",
+   "filename": "Rechnungen/AT/2026-0007_Tannenwald.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Tannenwald Test GmbH\nProbegasse 5 | 1099 Beispielhausen | Österreich\nTel. +43 000 0000000 | office@mail.example.com\nUID-Nr. ATU00000000\n\nRECHNUNG Nr. 2026/0007\nRechnungsdatum: 15. Jänner 2026\nLieferdatum: 12. Jänner 2026\nZahlbar bis: 14. Februar 2026\n\nWir erlauben uns, fur die gelieferten Waren den Betrag von € 2.376,00 inkl. 20 % USt zu verrechnen.\n\nPos  Bezeichnung                    Menge    Preis      Summe\n1    Burotisch hohenverstellbar         4   € 345,00   € 1.380,00\n2    Ro11container                      4   € 150,00     € 600,00\n\nNettobetrag                                          € 1.980,00\n20 % USt                                               € 396,00\nRechnungsbetrag                                      € 2.376,00\n\nEs gelten unsere Allgemeinen Geschaftsbedingungen.",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-01-15",
+    "amount": 2376.0,
+    "currency": "EUR",
+    "counterparty": "Tannenwald Test GmbH",
+    "reference": "2026/0007",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h266",
+   "filename": "Steuern/2025/ESt_Berechnung_2025.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Sabine Probe\nLerchenweg 12 · 10117 Musterstadt\n\nEinkommensteuer 2025 - Berechnungsübersicht (zur Abgabe vorbereitet)\nErstellt am 18.05.2026\n\nEinkünfte aus nichtselbständiger Arbeit         41.800,00 €\nWerbungskosten                                   -1.640,00 €\nSonderausgaben                                   -3.250,00 €\nZu versteuerndes Einkommen                      36.910,00 €\nFestzusetzende Einkommensteuer                   5.386,00 €\nBereits einbehaltene Lohnsteuer                  6.590,00 €\nVoraussichtliche Erstattung                      1.204,00 €\n\nDie Berechnung ist eine eigene Schätzung und nicht verbindlich.",
+   "expected": {
+    "doctype": "tax_document",
+    "doc_date": "2026-05-18",
+    "amount": 1204.0,
+    "currency": "EUR",
+    "counterparty": "Sabine Probe",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h267",
+   "filename": "Travel/Nordics/hotel_folio_40881.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Linden Demo Hotel AB\nHamngatan 3, Sampleton, Exampleland\nreservations@mail.example.com\n\nGUEST RECEIPT - SETTLED\nFolio 40881\nGuest: Lucia Example\nArrival: 05-Feb-2026   Departure: 08-Feb-2026\nPrinted: 08-Feb-2026\n\nRoom, 3 nights x SEK 620.00        SEK 1,860.00\nBreakfast, 2 guests x 3 days         SEK 450.00\n-----------------------------------------------\nTotal paid                         SEK 2,310.00\nIndicative only: EUR 206.25 at 11.2000. Charged in SEK.",
+   "expected": {
+    "doctype": "receipt",
+    "doc_date": "2026-02-08",
+    "amount": 2310.0,
+    "currency": "SEK",
+    "counterparty": "Linden Demo Hotel AB",
+    "reference": "40881",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h268",
+   "filename": "Mahnungen/CH/Mahnung_26-114.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Garage Probehof AG\nGaragenweg 1 · 9999 Probedorf\n\nMahnung Nr. 26-114\nDatum: 3.4.2026\n\nRechnung 14872 vom 10.1.2026          Fr. 1'346.40\nMahngebuhr                            Fr.    20.00\nTotal zu zahlen                       Fr. 1'366.40\n\nZah1bar bis 13.4.2026. Bitte beachten Sie, dass bei weiterem Verzug die Betre1bung eingele1tet wird.",
+   "expected": {
+    "doctype": "reminder",
+    "doc_date": "2026-04-03",
+    "amount": 1366.4,
+    "currency": "CHF",
+    "counterparty": "Garage Probehof AG",
+    "reference": "26-114",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h269",
+   "filename": "Protokolle/Projekt_Nordlicht_2026-03-17.docx",
+   "ext": "docx",
+   "kind": "office",
+   "text": "Besprechungsprotokoll Projekt Nordlicht\n\nDatum: 17.03.2026\nTeilnehmer: Hans Demo, Sabine Probe, Tomas Sample\n\n1. Stand\nDie Lieferung der Sensoren ist abgeschlossen. Die Rechnung des Lieferanten ist noch nicht eingegangen.\n2. Verträge\nDer Wartungsvertrag wird im April besprochen. Entwurf liegt vor.\n3. Offene Punkte\nBelege der Reisekosten sammeln; Zeitplan bis Ende des Monats aktualisieren.\n\nProtokoll: Sabine Probe",
+   "expected": {
+    "doctype": "other",
+    "doc_date": "2026-03-17",
+    "amount": null,
+    "currency": null,
+    "counterparty": null,
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h270",
+   "filename": "Kunden/Kiesel_Probe_Schlussrechnung_26-0087.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Kiesel & Probe OHG · Werkstattgasse 3 · 10117 Musterstadt\ninfo@mail.example.com\n\nSCHLUSSRECHNUNG 26-0087\nRechnungsbetrag brutto: 5.950,00 EUR\nabzgl. Anzahlung (erhalten 05.01.2026): -2.000,00 EUR\nRestbetrag: 3.950,00 EUR\n\nDatum: 24.02.2026\nAbnahme: 20.02.2026\nZahlbar bis: 10.03.2026\n\nLeistungen laut Auftrag vom 18.12.2025:\nPlanung und Aufmaß                       1 x   1.400,00\nMontage Küchenzeile (Tage)               4 x   2.600,00   (je 650,00)\nMaterial und Zubehör                     1 x   1.000,00\nSumme netto                                    5.000,00\n19 % USt                                         950,00\nSeite 1 von 1",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-02-24",
+    "amount": 5950.0,
+    "currency": "EUR",
+    "counterparty": "Kiesel & Probe OHG",
+    "reference": "26-0087",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h271",
+   "filename": "Rechnungen/CH/20260417_Bergkristall.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Bergkristall Probe AG\nMusterweg 9 · 9999 Probestadt · Schweiz\nTel. +41 00 000 00 00 · info@mail.example.com\n\nRECHNUNG 20260417\nTotal zu zahlen: CHF 2'845.60 (inkl. 8.1 % MWST)\nRechnungsdatum 6.3.2026\nLeistungsdatum 27.2.2026\nZah1bar innert 30 Tagen (bis 5.4.2026)\n\nKunde: Hafenstrasse Demo GmbH, Seeweg 2, 9998 Probestadt\n\nBeratunq Lagerlogistik     12 Std. à 118.00      1'416.00\nReisespesen pauschal                               216.40\nSchulungsunterlagen         20 Stk. à 50.00      1'000.00\nZwischensumme exkl. MWST                         2'632.40\nMWST 8.1 %                                         213.22\nRundung                                             -0.02\nTotal CHF                                        2'845.60\nSeite 1/1",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-03-06",
+    "amount": 2845.6,
+    "currency": "CHF",
+    "counterparty": "Bergkristall Probe AG",
+    "reference": "20260417",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h272",
+   "filename": "Taxes/Corporation_tax_computation_YE2026-03.docx",
+   "ext": "docx",
+   "kind": "office",
+   "text": "Heron Demo Ltd\n8 Specimen Wharf, Sampleton SA6 4QT\n\nCORPORATION TAX COMPUTATION\nAccounting period: 1 April 2025 to 31 March 2026\nPrepared on 9 June 2026\n\nProfit per accounts                      £212,400.00\nAdd back: depreciation                    £18,900.00\nAdd back: client entertainment             £3,150.00\nLess: capital allowances                 -£27,600.00\nTaxable profit                           £206,850.00\nCorporation tax at 25%                    £51,712.50\nLess: payments on account                -£40,000.00\nBalance of tax payable                    £11,712.50\n\nDraft for review by the directors before filing.",
+   "expected": {
+    "doctype": "tax_document",
+    "doc_date": "2026-06-09",
+    "amount": 11712.5,
+    "currency": "GBP",
+    "counterparty": "Heron Demo Ltd",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h273",
+   "filename": "Korrespondenz/Reservierung_RES-2026-033.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Gasthof Probeberg GmbH\nDorfplatz 1 · 1099 Beispielhausen · Österreich\nreservierung@mail.example.com\n\nUnser Zeichen: RES/2026/033\nBeispielhausen, 12. Jänner 2026\n\nFrau Marta Beispiel\nLindenweg 9\n10117 Musterstadt\n\nBestätigung Ihrer Reservierung\n\nSehr geehrte Frau Beispiel,\n\nwir bestätigen gerne Ihre Reservierung eines Doppelzimmers für zwei Nächte. Der Preis beträgt € 420,00 inklusive Frühstück und wird bei der Abreise bezahlt.\n\nWir freuen uns auf Ihren Besuch.\nIhr Gasthof Probeberg",
+   "expected": {
+    "doctype": "letter",
+    "doc_date": "2026-01-12",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Gasthof Probeberg GmbH",
+    "reference": "RES/2026/033",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h274",
+   "filename": "Fornitori/Orchid_2026-114.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Orchid Sample S.p.A.\nVia Esempio 12 - 00000 Campione (XX) - Italy\namministrazione@mail.example.com\nP.IVA IT00000000000\n\nFATTURA / INVOICE n. 2026/114\nData fattura / Invoice date: 14/02/2026\nData consegna / Delivery date: 10/02/2026\nScadenza / Due date: 16/03/2026\n\nCliente / Customer: Delta Beispiel AS\n\nDescrizione / Item                    Qty    Prezzo     Importo\nHydraulic hose assembly                40     18,50      740,00\nFittings kit                           20     13,00      260,00\n\nImponibile / Net amount             EUR 1.000,00\nIVA 22 %                            EUR   220,00\nTotale documento / Total            EUR 1.220,00\n\nPayment: bank transfer within 30 days / pagamento a 30 giorni.",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-02-14",
+    "amount": 1220.0,
+    "currency": "EUR",
+    "counterparty": "Orchid Sample S.p.A.",
+    "reference": "2026/114",
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h275",
+   "filename": "Handwerk/Rechnung_Heizung_2026-031.docx",
+   "ext": "docx",
+   "kind": "office",
+   "text": "Sonnenhof Demo e.K.\nHeizung · Sanitär · Solar\nBrunnenstraße 11, 10119 Musterstadt\nTelefon +49 000 454545\n\nFrau Lucia Beispiel\nRosenweg 2\n10117 Musterstadt\n\nMusterstadt, 18.03.2026\n\nRechnung Nr. 2026-031\n\nSehr geehrte Frau Beispiel,\n\nfür die Reparatur Ihrer Heizungsanlage am 12.03.2026 (Kundendienst 3,5 Std. zu je 78,00 EUR, Material 112,40 EUR, jeweils netto) berechnen wir Ihnen insgesamt 458,63 EUR inkl. 19 % MwSt. Der Nettobetrag beträgt 385,40 EUR.\n\nBitte überweisen Sie den Betrag bis zum 01.04.2026 unter Angabe der Rechnungsnummer.\n\nMit freundlichen Grüßen\nSonnenhof Demo e.K.",
+   "expected": {
+    "doctype": "invoice",
+    "doc_date": "2026-03-18",
+    "amount": 458.63,
+    "currency": "EUR",
+    "counterparty": "Sonnenhof Demo e.K.",
+    "reference": "2026-031",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h276",
+   "filename": "Bank/AT/Auszug_2026-01.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Probebank AG\nBankgasse 2 · 1099 Beispielhausen · Österreich\n\nKontoauszug vom 31. Jänner 2026\nAuszugsnummer 01/2026\nGirokonto   Inhaber: Lucia Example\n\nAlter Saldo                                  1.980,20\nDatum   Buchung                                  Betrag       Saldo\n02.01.  Gehalt Tannenwald Test GmbH             2.317,66     4.297,86\n05.01.  Miete Jänner                             -690,00     3.607,86\n09.01.  Strom und Gas                             -88,50     3.519,36\n15.01.  Geldautomat Beispielhausen               -100,00     3.419,36\n20.01.  Überweisung Versicherung                  -61,20     3.358,16\n27.01.  Spesen                                     -3,40     3.354,76\nNeuer Saldo EUR 3.354,76",
+   "expected": {
+    "doctype": "bank_statement",
+    "doc_date": "2026-01-31",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Probebank AG",
+    "reference": "01/2026",
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h277",
+   "filename": "letters/query_invoice_55-1209.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Foo Components Inc\nCustomer Accounts\n17 Placeholder Road\nExampletown EX 00040\n\nTomas Sample\n9 Willow Close\nSampleton SA3 4QP\ntomas.sample@example.com\n\n14 March 2026\n\nDear Sirs,\n\nRe: Invoice 55-1209\n\nI received your invoice 55-1209 for GBP 340.00 today. It charges two service visits, but only one took place. Please send me a corrected invoice or a credit note, and confirm that no reminder fees will be charged in the meantime.\n\nYours faithfully,\nTomas Sample",
+   "expected": {
+    "doctype": "letter",
+    "doc_date": "2026-03-14",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Tomas Sample",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h278",
+   "filename": "scans/notice_of_assessment_2025.png",
+   "ext": "png",
+   "kind": "image",
+   "text": "Example Tax Office\nNotice of assessment 2025\nDate of issue: 12 May 2026\nTaxpayer: Tomas Sample\n\nTax due for the year      AUD 6,180.40\nTax already paid          AUD 7,421.20\nRefund due                AUD 1,240.80\n\nThe refund wi11 be paid within 14 days.",
+   "expected": {
+    "doctype": "tax_document",
+    "doc_date": "2026-05-12",
+    "amount": 1240.8,
+    "currency": "AUD",
+    "counterparty": "Example Tax Office",
+    "reference": null,
+    "lang": "en"
+   }
+  },
+  {
+   "id": "h279",
+   "filename": "Privat/Kuendigung_Mobilabo.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Funkwerk Probe AG\nKundendienst\nPostfach 77\n9999 Probestadt\n\nLucia Example\nSeeweg 14\n9999 Probestadt\nlucia.example@mail.example.com\n\nProbestadt, 14.3.2026\n\nBetreff: Kündigung Mobilabonnement (Ihre Vertragsnummer 2210-77)\n\nSehr geehrte Darnen und Herren\n\nHiermit kundige ich mein Mobi1abonnement ordent1ich auf den nachstmoglichen Termin. Bitte bestatigen Sie mir den Eingang dieser Kundigung und das Vertragsende schriftlich.\n\nFreundliche Grüsse\nLucia Example",
+   "expected": {
+    "doctype": "letter",
+    "doc_date": "2026-03-14",
+    "amount": null,
+    "currency": null,
+    "counterparty": "Lucia Example",
+    "reference": null,
+    "lang": "de"
+   }
+  },
+  {
+   "id": "h280",
+   "filename": "Steuern/CH/Steuerrechnung_2025.pdf",
+   "ext": "pdf",
+   "kind": "pdf",
+   "text": "Gemeinde Beispielstadt · Steueramt\nGemeindehausplatz 1 · 9998 Beispielstadt\n\nSteuerrechnung 2025\nRechnungsdatum 10.2.2026\nFällig am 31.3.2026\n\nGemeindesteuer                      Fr. 2'940.15\nKirchensteuer                       Fr.   352.80\nFeuerwehrersatzabgabe               Fr.   120.00\nTotal zu zahlen                     Fr. 3'412.95\n\nBitte verwenden Sie den beiliegenden Einzahlungsschein.",
+   "expected": {
+    "doctype": "tax_document",
+    "doc_date": "2026-02-10",
+    "amount": 3412.95,
+    "currency": "CHF",
+    "counterparty": "Gemeinde Beispielstadt · Steueramt",
+    "reference": null,
+    "lang": "de"
+   }
+  }
+ ]
+}

@@ -49,6 +49,32 @@ struct AskDot: View {
     var body: some View { Circle().fill(color).frame(width: 7, height: 7).alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 } }
 }
 
+/// An SF Symbol drawn with the one app configuration (MSEStyle.symbolConfig), so the Ask view adds no second symbol size.
+struct AskSymbol: View {
+    let name: String
+    var body: some View {
+        if let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(MSEStyle.symbolConfig) {
+            Image(nsImage: image).renderingMode(.template)
+        } else {
+            Image(systemName: name)
+        }
+    }
+}
+
+/// The measure of the Ask answer. The cap on a line is MSEStyle.askMeasure average characters of the answer's own font,
+/// not a fixed pixel width: the average advance of a to z and a space (27 characters) times askMeasure. It follows the
+/// font size (the one constant below is also the size AskAnswer draws with), and it is a maximum only, so a narrower
+/// window still gives the text less and it reflows.
+enum AskMeasure {
+    static let answerFontSize: CGFloat = 14.5
+    static let width: CGFloat = {
+        let font = NSFont.systemFont(ofSize: answerFontSize)
+        let alphabet = "abcdefghijklmnopqrstuvwxyz "
+        let advance = (alphabet as NSString).size(withAttributes: [.font: font]).width / CGFloat(alphabet.count)
+        return (advance * CGFloat(MSEStyle.askMeasure)).rounded()
+    }()
+}
+
 /// The sidebar material behind the recent chats, like Finder's sidebar.
 struct AskSidebarBackground: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
@@ -61,17 +87,32 @@ struct AskSidebarBackground: NSViewRepresentable {
     func updateNSView(_ v: NSVisualEffectView, context: Context) {}
 }
 
-/// The small "cloud" / "local" badge.
+/// The small "cloud" / "local" badge. Its text is at least 4.5:1 on its own (opaque) fill in light and dark: a dark colour on
+/// a pale fill in light, a pale colour on a deep fill in dark. The system green and accent colours on their 14-16 % tints
+/// measured 1.6 (local, light) and 2.8 to 2.9 (cloud). The pairs are built as MSEStyle.secondary is (SearchView.swift):
+/// opaque values chosen per appearance, so the badge never stays light or dark.
 struct AskWhereBadge: View {
     let local: Bool
+    private static func dynamic(light: UInt32, dark: UInt32) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let rgb = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+            return NSColor(srgbRed: CGFloat((rgb >> 16) & 0xFF) / 255, green: CGFloat((rgb >> 8) & 0xFF) / 255,
+                           blue: CGFloat(rgb & 0xFF) / 255, alpha: 1)
+        }
+    }
+    static let localText = Color(nsColor: dynamic(light: 0x17612A, dark: 0x9BE8AB))     // green
+    static let localFill = Color(nsColor: dynamic(light: 0xD5EEDA, dark: 0x21402A))
+    static let cloudText = Color(nsColor: dynamic(light: 0x0B4DA8, dark: 0xA5CDFF))     // blue
+    static let cloudFill = Color(nsColor: dynamic(light: 0xD3E4FA, dark: 0x1D3759))
+
     var body: some View {
         HStack(spacing: 3) {
             Image(systemName: local ? "desktopcomputer" : "cloud").font(.system(size: 9.5, weight: .medium))
             Text(local ? "local" : "cloud").font(.system(size: 10.5, weight: .medium))
         }
         .padding(.horizontal, 6).padding(.vertical, 1.5)
-        .background(RoundedRectangle(cornerRadius: 5).fill(local ? AskColors.okSoft : AskColors.glow))
-        .foregroundStyle(local ? AskColors.ok : AskColors.prompt)
+        .background(RoundedRectangle(cornerRadius: 5).fill(local ? Self.localFill : Self.cloudFill))
+        .foregroundStyle(local ? Self.localText : Self.cloudText)
         .help(local ? "Answered on this Mac" : "Answered by a cloud model")
     }
 }
@@ -215,22 +256,10 @@ struct AskChatRail: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button { m.newChat() } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "square.and.pencil").font(.system(size: 13)).foregroundStyle(AskColors.prompt).frame(width: 18)
-                    Text("New Chat").font(.system(size: 13))
-                    Spacer()
-                    Text("⌘N").font(.system(size: 11)).foregroundStyle(AskColors.dim)
-                }
-                .foregroundStyle(AskColors.ink)
-                .padding(.horizontal, 8).padding(.vertical, 5)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .padding(.top, 12)
-            Text("Recent").font(.system(size: 11, weight: .semibold)).foregroundStyle(AskColors.dim).padding(.top, 8).padding(.leading, 8).padding(.bottom, 2)
+            // New Chat lives in the header (AskHeader): one entry, not two. ⌘N still works (AskViewController).
+            Text("Recent").font(.system(size: 11, weight: .semibold)).foregroundStyle(AskColors.faded).padding(.top, 14).padding(.leading, 8).padding(.bottom, 2)
             if m.chats.isEmpty {
-                Text("Your chats appear here. They stay on this Mac.").font(.system(size: 12)).foregroundStyle(AskColors.dim).padding(.horizontal, 8)
+                Text("Your chats appear here. They stay on this Mac.").font(.system(size: 12)).foregroundStyle(AskColors.faded).padding(.horizontal, 8)
             } else {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 1) {
@@ -256,13 +285,13 @@ struct AskChatRow: View {
         HStack(alignment: .center, spacing: 2) {
             Button { m.open(chat.id) } label: {
                 HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: "bubble.left").font(.system(size: 12)).foregroundStyle(on ? AskColors.prompt : AskColors.ink2).frame(width: 18).padding(.top, 1)
+                    Image(systemName: "bubble.left").font(.system(size: 12)).foregroundStyle(on ? AskColors.prompt : AskColors.faded).frame(width: 18).padding(.top, 1)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(chat.title.isEmpty ? "Untitled" : chat.title)
                             .font(.system(size: 13, weight: on ? .medium : .regular)).foregroundStyle(AskColors.ink)
                             .lineLimit(2).multilineTextAlignment(.leading)
                         Text("\(chat.turns.count) question\(chat.turns.count == 1 ? "" : "s") · \(AskText.ago(chat.updated))\(chat.route == "local" ? " · local" : "")")
-                            .font(.system(size: 11)).foregroundStyle(AskColors.dim).lineLimit(1)
+                            .font(.system(size: 11)).foregroundStyle(AskColors.faded).lineLimit(1)
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -271,7 +300,7 @@ struct AskChatRow: View {
             .buttonStyle(.plain)
             if hover || on {
                 Button { m.remove(chat.id) } label: {
-                    Image(systemName: "xmark").font(.system(size: 9, weight: .bold)).foregroundStyle(AskColors.dim).frame(width: 18, height: 18)
+                    Image(systemName: "xmark").font(.system(size: 9, weight: .bold)).foregroundStyle(AskColors.faded).frame(width: 18, height: 18)
                 }
                 .buttonStyle(.plain).help("Remove this chat").opacity(hover ? 1 : 0.0)
             }
@@ -309,13 +338,13 @@ struct AskMain: View {
                     if m.overlay == .folder { AskFolderPicker(m: m) } else { AskModelMenu(m: m) }
                 }
                 .frame(maxWidth: .infinity, alignment: m.overlay == .model ? .trailing : .leading)
-                .padding(.horizontal, 22)
+                .padding(.horizontal, MSEStyle.contentInset)
                 .padding(.bottom, composerH + 2)
             }
             if m.mentionOpen && !m.mentionItems.isEmpty {
                 AskMentionList(m: m)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 22)
+                    .padding(.horizontal, MSEStyle.contentInset)
                     .padding(.bottom, composerH + 2)
             }
         }
@@ -331,11 +360,15 @@ struct AskHeader: View {
             Text(m.currentChat?.title ?? "New chat")
                 .font(.system(size: 13, weight: .semibold)).foregroundStyle(AskColors.ink).lineLimit(1)
             Spacer()
-            if m.currentChat != nil {
-                Button("+ New chat") { m.newChat() }.buttonStyle(AskGhostStyle()).help("Start a new chat (the context of this one is not carried over)")
+            if m.currentChat != nil {          // an empty chat is already new: nothing to start
+                Button { m.newChat() } label: {
+                    HStack(spacing: 5) { AskSymbol(name: "square.and.pencil"); Text("New Chat") }
+                }
+                .buttonStyle(AskGhostStyle()).help("New Chat (⌘N). The context of this chat is not carried over.")
             }
         }
-        .padding(.horizontal, 22).padding(.vertical, 9)
+        .padding(.horizontal, MSEStyle.contentInset).padding(.vertical, 9)
+        .frame(minHeight: 42)               // the height with the button, so the rule does not jump when the first question is sent
         .background(AskColors.bg)
         .overlay(alignment: .bottom) { Rectangle().fill(AskColors.rule).frame(height: 1) }
     }
@@ -360,8 +393,8 @@ struct AskThread: View {
                     Color.clear.frame(height: 1).id("bottom")
                 }
                 .frame(maxWidth: 860, alignment: .leading)
-                .padding(.horizontal, 26).padding(.top, 14).padding(.bottom, 10)
-                .frame(maxWidth: .infinity)
+                .padding(.horizontal, MSEStyle.contentInset).padding(.top, 14).padding(.bottom, 10)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
             .environment(\.openURL, OpenURLAction { url in
                 guard url.scheme == "mysearch-cite", let turn = url.host, let n = Int(url.lastPathComponent) else { return .systemAction }
@@ -388,9 +421,9 @@ struct AskEmptyState: View {
                 Image(systemName: "text.bubble").font(.system(size: 22, weight: .light)).foregroundStyle(AskColors.prompt)
                 Text("Ask your documents").font(.system(size: 20, weight: .semibold)).foregroundStyle(AskColors.ink)
             }
-            Text(message).font(.system(size: 13.5)).foregroundStyle(AskColors.ink2).fixedSize(horizontal: false, vertical: true)
+            Text(message).font(.system(size: 13.5)).foregroundStyle(AskColors.faded).fixedSize(horizontal: false, vertical: true)
             if m.statusFailed == false, m.status == nil, m.isBusy {
-                Text("Connecting…").font(.system(size: 12)).foregroundStyle(AskColors.dim)
+                Text("Connecting…").font(.system(size: 12)).foregroundStyle(AskColors.faded)
             }
             if let s = m.status, s.available, !s.enabled {
                 Button("Turn on Ask") { m.enableAsk() }.buttonStyle(AskGhostStyle(primary: true))
@@ -398,17 +431,17 @@ struct AskEmptyState: View {
                 HStack(spacing: 8) {
                     AskDot(color: AskColors.warn)
                     Text("Choose a model").font(.system(size: 13, weight: .semibold)).foregroundStyle(AskColors.warn)
-                    Text("— open the model menu under the message box.").font(.system(size: 13)).foregroundStyle(AskColors.dim)
+                    Text("— open the model menu under the message box.").font(.system(size: 13)).foregroundStyle(AskColors.faded)
                     Button("Choose…") { m.overlay = .model }.buttonStyle(AskGhostStyle())
                 }
             } else if m.ready {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Try").font(.system(size: 11, weight: .semibold)).foregroundStyle(AskColors.dim)
+                    Text("Try").font(.system(size: 11, weight: .semibold)).foregroundStyle(AskColors.faded)
                     ForEach(["What were the payment terms in the last contract?", "When does the licence expire?", "Summarise the meeting notes from last week"], id: \.self) { q in
                         Button { m.draft = q } label: {
                             HStack(spacing: 8) {
                                 Image(systemName: "arrow.turn.down.right").font(.system(size: 11)).foregroundStyle(AskColors.prompt)
-                                Text(q).font(.system(size: 13)).foregroundStyle(AskColors.ink2)
+                                Text(q).font(.system(size: 13)).foregroundStyle(AskColors.faded)
                             }.contentShape(Rectangle())
                         }.buttonStyle(.plain)
                     }
@@ -450,13 +483,13 @@ struct AskTurnView: View {
                     Text(e).font(.system(size: 13)).foregroundStyle(AskColors.err).textSelection(.enabled).padding(.leading, 15)
                 }.padding(.top, 6)
             } else if turn.a.isEmpty {
-                if !live { Text(turn.stopped ? "Stopped before an answer." : "No answer.").font(.system(size: 13)).foregroundStyle(AskColors.dim).padding(.top, 8) }
+                if !live { Text(turn.stopped ? "Stopped before an answer." : "No answer.").font(.system(size: 13)).foregroundStyle(AskColors.faded).padding(.top, 8) }
             } else {
                 AskAnswer(turn: turn, streaming: live).padding(.top, 12)
             }
             if !turn.a.isEmpty, !turn.sources.isEmpty {
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("Sources").font(.system(size: 11, weight: .semibold)).foregroundStyle(AskColors.dim).padding(.bottom, 3)
+                    Text("Sources").font(.system(size: 11, weight: .semibold)).foregroundStyle(AskColors.faded).padding(.bottom, 3)
                     ForEach(turn.sources) { s in
                         AskSourceRow(m: m, turn: turn, source: s, dimmed: !cited.isEmpty && !cited.contains(s.n))
                     }
@@ -493,7 +526,7 @@ struct AskMeta: View {
     var body: some View {
         AskWrap(spacing: 6, lineSpacing: 3) {
             if !turn.a.isEmpty, let model = turn.model {
-                Text(model).font(.system(size: 11, weight: .medium)).foregroundStyle(AskColors.ink2)
+                Text(model).font(.system(size: 11, weight: .medium)).foregroundStyle(AskColors.faded)
                     .help(whereTitle)
             }
             if !turn.a.isEmpty, let w = turn.answeredWhere { AskWhereBadge(local: w != "cloud") }
@@ -502,9 +535,9 @@ struct AskMeta: View {
                 Text(AskText.fallbackText(f)).font(.system(size: 11)).foregroundStyle(AskColors.warn)
             }
             if let ms = turn.ms, ms > 0 {
-                Text(String(format: "%.1f s", Double(ms) / 1000)).font(.system(size: 11)).foregroundStyle(AskColors.dim)
+                Text(String(format: "%.1f s", Double(ms) / 1000)).font(.system(size: 11)).foregroundStyle(AskColors.faded)
             }
-            if !turn.a.isEmpty { Text("check the sources").font(.system(size: 11)).foregroundStyle(AskColors.dim) }
+            if !turn.a.isEmpty { Text("check the sources").font(.system(size: 11)).foregroundStyle(AskColors.faded) }
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
@@ -532,9 +565,9 @@ struct AskSteps: View {
                 } label: {
                     HStack(spacing: 6) {
                         if !open { AskDot(color: turn.steps.contains { $0.state == .err } ? AskColors.err : AskColors.ok) }
-                        else { Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(AskColors.dim) }
-                        Text(label).font(.askMono(11)).foregroundStyle(AskColors.dim)
-                        if !open { Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(AskColors.dim) }
+                        else { Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold)).foregroundStyle(AskColors.faded) }
+                        Text(label).font(.askMono(11)).foregroundStyle(AskColors.faded)
+                        if !open { Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(AskColors.faded) }
                     }.contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -556,13 +589,13 @@ struct AskStepLine: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 AskDot(color: color)
-                Text(step.title).font(.askMono(11)).foregroundStyle(step.state == .err ? AskColors.err : AskColors.ink2)
+                Text(step.title).font(.askMono(11)).foregroundStyle(step.state == .err ? AskColors.err : AskColors.faded)
                     .lineLimit(2).textSelection(.enabled)
             }
             if !res.isEmpty {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("⎿").font(.askMono(11)).foregroundStyle(AskColors.dim)
-                    Text(res).font(.askMono(11)).foregroundStyle(AskColors.dim)
+                    Text("⎿").font(.askMono(11)).foregroundStyle(AskColors.faded)
+                    Text(res).font(.askMono(11)).foregroundStyle(AskColors.faded)
                 }.padding(.leading, 15)
             }
         }
@@ -588,7 +621,7 @@ struct AskAnswer: View {
                     VStack(alignment: .leading, spacing: 3) {
                         ForEach(Array(items.enumerated()), id: \.offset) { j, it in
                             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                Text(ordered ? "\(j + 1)." : "•").foregroundStyle(AskColors.dim).frame(minWidth: 16, alignment: .trailing)
+                                Text(ordered ? "\(j + 1)." : "•").foregroundStyle(AskColors.faded).frame(minWidth: 16, alignment: .trailing)
                                 Text(AskMarkdown.inline(it, turn: turn.id, sources: turn.sources, cursor: last && j == items.count - 1)).textSelection(.enabled)
                             }
                         }
@@ -602,10 +635,10 @@ struct AskAnswer: View {
             }
             if streaming && blocks.isEmpty { Text("▍").foregroundStyle(AskColors.prompt) }
         }
-        .font(.system(size: 14.5))
+        .font(.system(size: AskMeasure.answerFontSize))
         .lineSpacing(4)
         .foregroundStyle(AskColors.ink)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: AskMeasure.width, alignment: .leading)     // a cap, not a width: a narrower window still reflows the text
     }
 }
 
@@ -620,11 +653,11 @@ struct AskSourceRow: View {
         Button { m.openSource = (turn.id, source) } label: {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("[\(source.n)]").font(.system(size: 12, weight: .semibold)).foregroundStyle(AskColors.prompt)
-                (Text("\(source.collection) / ").foregroundStyle(AskColors.dim) + Text(source.path).foregroundStyle(hover ? AskColors.ink : AskColors.ink2))
+                (Text("\(source.collection) / ").foregroundStyle(AskColors.faded) + Text(source.path).foregroundStyle(hover ? AskColors.ink : AskColors.faded))
                     .font(.askMono(11)).lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 8)
-                if let p = source.page { Text("p. \(p)").font(.system(size: 11)).foregroundStyle(AskColors.dim) }
-                else if let ts = source.ts { Text(ts).font(.system(size: 11)).foregroundStyle(AskColors.dim) }
+                if let p = source.page { Text("p. \(p)").font(.system(size: 11)).foregroundStyle(AskColors.faded) }
+                else if let ts = source.ts { Text(ts).font(.system(size: 11)).foregroundStyle(AskColors.faded) }
             }
             .padding(.vertical, 2)
             .contentShape(Rectangle())
@@ -654,7 +687,7 @@ struct AskComposer: View {
                         onCaret: { t, c in m.updateMention(text: t, caret: c) })
                     if m.draft.isEmpty {
                         Text(m.ready ? (m.currentChat?.turns.isEmpty == false ? "Follow up…" : "Ask about your documents") : "Ask is off")
-                            .font(.system(size: 14)).foregroundStyle(AskColors.dim).padding(.top, 4).allowsHitTesting(false)
+                            .font(.system(size: 14)).foregroundStyle(AskColors.faded).padding(.top, 4).allowsHitTesting(false)
                     }
                 }
                 .frame(height: min(max(fieldH, 24), 168))
@@ -663,8 +696,8 @@ struct AskComposer: View {
                         HStack(spacing: 5) {
                             Image(systemName: "folder").font(.system(size: 11))
                             Text(m.whereLabel).font(.system(size: 12)).lineLimit(1).truncationMode(.middle).frame(maxWidth: 260)
-                            Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(AskColors.dim)
-                        }.foregroundStyle(AskColors.ink2).fixedSize()
+                            Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(AskColors.faded)
+                        }.foregroundStyle(AskColors.faded).fixedSize()
                     }
                     .buttonStyle(AskChipStyle()).disabled(!m.ready)
                     .help("This chat reads \(m.whereLabel). Click to choose another folder, or type @ to mention one.")
@@ -679,7 +712,7 @@ struct AskComposer: View {
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(AskColors.rule, lineWidth: 0.5))
             AskNote(m: m, pred: pred)
         }
-        .padding(.horizontal, 22).padding(.top, 10).padding(.bottom, 12)
+        .padding(.horizontal, MSEStyle.contentInset).padding(.top, 10).padding(.bottom, 12)
         .overlay(alignment: .top) { Rectangle().fill(AskColors.rule).frame(height: 0.5) }
         .background(AskColors.bg)
     }
@@ -743,13 +776,23 @@ struct AskRouteSwitch: View {
     func seg(_ title: String, on: Bool, help: String, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title).font(.system(size: 11.5, weight: on ? .semibold : .regular)).lineLimit(1).fixedSize()
-                .foregroundStyle(on ? AskColors.ink : AskColors.dim)
+                .foregroundStyle(on ? AskColors.ink : AskColors.faded)
                 .padding(.horizontal, 10).padding(.vertical, 2.5)
                 .background(RoundedRectangle(cornerRadius: 5).fill(on ? AskColors.well : Color.clear))
                 .shadow(color: on ? Color.black.opacity(0.12) : .clear, radius: 1, y: 0.5)
         }
         .buttonStyle(.plain).help(help)
     }
+}
+
+/// The faded text: headers, hints, the empty "Recent" note and the off side of a segmented control. AskColors.dim
+/// (AskModel.swift) is the secondary label colour with its alpha baked in, which resolved near-white in the light-mode
+/// snapshot (the Recent header, the empty note, the hint line and the Cloud segment all vanished). The plain semantic
+/// colour, without an alpha, follows light and dark mode. It is the one secondary token, so it reaches 4.5:1 on the window
+/// and on the content area in both modes; the text that used AskColors.ink2 (the system secondary colour, 3.7 to 3.95:1 in
+/// light) uses it too, so the Ask view has one secondary colour.
+extension AskColors {
+    static let faded = Color(nsColor: MSEStyle.secondary)
 }
 
 struct AskModelChip: View {
@@ -761,15 +804,15 @@ struct AskModelChip: View {
             HStack(spacing: 6) {
                 if let s = sel {
                     Text(s.model).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
-                    Text("· \(s.local ? "On this Mac" : m.providerLabel(s.provider))").font(.system(size: 11)).foregroundStyle(AskColors.dim).lineLimit(1)
+                    Text("· \(s.local ? "On this Mac" : m.providerLabel(s.provider))").font(.system(size: 11)).foregroundStyle(AskColors.faded).lineLimit(1)
                     AskWhereBadge(local: s.local)
                     if m.trains(s.provider, s.model) { Text("⚠").font(.system(size: 11)).foregroundStyle(AskColors.warn) }
                 } else {
                     Text("Choose a model").font(.system(size: 11.5, weight: .medium)).foregroundStyle(AskColors.warn)
                 }
-                Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(AskColors.dim)
+                Image(systemName: "chevron.up.chevron.down").font(.system(size: 8, weight: .semibold)).foregroundStyle(AskColors.faded)
             }
-            .foregroundStyle(AskColors.ink2)
+            .foregroundStyle(AskColors.faded)
         }
         .buttonStyle(AskChipStyle())
         .layoutPriority(-1)
@@ -780,30 +823,59 @@ struct AskModelChip: View {
 struct AskNote: View {
     @ObservedObject var m: AskModel
     let pred: AskPrediction?
+    @State private var showMore = false
 
+    /// The hint line shows three items and a "?" for the rest. The three: "⇧↵ new line", "@ mention a folder" and
+    /// "next answer ..." (which model answers next; it is state, and it also carries the warning when no cloud model is
+    /// ready). Without a prediction the third is "↵ ask". The rest ("Reads <folder>", "↵ ask") is behind the "?".
     var body: some View {
-        AskWrap(spacing: 5, lineSpacing: 2) {
-            if !m.ready {
-                Text("Turn Ask on to ask questions.").foregroundStyle(AskColors.dim)
-            } else {
-                let sc = Text("Reads \(m.whereLabel) · ↵ ask · ⇧↵ new line · @ mention a folder")
-                sc.foregroundStyle(AskColors.dim)
-                if let p = pred {
-                    Text("·").foregroundStyle(AskColors.dim)
-                    if !p.local, let prob = p.problem {
-                        (Text("next answer: ").foregroundStyle(AskColors.dim) + Text(AskText.problem[prob] ?? "no cloud model is ready").foregroundStyle(AskColors.warn).bold()
-                         + Text(" · pick a model, or switch to Local").foregroundStyle(AskColors.dim))
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            AskWrap(spacing: 5, lineSpacing: 2) {
+                if !m.ready {
+                    Text("Turn Ask on to ask questions.").foregroundStyle(AskColors.faded)
+                } else {
+                    Text("⇧↵ new line").foregroundStyle(AskColors.faded)
+                    Text("·").foregroundStyle(AskColors.faded)
+                    Text("@ mention a folder").foregroundStyle(AskColors.faded)
+                    Text("·").foregroundStyle(AskColors.faded)
+                    if let p = pred {
+                        if !p.local, let prob = p.problem {
+                            (Text("next answer: ").foregroundStyle(AskColors.faded) + Text(AskText.problem[prob] ?? "no cloud model is ready").foregroundStyle(AskColors.warn).bold()
+                             + Text(" · pick a model, or switch to Local").foregroundStyle(AskColors.faded))
+                        } else {
+                            Text("next answer").foregroundStyle(AskColors.faded)
+                            AskWhereBadge(local: p.local)
+                            Text(p.model).bold().foregroundStyle(AskColors.faded)
+                            if !p.local, m.trains(m.cfg.provider, p.model) { AskTrainBadge() }
+                        }
                     } else {
-                        Text("next answer").foregroundStyle(AskColors.dim)
-                        AskWhereBadge(local: p.local)
-                        Text(p.model).bold().foregroundStyle(AskColors.ink2)
-                        if !p.local, m.trains(m.cfg.provider, p.model) { AskTrainBadge() }
+                        Text("↵ ask").foregroundStyle(AskColors.faded)
                     }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if m.ready { moreButton }
         }
         .font(.system(size: 11))
-        .padding(.horizontal, 4)
+    }
+
+    /// The hints that are not on the line: the ones left behind "?" (a tooltip, and a popover on a click).
+    private var more: [String] {
+        (pred == nil ? [] : ["↵ ask"]) + ["Reads \(m.whereLabel)", "⌘N new chat", "esc stops an answer"]
+    }
+
+    private var moreButton: some View {
+        Button { showMore.toggle() } label: {
+            AskSymbol(name: "questionmark.circle").foregroundStyle(AskColors.faded).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(more.joined(separator: "\n"))
+        .popover(isPresented: $showMore, arrowEdge: .top) {
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(more, id: \.self) { Text($0).font(.system(size: 12)).foregroundStyle(AskColors.ink) }
+            }
+            .padding(12)
+        }
     }
 }
 
@@ -933,7 +1005,7 @@ struct AskFolderPicker: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
                     ForEach(Array(m.pickerCrumbs.enumerated()), id: \.offset) { i, c in
-                        if i > 0 { Text("›").foregroundStyle(AskColors.dim) }
+                        if i > 0 { Text("›").foregroundStyle(AskColors.faded) }
                         let last = i == m.pickerCrumbs.count - 1
                         Button(c.label) { m.pickerGo(c.scope, c.path) }
                             .buttonStyle(.plain).font(.system(size: 12, weight: last ? .semibold : .regular))
@@ -943,7 +1015,7 @@ struct AskFolderPicker: View {
             }
             Rectangle().fill(AskColors.rule).frame(height: 1)
             HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(AskColors.dim)
+                Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(AskColors.faded)
                 TextField("Type to filter", text: $m.pickerFilter).textFieldStyle(.plain).font(.system(size: 12.5))
                     .focused($focused).onSubmit { openFirst() }
             }.padding(.horizontal, 12).padding(.vertical, 7)
@@ -953,7 +1025,7 @@ struct AskFolderPicker: View {
             }.frame(maxHeight: 260)
             Rectangle().fill(AskColors.rule).frame(height: 1)
             HStack {
-                Text(useLabel).font(.system(size: 11)).foregroundStyle(AskColors.dim).lineLimit(1).truncationMode(.middle)
+                Text(useLabel).font(.system(size: 11)).foregroundStyle(AskColors.faded).lineLimit(1).truncationMode(.middle)
                 Spacer()
                 Button("Use this folder") { use(m.pickerScope ?? "all", m.pickerPath) }.buttonStyle(AskGhostStyle(primary: true))
             }.padding(.horizontal, 12).padding(.vertical, 8)
@@ -982,10 +1054,10 @@ struct AskFolderPicker: View {
 
     @ViewBuilder var rows: some View {
         if let s = m.pickerScope {
-            if m.pickerLoading { Text("Loading…").font(.system(size: 12)).foregroundStyle(AskColors.dim).padding(12) }
+            if m.pickerLoading { Text("Loading…").font(.system(size: 12)).foregroundStyle(AskColors.faded).padding(12) }
             let list = m.pickerRows.filter { matches($0.name) }
             if !m.pickerLoading && list.isEmpty {
-                Text(m.pickerRows.isEmpty ? "No subfolders." : "No folder matches.").font(.system(size: 12)).foregroundStyle(AskColors.dim).padding(12)
+                Text(m.pickerRows.isEmpty ? "No subfolders." : "No folder matches.").font(.system(size: 12)).foregroundStyle(AskColors.faded).padding(12)
             }
             ForEach(list) { f in
                 pickRow(icon: "folder", title: f.name, sub: nil, chevron: f.children,
@@ -1008,7 +1080,7 @@ struct AskFolderPicker: View {
     }
 
     func header(_ t: String) -> some View {
-        Text(t).font(.system(size: 11, weight: .semibold)).foregroundStyle(AskColors.dim).padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 2)
+        Text(t).font(.system(size: 11, weight: .semibold)).foregroundStyle(AskColors.faded).padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 2)
     }
 
     func pickRow(icon: String, title: String, sub: String?, chevron: Bool, open: @escaping () -> Void, use: (() -> Void)?) -> some View {
@@ -1031,9 +1103,9 @@ struct AskPickRow: View {
                 HStack(spacing: 8) {
                     Image(systemName: icon).font(.system(size: 12)).foregroundStyle(AskColors.prompt).frame(width: 16)
                     Text(title).font(.system(size: 12.5)).foregroundStyle(AskColors.ink).lineLimit(1)
-                    if let sub { Text(sub).font(.system(size: 11)).foregroundStyle(AskColors.dim) }
+                    if let sub { Text(sub).font(.system(size: 11)).foregroundStyle(AskColors.faded) }
                     Spacer(minLength: 4)
-                    if chevron { Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(AskColors.dim) }
+                    if chevron { Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(AskColors.faded) }
                 }.contentShape(Rectangle())
             }.buttonStyle(.plain)
             if let use, chevron {
@@ -1058,14 +1130,14 @@ struct AskModelMenu: View {
         let total = sections.flatMap { $0.subs.flatMap { $0.items } }.count
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(AskColors.dim)
+                Image(systemName: "magnifyingglass").font(.system(size: 11)).foregroundStyle(AskColors.faded)
                 TextField("Search \(total) model\(total == 1 ? "" : "s")", text: $m.modelFilter).textFieldStyle(.plain).font(.system(size: 12.5))
             }.padding(.horizontal, 12).padding(.vertical, 8)
             Rectangle().fill(AskColors.rule).frame(height: 1)
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     if sections.isEmpty {
-                        Text("No provider is connected yet: add a key in Settings › Ask (Classic MySearch).").font(.system(size: 12)).foregroundStyle(AskColors.dim).padding(12)
+                        Text("No provider is connected yet: add a key in Settings › Ask.").font(.system(size: 12)).foregroundStyle(AskColors.faded).padding(12)
                     }
                     ForEach(sections) { sec in
                         let visible = sec.subs.map { sub in (sub.sub, sub.items.filter { it in
@@ -1073,10 +1145,10 @@ struct AskModelMenu: View {
                         if !visible.isEmpty {
                             HStack(spacing: 6) {
                                 Text(sec.head).font(.system(size: 11.5, weight: .semibold)).foregroundStyle(AskColors.ink)
-                                if let n = sec.note { Text(n).font(.system(size: 10.5)).foregroundStyle(AskColors.dim) }
+                                if let n = sec.note { Text(n).font(.system(size: 10.5)).foregroundStyle(AskColors.faded) }
                             }.padding(.horizontal, 12).padding(.top, 9).padding(.bottom, 2)
                             ForEach(Array(visible.enumerated()), id: \.offset) { _, v in
-                                if let s = v.0 { Text(s).font(.system(size: 10.5, weight: .medium)).foregroundStyle(AskColors.dim).padding(.horizontal, 12).padding(.top, 4) }
+                                if let s = v.0 { Text(s).font(.system(size: 10.5, weight: .medium)).foregroundStyle(AskColors.faded).padding(.horizontal, 12).padding(.top, 4) }
                                 ForEach(v.1) { it in AskModelRow(m: m, entry: it) }
                             }
                         }
@@ -1106,7 +1178,7 @@ struct AskModelRow: View {
         Button { m.choose(entry) } label: {
             HStack(spacing: 8) {
                 Text(entry.model).font(.system(size: 12.5, weight: cur ? .semibold : .regular)).foregroundStyle(AskColors.ink).lineLimit(1).truncationMode(.middle)
-                if !entry.name.isEmpty { Text(entry.name).font(.system(size: 11)).foregroundStyle(AskColors.dim) }
+                if !entry.name.isEmpty { Text(entry.name).font(.system(size: 11)).foregroundStyle(AskColors.faded) }
                 Spacer(minLength: 4)
                 if m.trains(entry.provider, entry.model) { AskTrainBadge() }
                 if cur { Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(AskColors.prompt) }
@@ -1128,9 +1200,9 @@ struct AskMentionList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text("Folders and groups").font(.system(size: 10.5, weight: .semibold)).foregroundStyle(AskColors.dim)
+                Text("Folders and groups").font(.system(size: 10.5, weight: .semibold)).foregroundStyle(AskColors.faded)
                 Spacer()
-                Text("↵ read · esc").font(.system(size: 10.5)).foregroundStyle(AskColors.dim)
+                Text("↵ read · esc").font(.system(size: 10.5)).foregroundStyle(AskColors.faded)
             }.padding(.horizontal, 12).padding(.vertical, 6)
             Rectangle().fill(AskColors.rule).frame(height: 1)
             ForEach(Array(m.mentionItems.enumerated()), id: \.element.id) { i, it in
@@ -1138,7 +1210,7 @@ struct AskMentionList: View {
                     HStack {
                         Text(it.label).font(.system(size: 12.5)).foregroundStyle(AskColors.ink).lineLimit(1).truncationMode(.middle)
                         Spacer()
-                        Text(it.sub).font(.system(size: 10.5)).foregroundStyle(AskColors.dim)
+                        Text(it.sub).font(.system(size: 10.5)).foregroundStyle(AskColors.faded)
                     }
                     .padding(.horizontal, 12).padding(.vertical, 4)
                     .background(i == m.mentionSel ? AskColors.prompt.opacity(0.25) : Color.clear)
@@ -1197,17 +1269,17 @@ struct AskSourcePreview: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("[\(source.n)] \(source.title ?? url.lastPathComponent)").font(.system(size: 13, weight: .semibold)).foregroundStyle(AskColors.ink).lineLimit(2)
                     Text("\(source.collection) / \(source.path)\(source.page.map { " · page \($0)" } ?? "")\(source.ts.map { " · \($0)" } ?? "")")
-                        .font(.askMono(11)).foregroundStyle(AskColors.dim).lineLimit(3).textSelection(.enabled)
+                        .font(.askMono(11)).foregroundStyle(AskColors.faded).lineLimit(3).textSelection(.enabled)
                 }
                 Spacer(minLength: 4)
                 Button { m.openSource = nil } label: {
-                    Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(AskColors.dim).frame(width: 22, height: 22)
+                    Image(systemName: "xmark").font(.system(size: 10, weight: .bold)).foregroundStyle(AskColors.faded).frame(width: 22, height: 22)
                 }.buttonStyle(.plain).help("Close the preview")
             }.padding(12)
             Rectangle().fill(AskColors.rule).frame(height: 1)
             if let sn = source.snippet, !sn.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Passage").font(.system(size: 11, weight: .semibold)).foregroundStyle(AskColors.dim)
+                    Text("Passage").font(.system(size: 11, weight: .semibold)).foregroundStyle(AskColors.faded)
                     ScrollView { Text(AskMarkdown.stripMarks(sn)).font(.system(size: 13)).foregroundStyle(AskColors.ink).textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading) }
                         .frame(maxHeight: isPDF && exists ? 110 : .infinity)

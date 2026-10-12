@@ -1,7 +1,11 @@
-// The filter bar above the native results, in the style of Finder's search bar: popups for type, date, size and
-// sort, a segmented control for the search method, and two text fields for the files to include and exclude. Also
-// the facet chips above the content matches (the web's .facets row) and the custom date range sheet.
-// The bar only reports; SearchViewController owns the state and re-runs the search.
+// The filter bar above the native results, in the style of Finder's search bar. Row 1 is where to search (scope, File
+// names, Contents, Results | Timeline, Save Search); row 2 is the everyday filters (type, Modified, size or sort), the
+// "More filters (n)" button and Clear. The button opens the search method, the document filters and the include and
+// exclude globs. Under row 2, only when a filter is set, a strip holds one chip per filter, from every group, so a filter
+// that is behind the button is never out of sight. Also the facet chips above the content matches (the web's .facets row) and the custom date range sheet.
+// The bar only reports; SearchViewController owns the state and re-runs the search. Every chip and every control is a view
+// of that state: a chip's x goes the way the control goes (onChange for a file filter, onDocChange for a document filter,
+// which the controller writes into the search text).
 
 import Cocoa
 
@@ -17,6 +21,8 @@ struct SearchFacets {
     let kinds: [(key: String, count: Int)]
     let years: [(year: String, count: Int)]
     let collections: [(name: String, count: Int)]
+    /// The document types of the matches (facets.doctype), most first: the Document pop-up shows their counts.
+    let doctypes: [(type: DocType, count: Int)]
 
     /// JSON objects lose their order, so the counts are sorted here: most first for kinds and collections, newest
     /// year first (the web shows the six newest years).
@@ -28,15 +34,51 @@ struct SearchFacets {
         kinds = counts("kind").sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }.map { (key: $0.0, count: $0.1) }
         years = counts("year").sorted { $0.0 > $1.0 }.prefix(6).map { (year: $0.0, count: $0.1) }
         collections = counts("collection").sorted { $0.1 != $1.1 ? $0.1 > $1.1 : $0.0 < $1.0 }.map { (name: $0.0, count: $0.1) }
-        if kinds.isEmpty && years.isEmpty && collections.isEmpty { return nil }
+        doctypes = counts("doctype").compactMap { (key, n) -> (type: DocType, count: Int)? in
+            guard let t = DocType(rawValue: key) else { return nil }
+            return (type: t, count: n)
+        }.sorted { $0.count != $1.count ? $0.count > $1.count : $0.type.rawValue < $1.type.rawValue }
+        if kinds.isEmpty && years.isEmpty && collections.isEmpty && doctypes.isEmpty { return nil }
     }
 }
 
+/// One change of a document filter (Indexed mode). SearchViewController turns it into operators in the search text.
+enum DocChange {
+    case types([DocType])
+    case amount(AmountChoice)
+    case currency(String?)
+    case party(String)
+    case docdate(DatePreset)
+}
+
 /// The filter popups and fields. Mac scope shows type, date, size and the globs; Indexed scope shows type, date,
-/// the method, sort and the globs, as the web does (the web has no size and no sort).
+/// the method, sort and the globs, as the web does (the web has no size and no sort), and a row of document filters
+/// (document type, amount, currency, party, document date) with the Results / Timeline switch and Save Search.
 @MainActor
 final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
     enum Mode { case mac, indexed }
+
+    /// A document filter changed (Indexed mode). The controller writes it into the search text and runs the search.
+    var onDocChange: ((DocChange) -> Void)?
+    /// Results (false) or Timeline (true) was chosen.
+    var onViewChoice: ((Bool) -> Void)?
+    /// Save Search… was pressed.
+    var onSaveSearch: (() -> Void)?
+    /// The document filters as the pop-ups show them (set by setDocs; the search text is the source).
+    private(set) var docs = DocFilters()
+
+    private let docTypePop = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let amountPop = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let currencyPop = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let docDatePop = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let partyField = NSTextField()
+    private let viewSeg = NSSegmentedControl(labels: ["Results", "Timeline"], trackingMode: .selectOne, target: nil, action: nil)
+    private let saveButton = NSButton(title: "Save Search…", target: nil, action: nil)
+    private var partyDebounce: Task<Void, Never>?
+    /// The sheet of a custom amount or date range, while it is open (the snapshot composites it).
+    private var docSheet: AnyObject?
+    /// The currencies the pop-up offers, in order; any other code shows as its own item.
+    static let currencyCodes = ["EUR", "USD", "GBP", "CHF", "JPY", "CAD", "AUD", "SEK", "NOK", "DKK", "PLN", "CZK", "CNY", "INR", "BRL", "ZAR"]
 
     /// A filter changed: the whole filter set. The user runs the search again.
     var onChange: ((SearchFilters) -> Void)?
@@ -62,17 +104,34 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
     private let methodSeg = NSSegmentedControl(labels: [], trackingMode: .selectOne, target: nil, action: nil)
     private let include = NSTextField()
     private let exclude = NSTextField()
-    private let clearButton = NSButton(title: "Clear filters", target: nil, action: nil)
+    private let clearButton = NSButton(title: "Clear", target: nil, action: nil)
     private let scopeButton = NSButton(title: "Whole Mac", target: nil, action: nil)
     private let namesCheck = NSButton(checkboxWithTitle: "File names", target: nil, action: nil)
     private let contentsCheck = NSButton(checkboxWithTitle: "Contents", target: nil, action: nil)
-    private let rowZero = NSStackView()
-    private let rowOne = NSStackView()
-    private let rowTwo = NSStackView()
     private let includeGroup = NSStackView()
     private let excludeGroup = NSStackView()
-    /// Whether every control sits on a single row (the window is wide enough) or the globs wrap onto a second row.
-    private var singleRow = false
+    /// "Modified" with the file's date pop-up, and "Document date" with the document's: the two dates are told apart by name.
+    private let modifiedGroup = NSStackView()
+    private let docDateGroup = NSStackView()
+    /// "More filters (n)", at the end of row 2: opens the method, the document filters and the globs. n counts the filters set
+    /// inside it.
+    private let moreButton = NSButton(title: "More filters", target: nil, action: nil)
+    /// Snapshot hook: the next bar starts with More filters open (Snapshot.swift sets it before the window is built).
+    static var snapshotStartsOpen = false
+    private var moreOpen = SearchFilterBar.snapshotStartsOpen
+    /// The chips of the filters that are set, and what they were built from (a chip is rebuilt only when its text changes).
+    private var chips: [FilterChipView] = []
+    private var chipKeys: [String] = []
+    private var chipsInMore = 0
+    /// The lines of the bar: one persistent stack per line (a line that is wider than the bar wraps onto more stacks), and
+    /// what each holds now. A stack whose controls did not change is left alone, so a field that is being typed in keeps
+    /// the keyboard while a chip appears next to it.
+    private var rowStacks: [String: NSStackView] = [:]
+    private var appliedRows: [String: [ObjectIdentifier]] = [:]
+    private var appliedOrder: [String] = []
+    /// The width the lines fit before the bar has a host (narrow on purpose: a wide first arrangement would ask the window
+    /// for that width, and nothing gives it back).
+    private static let seedWidth: CGFloat = 480
     private var observed: NSView?
     private var lastDate: DatePreset = .any
     private var quiet = false
@@ -99,6 +158,7 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
     private func build() {
         for pop in [typePop, datePop, sizePop, sortPop] {
             pop.controlSize = .regular
+            pop.bezelStyle = .rounded                          // NSButton.BezelStyle has no .roundedBezel; .rounded is the pop-up's pill
             pop.target = self
         }
         typePop.action = #selector(typeChanged(_:))
@@ -108,7 +168,12 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
             typePop.lastItem?.tag = k.rawValue
         }
         datePop.action = #selector(dateChanged(_:))
-        datePop.setAccessibilityLabel("Date")
+        datePop.setAccessibilityLabel("Modified")
+        datePop.toolTip = "When the file was last changed"
+        modifiedGroup.orientation = .horizontal
+        modifiedGroup.alignment = .centerY
+        modifiedGroup.spacing = 6
+        modifiedGroup.setViews([caption("Modified"), datePop], in: .leading)
         for (tag, preset) in dateTags {
             datePop.addItem(withTitle: preset.title)
             datePop.lastItem?.tag = tag
@@ -143,24 +208,24 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
         methodSeg.setAccessibilityLabel("Search method")
 
         for (field, label, group, placeholder, help) in [
-            (include, "Include:", includeGroup, "*.pdf, Invoices/", "Only these files: comma-separated, e.g. .pdf, *.pdf or Invoices/"),
-            (exclude, "Exclude:", excludeGroup, "*.md, *.eml, backups/", "Skip these files: comma-separated, e.g. .md, *.eml or backups/"),
+            (include, "Include", includeGroup, "*.pdf, Invoices/", "Only these files: comma-separated, e.g. .pdf, *.pdf or Invoices/"),
+            (exclude, "Exclude", excludeGroup, "*.md, *.eml, backups/", "Skip these files: comma-separated, e.g. .md, *.eml or backups/"),
         ] {
             field.placeholderString = placeholder
             field.toolTip = help
             field.controlSize = .regular
+            field.isBezeled = true
+            field.bezelStyle = .roundedBezel
             field.delegate = self
             field.target = self
             field.action = #selector(globCommitted(_:))
-            field.setAccessibilityLabel(String(label.dropLast()))
+            field.setAccessibilityLabel(label)
             field.translatesAutoresizingMaskIntoConstraints = false
             field.widthAnchor.constraint(equalToConstant: 190).isActive = true
-            let caption = NSTextField(labelWithString: label)
-            caption.textColor = .secondaryLabelColor
             group.orientation = .horizontal
             group.alignment = .centerY
             group.spacing = 6
-            group.setViews([caption, field], in: .leading)
+            group.setViews([caption(label), field], in: .leading)
         }
 
         clearButton.bezelStyle = .rounded
@@ -168,7 +233,7 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
         clearButton.target = self
         clearButton.action = #selector(clearPressed(_:))
         clearButton.toolTip = "Clear every filter (the search text stays)"
-        clearButton.isHidden = true
+        clearButton.setAccessibilityLabel("Clear filters")
 
         scopeButton.bezelStyle = .rounded
         scopeButton.controlSize = .regular
@@ -179,6 +244,7 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
         scopeButton.setAccessibilityLabel("Search scope")
         scopeButton.translatesAutoresizingMaskIntoConstraints = false
         scopeButton.widthAnchor.constraint(lessThanOrEqualToConstant: 300).isActive = true
+        scopeButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
         scopeButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         for box in [namesCheck, contentsCheck] {
             box.controlSize = .regular
@@ -188,47 +254,497 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
         namesCheck.setAccessibilityLabel("Search file names")
         contentsCheck.setAccessibilityLabel("Search contents")
 
-        for row in [rowZero, rowOne, rowTwo] {
-            row.orientation = .horizontal
-            row.alignment = .centerY
-            row.spacing = 10
+        buildDocControls()
+        viewSeg.segmentStyle = .rounded
+        viewSeg.controlSize = .regular
+        viewSeg.target = self
+        viewSeg.action = #selector(viewChanged(_:))
+        viewSeg.setAccessibilityLabel("Results or timeline")
+        viewSeg.toolTip = "Show the matching documents as a list, or as a timeline of months (per type, with amounts)"
+        for i in 0..<2 { viewSeg.setWidth(0, forSegment: i) }
+        saveButton.bezelStyle = .rounded
+        saveButton.controlSize = .regular
+        saveButton.target = self
+        saveButton.action = #selector(savePressed(_:))
+        saveButton.toolTip = "Save this search, its filters and folders under a name. Your files are untouched."
+        saveButton.setAccessibilityLabel("Save search")
+        // A stack view hugs at a low priority by default, so a row that is wider than its controls (the bar is as wide as its
+        // widest row) handed the spare width to the first stack in it and spread its controls apart. The groups hold their width.
+        for group in [modifiedGroup, docDateGroup, includeGroup, excludeGroup] {
+            group.setHuggingPriority(.required, for: .horizontal)
         }
-        rowZero.setViews([scopeButton, namesCheck, contentsCheck], in: .leading)
-        addArrangedSubview(rowZero)
-        addArrangedSubview(rowOne)
-        addArrangedSubview(rowTwo)
-        arrange()
+        moreButton.bezelStyle = .rounded
+        moreButton.controlSize = .regular
+        moreButton.imagePosition = .imageLeading
+        moreButton.target = self
+        moreButton.action = #selector(moreToggled(_:))
+        moreButton.toolTip = "The search method, the document filters (type, amount, currency, party, document date) and the file globs"
+        moreButton.setAccessibilityLabel("More filters")
+        updateChips()
+        applyLayout(width: SearchFilterBar.seedWidth)
     }
 
-    private var rowOneViews: [NSView] { [typePop, datePop, sizePop, methodSeg, sortPop] }
-    private var rowTwoViews: [NSView] { [includeGroup, excludeGroup, clearButton] }
+    /// A caption in front of a control: the one secondary colour.
+    private func caption(_ text: String) -> NSTextField {
+        let c = NSTextField(labelWithString: text)
+        c.textColor = MSEStyle.secondary
+        return c
+    }
 
-    /// Puts the controls on one row or two. Hidden controls take no room (NSStackView detaches them).
-    private func arrange() {
-        if singleRow {
-            rowOne.setViews(rowOneViews + rowTwoViews, in: .leading)
-            rowTwo.setViews([], in: .leading)
-            rowTwo.isHidden = true
+    /// The document filters: the document type, the amount, the currency, the party and the document date.
+    private func buildDocControls() {
+        for pop in [docTypePop, amountPop, currencyPop, docDatePop] {
+            pop.controlSize = .regular
+            pop.bezelStyle = .rounded
+            pop.target = self
+        }
+        docTypePop.action = #selector(docTypeChanged(_:))
+        docTypePop.setAccessibilityLabel("Document type")
+        docTypePop.toolTip = "The type of document (type:invoice, doctype:other …), counted from the classified documents"
+        docTypePop.addItem(withTitle: "Any document")
+        docTypePop.lastItem?.tag = 0
+        for (i, t) in DocType.allCases.enumerated() {
+            docTypePop.addItem(withTitle: t.title)
+            docTypePop.lastItem?.tag = i + 1
+        }
+
+        amountPop.action = #selector(amountChanged(_:))
+        amountPop.setAccessibilityLabel("Amount")
+        amountPop.toolTip = "The document's amount (an invoice's gross total, a receipt's total paid)"
+        for (tag, title) in [(0, "Any amount"), (1, "Under 100"), (2, "100 to 500"), (3, "Over 500"), (4, "Custom…")] {
+            amountPop.addItem(withTitle: title)
+            amountPop.lastItem?.tag = tag
+        }
+
+        currencyPop.action = #selector(currencyChanged(_:))
+        currencyPop.setAccessibilityLabel("Currency")
+        currencyPop.toolTip = "The currency of the amount (currency:EUR)"
+        currencyPop.addItem(withTitle: "Any currency")
+        currencyPop.lastItem?.tag = 0
+        for (i, code) in SearchFilterBar.currencyCodes.enumerated() {
+            currencyPop.addItem(withTitle: code)
+            currencyPop.lastItem?.tag = i + 1
+        }
+
+        partyField.placeholderString = "Party"
+        partyField.toolTip = "The counterparty contains this text, any case or accent (party:acme). Commas mean any of them."
+        partyField.controlSize = .regular
+        partyField.isBezeled = true
+        partyField.bezelStyle = .roundedBezel
+        partyField.delegate = self
+        partyField.target = self
+        partyField.action = #selector(partyCommitted(_:))
+        partyField.setAccessibilityLabel("Party")
+        partyField.translatesAutoresizingMaskIntoConstraints = false
+        partyField.widthAnchor.constraint(equalToConstant: 170).isActive = true
+
+        docDatePop.action = #selector(docDateChanged(_:))
+        docDatePop.setAccessibilityLabel("Document date")
+        docDatePop.toolTip = "The date in the document, not the file's (docdate:2025-03)"
+        for (tag, preset) in dateTags {
+            docDatePop.addItem(withTitle: preset.title)
+            docDatePop.lastItem?.tag = tag
+        }
+        docDatePop.menu?.addItem(.separator())
+        docDatePop.addItem(withTitle: "Custom range…")
+        docDatePop.lastItem?.tag = customTag
+
+        docDateGroup.orientation = .horizontal
+        docDateGroup.alignment = .centerY
+        docDateGroup.spacing = 6
+        docDateGroup.setViews([caption("Document date"), docDatePop], in: .leading)
+    }
+
+    /// The counts of the document types in the matches: each type's item says how many, as "Invoice  4". The "Any document"
+    /// item stays plain. Called after each content search, so the counts are the answer's own.
+    func setDocCounts(_ counts: [DocType: Int]) {
+        for (i, t) in DocType.allCases.enumerated() {
+            guard let item = docTypePop.itemArray.first(where: { $0.tag == i + 1 }) else { continue }
+            item.title = counts[t].map { "\(t.title)  \($0)" } ?? t.title
+        }
+    }
+
+    /// Shows the document filters in their pop-ups and field without sending a change: the search text is the source
+    /// (the controller calls this after each search, from the text or from the server's answer).
+    func setDocs(_ d: DocFilters) {
+        docs = d
+        // document type: one item per type, or "Several types" when the text names more than one
+        setDynamic(docTypePop, tag: 90, title: d.types.count > 1 ? "Several types" : nil)
+        if d.types.count > 1 {
+            docTypePop.selectItem(withTag: 90)
+        } else if let t = d.types.first, let i = DocType.allCases.firstIndex(of: t) {
+            docTypePop.selectItem(withTag: i + 1)
         } else {
-            rowOne.setViews(rowOneViews, in: .leading)
-            rowTwo.setViews(rowTwoViews, in: .leading)
-            rowTwo.isHidden = false
+            docTypePop.selectItem(withTag: 0)
+        }
+        // amount: a preset, or the custom range as its own item
+        var amountTag = 0
+        switch d.amount {
+        case .any: amountTag = 0
+        case .under100: amountTag = 1
+        case .between100and500: amountTag = 2
+        case .over500: amountTag = 3
+        case .custom: amountTag = 5
+        }
+        var customAmountTitle: String?
+        if case .custom = d.amount { customAmountTitle = d.amount.title }
+        setDynamic(amountPop, tag: 5, title: customAmountTitle)
+        amountPop.selectItem(withTag: amountTag)
+        // currency: a listed code, or the code the text names as its own item
+        if let c = d.currency {
+            if let i = SearchFilterBar.currencyCodes.firstIndex(of: c) {
+                setDynamic(currencyPop, tag: 90, title: nil)
+                currencyPop.selectItem(withTag: i + 1)
+            } else {
+                setDynamic(currencyPop, tag: 90, title: c)
+                currencyPop.selectItem(withTag: 90)
+            }
+        } else {
+            setDynamic(currencyPop, tag: 90, title: nil)
+            currencyPop.selectItem(withTag: 0)
+        }
+        // party
+        if partyField.stringValue != d.party { partyField.stringValue = d.party }
+        // document date: a preset, or the custom range as its own item (the same look as the file date)
+        if case .custom = d.docdate {
+            setDynamic(docDatePop, tag: customActiveTag, title: d.docdate.title)
+            docDatePop.selectItem(withTag: customActiveTag)
+        } else {
+            setDynamic(docDatePop, tag: customActiveTag, title: nil)
+            docDatePop.selectItem(withTag: dateTags.first { $0.preset == d.docdate }?.tag ?? 0)
+        }
+        refresh()
+    }
+
+    /// Adds or removes the item with `tag` at the end of a pop-up (the custom and the unlisted choices).
+    private func setDynamic(_ pop: NSPopUpButton, tag: Int, title: String?) {
+        if let old = pop.itemArray.first(where: { $0.tag == tag }) { pop.menu?.removeItem(old) }
+        if let title {
+            pop.addItem(withTitle: title)
+            pop.lastItem?.tag = tag
         }
     }
 
-    /// The width the controls need on a single row, and the width the owning header offers.
-    private func reflow() {
-        guard let host = superview?.superview else { return }
-        var need: CGFloat = 0
-        let views = rowOneViews + rowTwoViews
-        let visible = views.filter { !$0.isHidden }
-        for v in visible { need += v.fittingSize.width }
-        need += CGFloat(max(0, visible.count - 1)) * rowOne.spacing
-        let want = need <= host.bounds.width - 24
-        if want != singleRow {
-            singleRow = want
-            arrange()
+    /// Results or Timeline, as the controller shows it.
+    func setView(timeline: Bool) {
+        viewSeg.selectedSegment = timeline ? 1 : 0
+    }
+
+    /// Save Search… is for a search with words or a filter in it.
+    func setCanSave(_ on: Bool) {
+        saveButton.isEnabled = on
+    }
+
+    @objc private func viewChanged(_ s: NSSegmentedControl) {
+        onViewChoice?(s.selectedSegment == 1)
+    }
+
+    @objc private func savePressed(_ sender: Any?) {
+        onSaveSearch?()
+    }
+
+    @objc private func docTypeChanged(_ s: NSPopUpButton) {
+        let all = DocType.allCases
+        let tag = s.selectedTag()
+        guard tag >= 1 && tag <= all.count else {
+            onDocChange?(.types([]))
+            return
         }
+        onDocChange?(.types([all[tag - 1]]))
+    }
+
+    @objc private func amountChanged(_ s: NSPopUpButton) {
+        switch s.selectedTag() {
+        case 1: onDocChange?(.amount(.under100))
+        case 2: onDocChange?(.amount(.between100and500))
+        case 3: onDocChange?(.amount(.over500))
+        case 4:
+            setDocs(docs)                           // the menu goes back to the current choice until the sheet answers
+            presentAmountSheet()
+        default: onDocChange?(.amount(.any))
+        }
+    }
+
+    @objc private func currencyChanged(_ s: NSPopUpButton) {
+        let tag = s.selectedTag()
+        guard tag != 90 else { return }
+        let codes = SearchFilterBar.currencyCodes
+        onDocChange?(.currency(tag >= 1 && tag <= codes.count ? codes[tag - 1] : nil))
+    }
+
+    @objc private func docDateChanged(_ s: NSPopUpButton) {
+        let tag = s.selectedTag()
+        if tag == customTag {
+            setDocs(docs)
+            presentDocDateSheet()
+            return
+        }
+        guard tag != customActiveTag else { return }
+        onDocChange?(.docdate(dateTags.first { $0.tag == tag }?.preset ?? .any))
+    }
+
+    @objc private func partyCommitted(_ sender: NSTextField) {
+        partyDebounce?.cancel()
+        onDocChange?(.party(sender.stringValue))
+    }
+
+    /// The custom amount sheet: a minimum and a maximum, either may be empty.
+    private func presentAmountSheet() {
+        guard let win = window else { return }
+        let sheet = AmountRangeSheet(lo: docs.amount.customBounds.0, hi: docs.amount.customBounds.1) { [weak self] lo, hi in
+            self?.docSheet = nil
+            let choice: AmountChoice = (lo == nil && hi == nil) ? .any : .custom(lo, hi)
+            self?.onDocChange?(.amount(choice))
+        } cancel: { [weak self] in
+            self?.docSheet = nil
+        }
+        docSheet = sheet
+        sheet.present(on: win)
+    }
+
+    /// The custom document date sheet: the same From and To as the file's custom range.
+    private func presentDocDateSheet() {
+        guard let win = window else { return }
+        var from = Calendar.current.date(byAdding: .day, value: -30, to: Date()) ?? Date()
+        var to = Date()
+        if case .custom(let a, let b) = docs.docdate { from = a; to = b }
+        let sheet = DateRangeSheet(from: from, to: to, apply: { [weak self] a, b in
+            self?.docSheet = nil
+            self?.onDocChange?(.docdate(.custom(a, b)))
+        }, cancel: { [weak self] in
+            self?.docSheet = nil
+        })
+        docSheet = sheet
+        sheet.present(on: win)
+    }
+
+    /// The sheet that is open over this bar (a custom amount or date), for the snapshot.
+    var openDocSheet: NSWindow? {
+        if let s = docSheet as? DateRangeSheet { return s.sheetPanel }
+        if let s = docSheet as? AmountRangeSheet { return s.sheetPanel }
+        return nil
+    }
+
+    /// Clear shows when any filter is set, the file ones or the document ones.
+    private var clearVisible: Bool { filters.isActive || docs.isActive }
+
+    // MARK: chips
+
+    /// One chip: what it says, what it names in full, whether the filter lives behind More filters, and how it goes away.
+    private struct ChipSpec {
+        let key: String
+        let text: String
+        let tip: String
+        let inMore: Bool
+        let remove: () -> Void
+    }
+
+    /// One chip per filter that is set, from every group: the file filters, then the document filters. A chip is a view of
+    /// the same state the controls show; its x does what the control does (see removeFileFilter and onDocChange).
+    private func chipSpecs() -> [ChipSpec] {
+        var out: [ChipSpec] = []
+        let indexed = mode == .indexed
+        func file(_ key: String, _ text: String, _ tip: String, inMore: Bool, _ clear: @escaping (inout SearchFilters) -> Void) {
+            out.append(ChipSpec(key: key, text: text, tip: tip, inMore: inMore, remove: { [weak self] in self?.removeFileFilter(clear) }))
+        }
+        func doc(_ key: String, _ text: String, _ tip: String, _ change: @escaping @MainActor (SearchFilterBar) -> DocChange) {
+            out.append(ChipSpec(key: key, text: text, tip: tip, inMore: indexed, remove: { [weak self] in
+                guard let self else { return }
+                self.onDocChange?(change(self))
+            }))
+        }
+        if filters.kind != .any {
+            file("kind", filters.kind.title, "File type: \(filters.kind.title)", inMore: false) { $0.kind = .any }
+        }
+        if filters.date != .any {
+            file("date", "Modified: \(filters.date.title)", "Modified: \(filters.date.title)", inMore: false) { $0.date = .any }
+        }
+        if !indexed && filters.size != .any {
+            file("size", filters.size.title, "Size: \(filters.size.title)", inMore: false) { $0.size = .any }
+        }
+        if indexed && filters.method != .hybrid {
+            file("method", filters.method.title, "Search method: \(filters.method.title)", inMore: true) { $0.method = .hybrid }
+        }
+        if !filters.includeTerms.isEmpty {
+            let t = filters.includeTerms.joined(separator: ", ")
+            file("include", "Include: \(t)", "Include: \(t)", inMore: true) { $0.include = "" }
+        }
+        if !filters.excludeTerms.isEmpty {
+            let t = filters.excludeTerms.joined(separator: ", ")
+            file("exclude", "Exclude: \(t)", "Exclude: \(t)", inMore: true) { $0.exclude = "" }
+        }
+        for t in docs.types {
+            doc("type:\(t.key)", t.title, "Document type: \(t.title)") { .types($0.docs.types.filter { $0 != t }) }
+        }
+        if docs.amount != .any {
+            let text: String
+            switch docs.amount {
+            case .under100: text = "< 100"
+            case .over500: text = "> 500"
+            case .custom(let lo, let hi):
+                switch (lo, hi) {
+                case let (l?, nil): text = "\u{2265} \(AmountChoice.text(l))"
+                case let (nil, h?): text = "\u{2264} \(AmountChoice.text(h))"
+                default: text = docs.amount.title
+                }
+            default: text = docs.amount.title
+            }
+            doc("amount", text, "Amount: \(docs.amount.title)") { _ in .amount(.any) }
+        }
+        if let c = docs.currency {
+            doc("currency", c, "Currency: \(c)") { _ in .currency(nil) }
+        }
+        if !docs.party.isEmpty {
+            doc("party", "Party: \(docs.party)", "Party: \(docs.party)") { _ in .party("") }
+        }
+        if docs.docdate != .any {
+            doc("docdate", "Document date: \(docs.docdate.title)", "Document date: \(docs.docdate.title)") { _ in .docdate(.any) }
+        }
+        return out
+    }
+
+    /// A chip of a file filter was removed: the same path as its pop-up. The controls show the new filters, then the
+    /// controller hears of the change (onChange) and runs the search again.
+    private func removeFileFilter(_ clear: (inout SearchFilters) -> Void) {
+        clear(&filters)
+        syncControls()
+        emit()
+    }
+
+    /// Rebuilds the chips when what they say has changed; a chip that still says the same is kept.
+    private func updateChips() {
+        let specs = chipSpecs()
+        chipsInMore = specs.filter { $0.inMore }.count
+        let keys = specs.map { "\($0.key)|\($0.text)" }
+        guard keys != chipKeys else { return }
+        chipKeys = keys
+        chips = specs.map { FilterChipView(text: $0.text, tip: $0.tip, remove: $0.remove) }
+    }
+
+    /// "More filters (n)": n is the number of filters set inside the group. The chevron shows whether the group is open.
+    private func updateMoreButton() {
+        moreButton.title = chipsInMore > 0 ? "More filters (\(chipsInMore))" : "More filters"
+        let symbol = moreOpen ? "chevron.down" : "chevron.right"
+        moreButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(MSEStyle.symbolConfig)
+        moreButton.setAccessibilityExpanded(moreOpen)
+    }
+
+    @objc private func moreToggled(_ sender: Any?) {
+        moreOpen.toggle()
+        updateMoreButton()
+        reflow()
+    }
+
+    /// Everything that depends on the filters: the chips, the button, Clear and the lines.
+    private func refresh() {
+        updateChips()
+        updateMoreButton()
+        reflow()
+    }
+
+    // MARK: lines
+
+    /// One logical line of controls. A line that is wider than the bar wraps onto further rows of its own.
+    private struct Line {
+        let key: String
+        let items: [NSView]
+        let spacing: CGFloat
+    }
+
+    /// The lines in order. Membership, not isHidden, decides what is on screen: a control that is not listed is not in the bar.
+    private func lines() -> [Line] {
+        var out: [Line] = []
+        var scopeRow: [NSView] = [scopeButton, namesCheck, contentsCheck]
+        if mode == .indexed { scopeRow += [viewSeg, saveButton] }
+        out.append(Line(key: "a", items: scopeRow, spacing: 10))
+        // More filters sits before Clear, so it keeps its place when Clear appears with the first filter
+        var filterRow: [NSView] = [typePop, modifiedGroup, mode == .mac ? sizePop : sortPop, moreButton]
+        if clearVisible { filterRow.append(clearButton) }
+        out.append(Line(key: "b", items: filterRow, spacing: 10))
+        if !chips.isEmpty { out.append(Line(key: "c", items: chips, spacing: 8)) }
+        if moreOpen {
+            if mode == .indexed {
+                out.append(Line(key: "m", items: [methodSeg], spacing: 10))
+                out.append(Line(key: "d", items: [docTypePop, amountPop, currencyPop, partyField, docDateGroup], spacing: 10))
+            }
+            out.append(Line(key: "g", items: [includeGroup, excludeGroup], spacing: 10))
+        }
+        return out
+    }
+
+    /// Greedy line breaking: items fill a row until the next one no longer fits. A row has at least one item.
+    private func wrap(_ items: [NSView], width: CGFloat, spacing: CGFloat) -> [[NSView]] {
+        var rows: [[NSView]] = [[]]
+        var used: CGFloat = 0
+        for v in items {
+            // the stack lays controls out by their alignment rects: a pop-up's frame is wider than the pill it draws, so the
+            // frame's width (fittingSize) would count the shadow margins and wrap a row that fits
+            let size = v.fittingSize
+            let w = v.alignmentRect(forFrame: NSRect(origin: .zero, size: size)).width
+            if rows[rows.count - 1].isEmpty {
+                rows[rows.count - 1].append(v)
+                used = w
+            } else if used + spacing + w <= width {
+                rows[rows.count - 1].append(v)
+                used += spacing + w
+            } else {
+                rows.append([v])
+                used = w
+            }
+        }
+        return rows
+    }
+
+    private func rowStack(_ key: String, spacing: CGFloat) -> NSStackView {
+        if let r = rowStacks[key] { return r }
+        let r = NSStackView()
+        r.orientation = .horizontal
+        r.alignment = .centerY
+        r.spacing = spacing
+        // a row takes the width of its controls: it is not stretched to the bar's width, where the spare width spread
+        // its controls differently from one render to the next
+        r.setHuggingPriority(.required, for: .horizontal)
+        rowStacks[key] = r
+        return r
+    }
+
+    /// Lays the lines out in `width`. Only a row whose controls changed gets setViews, and the rows themselves stay in the bar
+    /// (a missing one is inserted), so a field that is being typed in is not detached while a chip appears next to it.
+    private func applyLayout(width: CGFloat) {
+        var rows: [(key: String, items: [NSView], spacing: CGFloat)] = []
+        for line in lines() {
+            for (i, items) in wrap(line.items, width: width, spacing: line.spacing).enumerated() {
+                rows.append((key: "\(line.key)\(i)", items: items, spacing: line.spacing))
+            }
+        }
+        let order = rows.map { $0.key }
+        for r in rows {
+            let stack = rowStack(r.key, spacing: r.spacing)
+            let ids = r.items.map { ObjectIdentifier($0) }
+            if appliedRows[r.key] != ids {
+                stack.setViews(r.items, in: .leading)
+                appliedRows[r.key] = ids
+            }
+        }
+        for key in appliedOrder where !order.contains(key) {
+            guard let stack = rowStacks[key] else { continue }
+            stack.setViews([], in: .leading)
+            appliedRows[key] = nil
+            removeArrangedSubview(stack)
+            stack.removeFromSuperview()
+        }
+        for (i, key) in order.enumerated() {
+            guard let stack = rowStacks[key], !arrangedSubviews.contains(stack) else { continue }
+            insertArrangedSubview(stack, at: min(i, arrangedSubviews.count))
+        }
+        appliedOrder = order
+    }
+
+    /// Lays the lines out in the width the owning header offers.
+    private func reflow() {
+        var width = SearchFilterBar.seedWidth
+        if let host = superview?.superview, host.bounds.width > 200 { width = host.bounds.width - 24 }
+        applyLayout(width: width)
     }
 
     override func viewDidMoveToSuperview() {
@@ -244,11 +760,19 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
 
     @objc private func hostResized(_ n: Notification) { reflow() }
 
+    /// The layout follows the width the owning header gives the bar at every layout pass. The header is not in the
+    /// window yet when the bar is first added, so the frame observer above can be missed, and a reflow that ran too
+    /// early left the controls on two rows. Deciding in layout makes the arrangement follow the final width.
+    override func layout() {
+        super.layout()
+        reflow()
+    }
+
     /// The scope button: its title and symbol, what it stands for, and whether the scope comes from a shortcut typed in
     /// the search field ("work: ..."), which shows in the accent colour.
     func setScope(title: String, symbol: String, tooltip: String, fromQuery: Bool) {
         scopeButton.title = title + (fromQuery ? " (typed)" : "") + "  \u{25BE}"
-        scopeButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        scopeButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?.withSymbolConfiguration(MSEStyle.symbolConfig)
         scopeButton.contentTintColor = fromQuery ? .controlAccentColor : nil
         scopeButton.toolTip = tooltip + (fromQuery
             ? "\nSet by the shortcut in the search text. Choosing here replaces it."
@@ -256,14 +780,16 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
     }
 
     /// Shows the two boxes. In the Whole Mac scope file names are always searched and contents are not available.
-    func setSources(names: Bool, contents: Bool, macScope: Bool) {
-        namesCheck.state = (macScope || names) ? .on : .off
+    func setSources(names: Bool, contents: Bool, macScope: Bool, namesOff: Bool = false) {
+        namesCheck.state = (macScope || names) && !namesOff ? .on : .off
         contentsCheck.state = (!macScope && contents) ? .on : .off
-        namesCheck.isEnabled = !macScope
+        namesCheck.isEnabled = !macScope && !namesOff
         contentsCheck.isEnabled = !macScope
         namesCheck.toolTip = macScope
             ? "The whole Mac is searched by file name."
-            : "File names: the instant search by name. Turn it off to search contents only."
+            : namesOff
+                ? "Not searched with document filters: a file name has no type, amount or date. Clear the document filters to search names again."
+                : "File names: the instant search by name. Turn it off to search contents only."
         contentsCheck.toolTip = macScope
             ? "Contents are searched in indexed folders only. Pick a folder or group with the scope button (\u{2318}\u{2325}F)."
             : "Contents: the deep search of words and meaning inside the indexed files. Turn it off for the instant search by name only (no embedding, no re-ranking)."
@@ -285,14 +811,11 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
         onSourcesChanged?(namesCheck.state == .on, contentsCheck.state == .on, sender === namesCheck)
     }
 
-    /// Mac scope shows type, date, size and the globs; Indexed scope shows type, date, method, sort and the globs.
+    /// Mac scope shows type, Modified, size and, behind More filters, the globs; Indexed scope shows type, Modified, sort and,
+    /// behind More filters, the method, the document filters and the globs.
     func setMode(_ m: Mode) {
         mode = m
-        sizePop.isHidden = m == .indexed
-        methodSeg.isHidden = m == .mac
-        sortPop.isHidden = m == .mac
         syncControls()
-        reflow()
     }
 
     /// Shows `f` in the controls without sending a change.
@@ -318,8 +841,7 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
         methodSeg.selectedSegment = methods.firstIndex(of: filters.method) ?? 0
         if include.stringValue != filters.include { include.stringValue = filters.include }
         if exclude.stringValue != filters.exclude { exclude.stringValue = filters.exclude }
-        clearButton.isHidden = !filters.isActive
-        reflow()
+        refresh()
     }
 
     /// The custom range shows as its own item, selected, after the separator.
@@ -334,8 +856,7 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
     }
 
     private func emit() {
-        clearButton.isHidden = !filters.isActive
-        reflow()
+        refresh()
         guard !quiet else { return }
         onChange?(filters)
     }
@@ -384,6 +905,16 @@ final class SearchFilterBar: NSStackView, NSTextFieldDelegate {
 
     /// Typing in a glob field waits for a short pause, so each keystroke does not start a search.
     func controlTextDidChange(_ obj: Notification) {
+        if let field = obj.object as? NSTextField, field === partyField {
+            partyDebounce?.cancel()
+            let text = partyField.stringValue
+            partyDebounce = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                guard let self, !Task.isCancelled else { return }
+                self.onDocChange?(.party(text))
+            }
+            return
+        }
         readGlobs()
         debounce?.cancel()
         debounce = Task { @MainActor [weak self] in
@@ -509,6 +1040,59 @@ final class FacetChip: NSButton {
     @objc private func pressed() { onPress() }
 }
 
+/// The chip of one filter that is set: its text and an x. Only the x removes the filter (the remove closure the bar gave it).
+/// The pill is drawn, not layered, so its colours follow the appearance (light, dark) every time it is drawn.
+@MainActor
+final class FilterChipView: NSStackView {
+    private let onRemove: () -> Void
+    private let label: NSTextField
+
+    init(text: String, tip: String, remove: @escaping () -> Void) {
+        onRemove = remove
+        label = NSTextField(labelWithString: text)
+        super.init(frame: .zero)
+        orientation = .horizontal
+        alignment = .centerY
+        spacing = 2
+        edgeInsets = NSEdgeInsets(top: 0, left: 10, bottom: 0, right: 3)
+        translatesAutoresizingMaskIntoConstraints = false
+        setHuggingPriority(.required, for: .horizontal)
+        toolTip = tip
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let x = NSButton(title: "", target: self, action: #selector(removePressed))
+        x.isBordered = false
+        x.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: nil)?.withSymbolConfiguration(MSEStyle.symbolConfig)
+        x.imagePosition = .imageOnly
+        x.contentTintColor = MSEStyle.secondary
+        x.toolTip = "Remove this filter"
+        x.setAccessibilityLabel("Remove filter \(text)")
+        x.translatesAutoresizingMaskIntoConstraints = false
+        x.widthAnchor.constraint(equalToConstant: 22).isActive = true
+        setViews([label, x], in: .leading)
+        heightAnchor.constraint(equalToConstant: 22).isActive = true
+        widthAnchor.constraint(lessThanOrEqualToConstant: 260).isActive = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: bounds.height / 2, yRadius: bounds.height / 2)
+        NSColor.controlAccentColor.withAlphaComponent(0.14).setFill()
+        path.fill()
+        NSColor.controlAccentColor.withAlphaComponent(0.5).setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        super.draw(dirtyRect)
+    }
+
+    @objc private func removePressed() {
+        withExtendedLifetime(self) { onRemove() }
+    }
+}
+
 /// The custom date range sheet: two day pickers, From and To, then Cancel or Apply.
 @MainActor
 final class DateRangeSheet: NSObject {
@@ -581,6 +1165,89 @@ final class DateRangeSheet: NSObject {
         if a > b { swap(&a, &b) }
         panel.sheetParent?.endSheet(panel)
         onApply(a, b)
+    }
+
+    @objc private func cancelPressed() {
+        panel.sheetParent?.endSheet(panel)
+        onCancel()
+    }
+}
+
+/// The custom amount sheet: a minimum and a maximum, either may be left empty. Apply sends (min, max), nil for an empty
+/// field; Cancel sends nothing. A value that is not a number is read as empty.
+@MainActor
+final class AmountRangeSheet: NSObject {
+    private let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 340, height: 150),
+                                styleMask: [.titled], backing: .buffered, defer: false)
+    private let minField = NSTextField()
+    private let maxField = NSTextField()
+    private let onApply: (Double?, Double?) -> Void
+    private let onCancel: () -> Void
+
+    init(lo: Double?, hi: Double?, apply: @escaping (Double?, Double?) -> Void, cancel: @escaping () -> Void) {
+        onApply = apply
+        onCancel = cancel
+        super.init()
+        for (field, value, placeholder) in [(minField, lo, "No minimum"), (maxField, hi, "No maximum")] {
+            field.placeholderString = placeholder
+            field.stringValue = value.map { AmountChoice.text($0) } ?? ""
+            field.controlSize = .regular
+            field.translatesAutoresizingMaskIntoConstraints = false
+            field.widthAnchor.constraint(equalToConstant: 160).isActive = true
+            field.setAccessibilityLabel(placeholder == "No minimum" ? "Minimum amount" : "Maximum amount")
+        }
+        let title = NSTextField(labelWithString: "Custom amount")
+        title.font = .systemFont(ofSize: 13, weight: .semibold)
+        let minRow = NSStackView(views: [NSTextField(labelWithString: "Minimum"), minField])
+        let maxRow = NSStackView(views: [NSTextField(labelWithString: "Maximum"), maxField])
+        for r in [minRow, maxRow] {
+            r.orientation = .horizontal
+            r.alignment = .centerY
+            r.spacing = 12
+            r.arrangedSubviews.first?.widthAnchor.constraint(equalToConstant: 70).isActive = true
+        }
+        let cancelButton = NSButton(title: "Cancel", target: self, action: #selector(cancelPressed))
+        cancelButton.keyEquivalent = "\u{1b}"
+        let applyButton = NSButton(title: "Apply", target: self, action: #selector(applyPressed))
+        applyButton.keyEquivalent = "\r"
+        applyButton.bezelStyle = .rounded
+        let buttons = NSStackView(views: [cancelButton, applyButton])
+        buttons.orientation = .horizontal
+        buttons.spacing = 10
+        let stack = NSStackView(views: [title, minRow, maxRow, buttons])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let container = NSView()
+        container.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
+            stack.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -20),
+            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 18),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: container.bottomAnchor, constant: -18),
+        ])
+        panel.contentView = container
+    }
+
+    /// Shows the sheet on `window`; Apply and Cancel end it.
+    func present(on window: NSWindow) {
+        window.beginSheet(panel) { _ in }
+    }
+
+    /// The panel, for the snapshot (composited into the main window's picture).
+    var sheetPanel: NSPanel { panel }
+
+    private func number(_ field: NSTextField) -> Double? {
+        let v = field.stringValue.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: "")
+        return v.isEmpty ? nil : Double(v)
+    }
+
+    @objc private func applyPressed() {
+        var lo = number(minField), hi = number(maxField)
+        if let a = lo, let b = hi, a > b { swap(&lo, &hi) }
+        panel.sheetParent?.endSheet(panel)
+        onApply(lo, hi)
     }
 
     @objc private func cancelPressed() {

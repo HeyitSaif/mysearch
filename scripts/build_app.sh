@@ -3,13 +3,18 @@
 #   ./scripts/build_app.sh --install     installs into ~/Applications and registers it with Launch Services
 #   MSE_APP_DIR=<folder> ./scripts/build_app.sh   builds into <folder>, without registering it (test builds)
 #   ./scripts/build_app.sh               builds into ./build/MySearch.app in this project
+#   ./scripts/build_app.sh --bundle-runtime   also puts a relocatable Python runtime, the locked dependencies and the mse package
+#                                        inside the app (scripts/bundle_runtime.sh), so it runs on a Mac with no clone and no
+#                                        venv. Without the flag the app uses the project's .venv, as before.
 set -e
 here="$(cd "$(dirname "$0")/.." && pwd)"
 install=""
+bundle=""
 for a in "$@"; do
   case "$a" in
     --install) install=1 ;;
-    *) echo "unknown option: $a (only --install is accepted)" >&2; exit 2 ;;
+    --bundle-runtime) bundle=1 ;;
+    *) echo "unknown option: $a (accepted: --install, --bundle-runtime)" >&2; exit 2 ;;
   esac
 done
 if [ -n "$MSE_APP_DIR" ]; then
@@ -24,7 +29,7 @@ build="$(mktemp -d)"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
 # every app/*.swift (main.swift is the entry)
-swiftc -O -swift-version 5 -o "$app/Contents/MacOS/MySearch" "$here"/app/*.swift \
+swiftc -O -swift-version 5 -target arm64-apple-macos14.0 -o "$app/Contents/MacOS/MySearch" "$here"/app/*.swift \
   -framework Cocoa -framework WebKit -framework Carbon -framework Quartz -framework QuickLookThumbnailing -framework ServiceManagement
 
 # Finder Sync extension (app/FinderExtension/): MySearch.app/Contents/PlugIns/MySearchFinder.appex, sandboxed, ad-hoc signed here
@@ -34,7 +39,7 @@ ext="$here/app/FinderExtension"
 appex="$app/Contents/PlugIns/MySearchFinder.appex"
 rm -rf "$appex"
 mkdir -p "$appex/Contents/MacOS"
-swiftc -O -swift-version 5 -application-extension -parse-as-library -module-name MySearchFinder \
+swiftc -O -swift-version 5 -target arm64-apple-macos14.0 -application-extension -parse-as-library -module-name MySearchFinder \
   -o "$appex/Contents/MacOS/MySearchFinder" "$ext"/*.swift \
   -framework Cocoa -framework FinderSync -framework Foundation \
   -Xlinker -e -Xlinker _NSExtensionMain
@@ -71,7 +76,7 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>CFBundleExecutable</key><string>MySearch</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.2</string>
+  <key>CFBundleShortVersionString</key><string>0.1.3</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
@@ -83,6 +88,16 @@ cat > "$app/Contents/Info.plist" <<EOF
   </dict></array>
 </dict></plist>
 EOF
+# Licence files: every build carries them, bundled runtime or not (the app holds MIT code adapted from FinderFlow, whose
+# notice has to travel with it). They are copied over any earlier copy, before the app is sealed by codesign below.
+# With --bundle-runtime, bundle_runtime.sh also copies the licence texts of the GPL/LGPL code in the wheels (Licenses/).
+cp "$here/LICENSE" "$app/Contents/Resources/LICENSE"
+cp "$here/THIRD_PARTY_NOTICES.md" "$app/Contents/Resources/THIRD_PARTY_NOTICES.md"
+# the bundled runtime goes in before the seal: its Mach-O files are signed first (ad hoc here, build_dmg.sh signs them again)
+if [ -n "$bundle" ]; then
+  "$here/scripts/bundle_runtime.sh" install "$app" >&2
+  "$here/scripts/bundle_runtime.sh" sign "$app" --identity - >&2
+fi
 codesign --force --sign - "$app" >/dev/null 2>&1 || true
 # register the mysearch:// scheme (and the new icon) with Launch Services right away; only for --install, never for a test build
 if [ -n "$install" ] && [ -z "$MSE_APP_DIR" ]; then

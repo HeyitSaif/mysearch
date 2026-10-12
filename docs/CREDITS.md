@@ -5,6 +5,7 @@ MySearch uses, or took ideas from, the projects, models, papers and platforms be
 ## Inspiration
 
 - [fsearch](https://github.com/noahdunnagan/fsearch) by noahdunnagan. MIT. `mse/filequery.py` follows its file-name query language (`ext:`, `size:`, `type:`, `path:`) and adds operators of its own.
+- [fff](https://github.com/dmtrKovalenko/fff) by Dmitriy Kovalenko. MIT. Ideas only, no code: smart case, ranking a match in the file name above a match in the folder path (+40 % when the name is the query, +16 % capped inside it), glob constraints with `!` exclusion, a recency-and-frequency score for opened files with a boost for the file last opened for the same query (`mse/frecency.py`), and honouring ignore files in git repositories (`mse/gitignore.py`). `mse/filequery.py`, `mse/frecency.py` and `mse/gitignore.py` are written from those descriptions; the name index and its query plan are MySearch's own.
 - [Everything](https://www.voidtools.com/) by voidtools. The README names it as the model for instant file-name search on the Mac (`README.md`).
 - [Shuffle](https://www.shuffleapp.co/) by Shuffle. Only its ideas were taken, no code: the command palette (`app/CommandPalette.swift`) and the dual panes (`app/SplitPanes.swift`).
 

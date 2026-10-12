@@ -28,7 +28,7 @@ final class ClassicWindowController: NSObject, NSWindowDelegate {
 
     /// Shows the window, loading the old UI the first time (and again after a reload).
     func show() {
-        if pane.retryURL == nil { reload() }
+        if pane.retryURL == nil || pane.authFailed { reload() }     // a refused token is tried again when the window opens
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
     }
@@ -39,4 +39,7 @@ final class ClassicWindowController: NSObject, NSWindowDelegate {
     }
 
     var isKey: Bool { window.isKeyWindow }
+
+    /// Closes the window (used when the Classic interface is turned off). The next show loads it again.
+    func hide() { window.orderOut(nil) }
 }

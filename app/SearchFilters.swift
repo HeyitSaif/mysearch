@@ -336,7 +336,7 @@ struct GlobMatcher {
     }
 }
 
-/// The filter sets the snapshot states show (search-indexed-filters, search-indexed-custom-date, search-mac-filters).
+/// The filter sets the snapshot states show (search-indexed-filters, search-indexed-custom-date, search-mac-filters, search-indexed-chips).
 enum SnapshotFilters {
     static var indexed: SearchFilters {
         var f = SearchFilters()
@@ -355,6 +355,16 @@ enum SnapshotFilters {
         f.date = .year
         f.include = "*.pdf"
         f.exclude = "Downloads/"
+        return f
+    }
+
+    /// search-indexed-chips and search-indexed-more: file filters from three groups (type, date, include); the document
+    /// filters come from the search text of the state.
+    static var chips: SearchFilters {
+        var f = SearchFilters()
+        f.kind = .pdf
+        f.date = .month
+        f.include = "*.pdf"
         return f
     }
 }
@@ -383,5 +393,371 @@ enum RecentSearches {
     static func clear() {
         UserDefaults.standard.removeObject(forKey: key)
         NotificationCenter.default.post(name: didChange, object: nil)
+    }
+}
+
+// MARK: - Document filters (type, amount, currency, party, document date)
+// They live in the search text as operators, as the server reads them (mse/search.py, mse/docmeta.py): type:invoice (or
+// doctype:other), amount:>500, currency:EUR, party:acme, docdate:2025-03. The text is the one source: a pop-up change
+// rewrites the operators of its group in the text and runs the search again, and a typed operator sets its pop-up. The
+// server echoes the filters it applied (res.filters), and those are shown when the text says it in plain language.
+
+/// What a document is (the names of mse/docmeta.py DOCTYPES, with the aliases of DOCTYPE_ALIASES).
+enum DocType: String, CaseIterable {
+    case invoice, receipt, bankStatement = "bank_statement", contract, letter, quote, reminder, payslip
+    case taxDocument = "tax_document", other
+
+    /// The name the search text uses.
+    var key: String { rawValue }
+
+    /// The pop-up and badge label.
+    var title: String {
+        switch self {
+        case .invoice: return "Invoice"
+        case .receipt: return "Receipt"
+        case .bankStatement: return "Statement"
+        case .contract: return "Contract"
+        case .letter: return "Letter"
+        case .quote: return "Quote"
+        case .reminder: return "Reminder"
+        case .payslip: return "Payslip"
+        case .taxDocument: return "Tax"
+        case .other: return "Other"
+        }
+    }
+
+    /// The aliases the server accepts for a type, lower case (docmeta.DOCTYPE_ALIASES).
+    private static let aliases: [String: DocType] = [
+        "invoices": .invoice, "rechnung": .invoice, "rechnungen": .invoice, "faktura": .invoice,
+        "receipts": .receipt, "quittung": .receipt, "quittungen": .receipt, "kassenbon": .receipt,
+        "kassenbons": .receipt, "kassenbeleg": .receipt,
+        "bank-statement": .bankStatement, "bankstatement": .bankStatement, "statement": .bankStatement,
+        "statements": .bankStatement, "bank_statements": .bankStatement, "kontoauszug": .bankStatement,
+        "kontoauszuege": .bankStatement, "kontoauszüge": .bankStatement, "kontoauszuge": .bankStatement,
+        "contracts": .contract, "vertrag": .contract, "vertraege": .contract, "verträge": .contract,
+        "vertrage": .contract, "agreement": .contract, "agreements": .contract,
+        "letters": .letter, "brief": .letter, "briefe": .letter,
+        "quotes": .quote, "quotation": .quote, "quotations": .quote, "angebot": .quote, "angebote": .quote,
+        "offer": .quote, "offers": .quote,
+        "reminders": .reminder, "mahnung": .reminder, "mahnungen": .reminder, "dunning": .reminder,
+        "payslips": .payslip, "lohnabrechnung": .payslip, "lohnabrechnungen": .payslip,
+        "gehaltsabrechnung": .payslip, "gehaltsabrechnungen": .payslip,
+        "tax-document": .taxDocument, "tax_documents": .taxDocument, "tax": .taxDocument, "steuer": .taxDocument,
+        "steuerdokument": .taxDocument, "steuerbescheid": .taxDocument,
+    ]
+
+    /// The document type a name stands for (canonical or alias, any case). `other` is returned for "other" too: the caller
+    /// decides whether that counts (in type: it is the file kind other, so only doctype: means the document type).
+    static func named(_ value: String) -> DocType? {
+        let key = value.trimmingCharacters(in: .whitespaces).lowercased()
+        return DocType(rawValue: key) ?? aliases[key]
+    }
+}
+
+/// The amount presets of the Amount pop-up, and a custom minimum and maximum (either may be open).
+enum AmountChoice: Equatable {
+    case any, under100, between100and500, over500
+    case custom(Double?, Double?)
+
+    var title: String {
+        switch self {
+        case .any: return "Any amount"
+        case .under100: return "Under 100"
+        case .between100and500: return "100 to 500"
+        case .over500: return "Over 500"
+        case .custom(let lo, let hi):
+            switch (lo, hi) {
+            case let (l?, h?): return "\(AmountChoice.text(l)) to \(AmountChoice.text(h))"
+            case let (l?, nil): return "From \(AmountChoice.text(l))"
+            case let (nil, h?): return "Up to \(AmountChoice.text(h))"
+            default: return "Any amount"
+            }
+        }
+    }
+
+    /// A number as the operators write it: 500 for 500, 12.5 for 12.5.
+    static func text(_ v: Double) -> String {
+        v == v.rounded() ? String(Int(v)) : String(v)
+    }
+
+    /// The bounds of a custom choice, for the amount sheet (nil, nil for the presets).
+    var customBounds: (Double?, Double?) {
+        if case .custom(let lo, let hi) = self { return (lo, hi) }
+        return (nil, nil)
+    }
+
+    /// The operators of this choice (amount:…), in the form the server reads.
+    var operators: [String] {
+        switch self {
+        case .any: return []
+        case .under100: return ["amount:<100"]
+        case .between100and500: return ["amount:100..500"]
+        case .over500: return ["amount:>500"]
+        case .custom(let lo, let hi):
+            switch (lo, hi) {
+            case let (l?, h?): return ["amount:\(AmountChoice.text(l))..\(AmountChoice.text(h))"]
+            case let (l?, nil): return ["amount:>=\(AmountChoice.text(l))"]
+            case let (nil, h?): return ["amount:<=\(AmountChoice.text(h))"]
+            default: return []
+            }
+        }
+    }
+}
+
+/// The document filters of a search text (or of the server's answer to it).
+struct DocFilters: Equatable {
+    var types: [DocType] = []
+    var amount: AmountChoice = .any
+    var currency: String? = nil
+    var party = ""
+    var docdate: DatePreset = .any
+
+    var isActive: Bool { !types.isEmpty || amount != .any || currency != nil || !party.isEmpty || docdate != .any }
+
+    /// The filters the (key, value) pairs of a query or of res.filters name. type: counts only for a document type (not a
+    /// file kind such as pdf); doctype: counts for every document type, other included.
+    init(pairs: [(key: String, value: String)] = []) {
+        var amounts: [String] = []
+        var docdates: [String] = []
+        for (key, raw) in pairs {
+            let value = DocQuery.unquote(raw)
+            switch key {
+            case "type", "doctype":
+                if let t = DocType.named(value), key == "doctype" || t != .other, !types.contains(t) { types.append(t) }
+            case "amount": amounts.append(value)
+            case "currency": if currency == nil, !value.isEmpty { currency = value.uppercased() }
+            case "party": if party.isEmpty { party = value }
+            case "docdate": docdates.append(value)
+            default: break
+            }
+        }
+        amount = DocFilters.amountChoice(amounts)
+        docdate = DocFilters.datePreset(docdates)
+    }
+
+    /// The filters the server applied, from res.filters ({key: [values]}).
+    init(serverFilters: [String: Any]) {
+        var pairs: [(key: String, value: String)] = []
+        for key in ["type", "doctype", "amount", "currency", "party", "docdate"] {
+            for v in (serverFilters[key] as? [Any]) ?? [] {
+                if let s = v as? String { pairs.append((key, s)) }
+            }
+        }
+        self.init(pairs: pairs)
+    }
+
+    /// Amount operators -> the preset when they say exactly one of them, else a custom range (a lower and an upper bound).
+    static func amountChoice(_ values: [String]) -> AmountChoice {
+        if values.isEmpty { return .any }
+        var lo: Double?, hi: Double?
+        for v in values {
+            guard let b = AmountOperator.bounds(v) else { continue }
+            if let l = b.0 { lo = max(lo ?? l, l) }
+            if let h = b.1 { hi = min(hi ?? h, h) }
+        }
+        switch (lo, hi) {
+        case (nil, 100?): return .under100
+        case (100?, 500?): return .between100and500
+        case (500?, nil): return .over500
+        case (nil, nil): return .any
+        default: return .custom(lo, hi)
+        }
+    }
+
+    /// The date of the document: a year (this year, or any other), a month, a day, or a range; a year-long or open range
+    /// is the custom range. "This year" is the year itself.
+    static func datePreset(_ values: [String]) -> DatePreset {
+        guard let v = values.last, let range = DocDate.range(v) else { return .any }
+        if v == String(Calendar.current.component(.year, from: Date())) { return .year }
+        return .custom(range.0, range.1)
+    }
+}
+
+/// The operator grammar of amount: values (">500", ">=500", "<100", "<=100", "100..500", "500") as bounds.
+enum AmountOperator {
+    /// (lower, upper) of one value; nil when the value is not an amount.
+    static func bounds(_ raw: String) -> (Double?, Double?)? {
+        let v = raw.replacingOccurrences(of: " ", with: "").replacingOccurrences(of: ",", with: "")
+        if let r = v.range(of: "..") {
+            let lo = Double(v[..<r.lowerBound]), hi = Double(v[r.upperBound...])
+            if lo == nil && hi == nil { return nil }
+            return (lo, hi)
+        }
+        for op in [">=", "<=", ">", "<", "="] where v.hasPrefix(op) {
+            guard let n = Double(v.dropFirst(op.count)) else { return nil }
+            switch op {
+            case ">", ">=": return (n, nil)
+            case "<", "<=": return (nil, n)
+            default: return (n, n)
+            }
+        }
+        guard let n = Double(v) else { return nil }
+        return (n, n)
+    }
+}
+
+/// The document-date values of a docdate: operator (2025, 2025-03, 2025-03-14, 2025-01..2025-06, 2025-01-01.., ..2025-06)
+/// as the first and last day they cover. Days are local; the server counts whole days.
+enum DocDate {
+    private static let day: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+
+    /// The first and last day of one period (2025, 2025-03, 2025-03-14).
+    static func period(_ v: String) -> (Date, Date)? {
+        let cal = Calendar.current
+        let parts = v.split(separator: "-").map(String.init)
+        guard let y = Int(parts.first ?? "") else { return nil }
+        if parts.count == 1 {
+            guard let a = cal.date(from: DateComponents(year: y, month: 1, day: 1)),
+                  let b = cal.date(from: DateComponents(year: y, month: 12, day: 31)) else { return nil }
+            return (a, b)
+        }
+        guard let m = Int(parts[1]) else { return nil }
+        if parts.count == 2 {
+            guard let a = cal.date(from: DateComponents(year: y, month: m, day: 1)),
+                  let next = cal.date(byAdding: .month, value: 1, to: a),
+                  let b = cal.date(byAdding: .day, value: -1, to: next) else { return nil }
+            return (a, b)
+        }
+        guard let d = day.date(from: v) else { return nil }
+        return (d, d)
+    }
+
+    /// The first and last day a docdate value covers; nil when it is not a date.
+    static func range(_ raw: String) -> (Date, Date)? {
+        let v = raw.trimmingCharacters(in: .whitespaces)
+        guard let r = v.range(of: "..") else { return period(v) }
+        let a = String(v[..<r.lowerBound]), b = String(v[r.upperBound...])
+        let lo = a.isEmpty ? Date.distantPast : period(a)?.0
+        let hi = b.isEmpty ? Date() : period(b)?.1
+        guard let lo, let hi else { return nil }
+        return (lo, hi)
+    }
+}
+
+/// The text operators of the document filters: reading them, and writing them back.
+enum DocQuery {
+    /// The operator names this file owns (type: only for a document type; see DocFilters).
+    static let keys: Set<String> = ["type", "doctype", "amount", "currency", "party", "docdate"]
+
+    /// The whitespace-separated tokens of a search text. A quoted run stays one token (party:"acme gmbh").
+    static func tokens(_ text: String) -> [String] {
+        var out: [String] = []
+        var current = ""
+        var quoted = false
+        for ch in text {
+            if ch == "\"" { quoted.toggle(); current.append(ch); continue }
+            if ch.isWhitespace && !quoted {
+                if !current.isEmpty { out.append(current); current = "" }
+                continue
+            }
+            current.append(ch)
+        }
+        if !current.isEmpty { out.append(current) }
+        return out
+    }
+
+    /// The (key, value) of an operator token ("party:acme" -> ("party", "acme")); nil for a word.
+    static func pair(_ token: String) -> (key: String, value: String)? {
+        guard let colon = token.firstIndex(of: ":") else { return nil }
+        let key = token[..<colon].lowercased()
+        guard keys.contains(key) || ["after", "before", "kind", "ext", "include", "exclude"].contains(key) else { return nil }
+        return (key, String(token[token.index(after: colon)...]))
+    }
+
+    /// Removes the quotes around a value ("\"muster logistik\"" -> muster logistik).
+    static func unquote(_ value: String) -> String {
+        value.count >= 2 && value.hasPrefix("\"") && value.hasSuffix("\"") ? String(value.dropFirst().dropLast()) : value
+    }
+
+    /// The document filters a text carries (its operators only; plain-language filters are the server's to say).
+    static func parse(_ text: String) -> DocFilters {
+        var pairs: [(key: String, value: String)] = []
+        for t in tokens(text) {
+            guard let p = pair(t), isDocOperator(p.key, p.value) else { continue }
+            pairs.append(p)
+        }
+        return DocFilters(pairs: pairs)
+    }
+
+    /// Whether an operator belongs to the document filters: type: only with a document type (type:pdf is a file kind).
+    static func isDocOperator(_ key: String, _ value: String) -> Bool {
+        switch key {
+        case "type": return DocType.named(DocQuery.unquote(value)).map { $0 != .other } ?? false
+        case "doctype", "amount", "currency", "party", "docdate": return true
+        default: return false
+        }
+    }
+
+    /// The groups the pop-ups change; each owns the operators of its keys.
+    enum Group: CaseIterable { case type, amount, currency, party, docdate }
+
+    /// Whether a token is one of the operators of a group (the rewrite replaces exactly these).
+    static func belongs(_ token: String, to group: Group) -> Bool {
+        guard let p = pair(token), isDocOperator(p.key, p.value) else { return false }
+        switch group {
+        case .type: return p.key == "type" || p.key == "doctype"
+        case .amount: return p.key == "amount"
+        case .currency: return p.key == "currency"
+        case .party: return p.key == "party"
+        case .docdate: return p.key == "docdate"
+        }
+    }
+
+    /// The text with the operators of one group replaced by `new` (appended at the end); every other token stays as typed.
+    static func replacing(_ text: String, group: Group, with new: [String]) -> String {
+        var out = tokens(text).filter { !belongs($0, to: group) }
+        out += new
+        return out.joined(separator: " ")
+    }
+
+    /// The operators that set the document type: type:invoice, doctype:other.
+    static func typeOperators(_ types: [DocType]) -> [String] {
+        types.map { $0 == .other ? "doctype:other" : "type:\($0.key)" }
+    }
+
+    static func currencyOperators(_ code: String?) -> [String] {
+        guard let code, !code.isEmpty else { return [] }
+        return ["currency:\(code.uppercased())"]
+    }
+
+    /// party:acme, or party:"muster logistik" when the name has a space.
+    static func partyOperators(_ name: String) -> [String] {
+        let v = name.trimmingCharacters(in: .whitespaces)
+        guard !v.isEmpty else { return [] }
+        return ["party:" + (v.contains(" ") ? "\"\(v)\"" : v)]
+    }
+
+    /// The operators of a date preset: the open range from its start for the past ranges, the year itself for this
+    /// year (docdate:2026), the day range for a custom range.
+    static func docdateOperators(_ preset: DatePreset, now: Date = Date()) -> [String] {
+        let cal = Calendar.current
+        switch preset {
+        case .any: return []
+        case .year: return ["docdate:\(cal.component(.year, from: now))"]
+        case .week, .month, .quarter:
+            let days = preset == .week ? 7 : (preset == .month ? 31 : 92)
+            let back = cal.date(byAdding: .day, value: -days, to: now) ?? now
+            return ["docdate:\(Day.string(back)).."]
+        case .custom(let a, let b): return ["docdate:\(Day.string(a))..\(Day.string(b))"]
+        }
+    }
+
+    /// The text with every document operator stripped, for the content search of a names-only or a words-only request.
+    static func withoutDocOperators(_ text: String) -> String {
+        tokens(text).filter { pair($0).map { !isDocOperator($0.key, $0.value) } ?? true }.joined(separator: " ")
+    }
+
+    /// The text the server reads: its document type is doctype: (the URL type= parameter carries the file kind and would
+    /// override a type: operator), so a typed type:invoice is sent as doctype:invoice.
+    static func forServer(_ text: String) -> String {
+        tokens(text).map { t -> String in
+            guard let p = pair(t), p.key == "type", let dt = DocType.named(unquote(p.value)), dt != .other else { return t }
+            return "doctype:\(dt.key)"
+        }.joined(separator: " ")
     }
 }

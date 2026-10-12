@@ -9,9 +9,10 @@ import numpy as np
 import sqlite_vec
 
 from . import paths
+from .ignore import NO_EMBED_EXT
 
 DIMS = 768
-SCHEMA_VERSION = "2"      # 2: files.xver, files.inode and the failures table (all additive, see _migrate)
+SCHEMA_VERSION = "4"      # 4: doc_meta; 3: files.missing_since; 2: files.xver, files.inode, failures (all additive, _migrate)
 
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
@@ -58,6 +59,15 @@ CREATE TABLE IF NOT EXISTS failures(
   path TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0, last_error TEXT, last_try REAL,
   mtime_at_failure REAL, version TEXT
 );
+-- schema 4 (additive; created on the first writable open of an older database, existing tables and indexes untouched):
+-- what a document is and its main facts (mse/docmeta.py). One row per file; doctype NULL = looked at, nothing to classify.
+CREATE TABLE IF NOT EXISTS doc_meta(
+  file_id INTEGER PRIMARY KEY,
+  doctype TEXT, confidence REAL, doc_date TEXT, amount REAL, currency TEXT,
+  counterparty TEXT, reference TEXT, lang TEXT, extractor_version INTEGER, extracted_at REAL
+);
+CREATE INDEX IF NOT EXISTS doc_meta_doctype ON doc_meta(doctype);
+CREATE INDEX IF NOT EXISTS doc_meta_date ON doc_meta(doc_date);
 """
 
 _write_locks: dict[str, threading.Lock] = {}
@@ -105,6 +115,11 @@ def _migrate(conn) -> None:
         conn.execute("ALTER TABLE files ADD COLUMN xver INTEGER")
     if "inode" not in cols:
         conn.execute("ALTER TABLE files ADD COLUMN inode INTEGER")
+    # schema 3, additive: when a pass last failed to see a file, the time it was first missing (NULL = present, which is
+    # every existing row). The row is removed only after a later pass, a grace period on (see indexer._settle_missing)
+    if "missing_since" not in cols:
+        conn.execute("ALTER TABLE files ADD COLUMN missing_since REAL")
+    conn.execute("CREATE INDEX IF NOT EXISTS files_missing ON files(missing_since) WHERE missing_since IS NOT NULL")
     conn.execute("CREATE INDEX IF NOT EXISTS files_hash ON files(hash)")
     # prompt -> vector cache: identical chunks (copies, re-extraction) are never embedded twice
     conn.execute("CREATE TABLE IF NOT EXISTS vcache(key TEXT PRIMARY KEY, v BLOB)")
@@ -143,6 +158,7 @@ def delete_items(conn, item_ids: list[int]) -> None:
 def delete_file(conn, file_id: int) -> None:
     ids = [r[0] for r in conn.execute("SELECT id FROM items WHERE file_id=?", (file_id,))]
     delete_items(conn, ids)
+    conn.execute("DELETE FROM doc_meta WHERE file_id=?", (file_id,))      # what was derived from the file goes with it
     conn.execute("DELETE FROM files WHERE id=?", (file_id,))
 
 
@@ -194,10 +210,44 @@ def get_meta(conn, key: str, default=None):
     return r[0] if r else default
 
 
+def has_column(conn, table: str, column: str) -> bool:
+    """Whether a table has a column. A read-only connection never runs _migrate, so a database that no writer has opened
+    since an upgrade may lack a newer column; callers treat that as 'nothing there'."""
+    return any(r[1] == column for r in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def name_only_unembeddable(alias: str = "", with_ext: bool = True) -> str:
+    """The rule for a file whose items are never embedded: a name-only code file (its kind is code), and a name-only
+    binary, font or data file (NO_EMBED_EXT). Its name stays searchable through the keyword index. `alias` is the files
+    table's alias in the query ("f." or ""). with_ext=False for a database that predates the ext column: code only.
+    The one predicate for embed(), pending_count, the progress counts and stats."""
+    if not with_ext:
+        return f"({alias}mode='meta' AND {alias}kind='code')"
+    exts = ",".join("'" + e + "'" for e in sorted(NO_EMBED_EXT))
+    return f"({alias}mode='meta' AND ({alias}kind='code' OR {alias}ext IN ({exts})))"
+
+
+def embed_skip_items(conn) -> str:
+    """' AND file_id NOT IN (...)' for a query over items: the items of files that are never embedded, a file marked
+    missing (when the column exists) and every file name_only_unembeddable() names. Same answer everywhere."""
+    skip = name_only_unembeddable(with_ext=has_column(conn, "files", "ext"))
+    if has_column(conn, "files", "missing_since"):
+        skip = "missing_since IS NOT NULL OR " + skip
+    return f" AND file_id NOT IN (SELECT id FROM files WHERE {skip})"
+
+
 def stats(conn) -> dict:
+    # Pending work is the work that will run: a file marked missing (missing_since) is skipped by the heavy and embed
+    # stages, and so is a name-only code or binary file (name_only_unembeddable). Neither counts, or the pending numbers
+    # would never reach zero.
+    if has_column(conn, "files", "missing_since"):
+        heavy = "SUM(heavy IS NOT NULL AND missing_since IS NULL)"
+    else:
+        heavy = "SUM(heavy IS NOT NULL)"
+    embed = "SUM(embedded=0" + embed_skip_items(conn) + ")"
     f = conn.execute("SELECT COUNT(*), COALESCE(SUM(size),0), SUM(mode='meta'), SUM(state='error'),"
-                     " SUM(heavy IS NOT NULL) FROM files").fetchone()
-    i = conn.execute("SELECT COUNT(*), SUM(embedded=0) FROM items").fetchone()
+                     f" {heavy} FROM files").fetchone()
+    i = conn.execute(f"SELECT COUNT(*), {embed} FROM items").fetchone()
     by_mod = {r[0]: r[1] for r in conn.execute("SELECT modality, COUNT(*) FROM items GROUP BY modality")}
     by_kind = {r[0]: r[1] for r in conn.execute("SELECT kind, COUNT(*) FROM files GROUP BY kind")}
     return {

@@ -1,9 +1,77 @@
 # Installing MySearch
 
 MySearch is a local search engine for your own folders. It runs on your Mac, indexes files in place and never sends
-file contents anywhere. This guide covers a fresh install on an Apple Silicon Mac.
+file contents anywhere. This guide covers a fresh install on an Apple Silicon Mac, two ways:
 
-## Requirements
+- **[From the disk image](#install-from-the-disk-image)**: drag the app to Applications. No clone, no Python, no Terminal.
+- **[From a clone](#install-from-a-clone-developers)**: `scripts/setup.sh`, for people who want to read, run and change the code.
+
+## Install from the disk image
+
+The disk image (`MySearch.dmg`, made by `scripts/build_dmg.sh --bundle-runtime`) carries its own Python runtime and every
+package MySearch needs, so nothing else has to be installed. The one thing downloaded afterwards is the model, by the app,
+when you press the button.
+
+**Needs:** an Apple Silicon Mac (M1 or later) on macOS 14 or later; about 0.8 GB for the app (large because the Python
+packages are inside it), then about 1.3 GB for the minimal model set (about 4.4 GB for the full set). ffmpeg is optional
+and only matters for audio and video (`brew install ffmpeg`).
+
+1. **Open the disk image and drag MySearch to Applications.** Open it from Applications, not from the disk image: the
+   background service is started from wherever the app is when you set it up, and a disk image goes away when you eject it.
+   The app refuses to set the service up from a disk image or from a quarantined copy and says so.
+2. **First open.** A notarized build opens normally. A build that is only ad-hoc signed (made by someone without an Apple
+   Developer ID) is blocked by Gatekeeper on other Macs: right-click the app, choose Open, then Open again; or System
+   Settings > Privacy & Security > Open Anyway.
+3. **The Setup Assistant opens by itself** (there is no folder yet and no model). Five steps:
+   - **Welcome:** press *Start MySearch*. That sets up the background service (a login item that runs the search service
+     and the indexing). macOS shows a "Background item added" notice: that is this. It starts when you log in.
+   - **Folders:** *Add Folder…* (the usual folder picker), or one click for Documents or Desktop. Your files are only read,
+     never changed.
+   - **Models:** *Minimal* (text search, plus pictures and PDF pages; about 1.27 GB) or *Full* (adds speech to text and a
+     small local model for Ask; about 4.4 GB). Nothing is downloaded until you press *Download*. The bar shows bytes, speed
+     and time left; *Stop* keeps what was fetched and *Resume Download* continues. When the models are in, MySearch starts
+     indexing the folders you added.
+   - **Full Disk Access:** explains why macOS keeps Desktop, Documents, Downloads and Mail private, and opens System
+     Settings > Privacy & Security > Full Disk Access. You switch MySearch on there yourself. It is optional if you only
+     index folders macOS does not protect.
+   - **Done:** a summary. *Open MySearch* closes the assistant.
+4. **Open the assistant again** any time: Settings > Mac App > *Open Setup Assistant…*. *Skip Setup* (or closing the
+   window) stops it from opening by itself; nothing else changes.
+
+**Licences.** The app's notices are in Settings > About > *Licences…* (the file is `MySearch.app/Contents/Resources/THIRD_PARTY_NOTICES.md`).
+The disk image bundles GPL-licensed code (FFmpeg and others, inside the opencv-python package); the notices say which, and
+where its source is.
+
+**What goes online, and only this:** the model download you start in step 3 (Hugging Face); a once-a-day look at the latest
+GitHub release (Settings > Mac App > *Check for updates*, on by default, off with one switch; see the README); and cloud
+answers only if you turn Ask on and choose a cloud model. Indexing, searching and the local models never go online, and
+the background service itself runs with Hugging Face access switched off: a download runs in a separate short-lived process
+that exists only while you are downloading.
+
+**The command line.** The app carries `mse`: `/Applications/MySearch.app/Contents/Resources/runtime/bin/mse`. Put a link on
+your path if you want it in Terminal (`ln -s /Applications/MySearch.app/Contents/Resources/runtime/bin/mse /usr/local/bin/mse`);
+the settings that connect AI agents write this full path, so they work without it.
+
+**Moving or replacing the app.** The background service starts the app from the place it was in when you pressed *Start
+MySearch*. Keep one copy. If you move the app, open it, go to the assistant's first step (Settings > Mac App > *Open Setup
+Assistant…*) and press *Start MySearch* again. After you replace the app with a newer one, restart the service so it runs the new code:
+`/Applications/MySearch.app/Contents/Resources/runtime/bin/mse service restart` (or log out and in).
+
+**Updating.** Download the new disk image and replace the app. MySearch tells you when a release is newer
+(*Update available — 0.x.y* in the menu-bar menu and in Settings > Mac App) and opens its release page; it never downloads or
+installs anything itself. With Homebrew (once a cask exists, see `packaging/homebrew/`): `brew upgrade --cask mysearch`.
+
+**Uninstalling the disk-image install.** In order, by hand:
+
+1. Quit MySearch (menu bar icon > Quit MySearch), then run `/Applications/MySearch.app/Contents/Resources/runtime/bin/mse service uninstall`
+   (stops the service and removes its login item).
+2. Move `/Applications/MySearch.app` to the Trash. Remove MySearch from Full Disk Access in System Settings.
+3. Optional, and not undoable: the data folder `~/Library/Application Support/MySearch/` (indexes, config, models), the logs in
+   `~/Library/Logs/MySearch/`, and `~/Library/Preferences/com.mysearch.app.plist`.
+
+## Install from a clone (developers)
+
+### Requirements
 
 | What | Needed for |
 |---|---|
@@ -16,7 +84,7 @@ file contents anywhere. This guide covers a fresh install on an Apple Silicon Ma
 
 The setup never installs uv, Homebrew or ffmpeg for you. It tells you what is missing and stops.
 
-## One-command setup
+### One-command setup
 
 ```sh
 git clone <repository-url> ~/Developer/mysearch
@@ -122,16 +190,64 @@ uv run mse setup check --json    # the same, with licence, source and tier for e
 ## Building the app and the disk image yourself
 
 - **Ad-hoc build (no Apple Developer account).** `scripts/build_app.sh` builds `build/MySearch.app`, signed ad hoc. It
-  runs on the Mac that built it. `scripts/build_app.sh --install` builds into `~/Applications`; the background service
-  uses only `/Applications`, so copy the app there before you run `mse service install`.
+  runs on the Mac that built it and uses this clone's `.venv` for the service, as before. `scripts/build_app.sh --install`
+  builds into `~/Applications`; the background service uses only `/Applications`, so copy the app there before you run
+  `mse service install`.
+- **With its own Python: `--bundle-runtime`.** `scripts/build_app.sh --bundle-runtime` (or `scripts/build_dmg.sh
+  --bundle-runtime`) also puts a relocatable CPython (python-build-standalone, fetched with `uv python install`), the
+  packages locked in `uv.lock` (`uv sync --frozen`) and the `mse` package inside `MySearch.app/Contents/Resources/`
+  (`scripts/bundle_runtime.sh`). The result is the app of the disk-image install above, about 0.8 GB. Build-time network use:
+  the CPython download (about 24 MB), the wheels from PyPI and the one git dependency (mlx-vlm) from GitHub; they are cached
+  in `MSE_RUNTIME_CACHE` (default `build/runtime-cache`). `scripts/bundle_runtime.sh check <app>` audits the result: every
+  `otool -L` dependency and rpath of every Mach-O file, symlinks, and strings that name the build machine.
+  Which Python the app starts (`MySearch --daemon`), in this order: the project in `config.json` (`service.project`) when it has a
+  `.venv` (a clone, the developer's setup), then the bundled runtime, then the clone the app was built in.
+  **Licences.** Every build, bundled or not, carries `LICENSE` and `THIRD_PARTY_NOTICES.md` in `Contents/Resources`. A bundled
+  build also carries the GPL, LGPL and GCC-exception texts in `Contents/Resources/Licenses/` (from `licenses/`), because the
+  opencv-python wheel inside it bundles a GPL build of FFmpeg with x264, x265, Xvid, vid.stab and Rubber Band. **A release
+  of a bundled image must also attach `MySearch-<version>-sources.tar.gz`, the source of the GPL, LGPL and MPL-2.0 libraries in it, to the same GitHub
+  release** (`scripts/fetch_gpl_sources.sh`, checked by `scripts/check_gpl_release.sh`); a plain image needs no such file.
+  See [RELEASING.md](RELEASING.md).
 - **Disk image.** `scripts/build_dmg.sh` writes `build/MySearch.dmg`. `--adhoc` makes a test image. A normal build signs
   with the identity in the `MSE_SIGN_IDENTITY` environment variable: set it to yours (`security find-identity -v -p
-  codesigning` lists them).
+  codesigning` lists them). Signing is inside-out: every Mach-O file of the runtime, the helper, the Finder extension, then
+  the app.
 - **Distributing to other people** needs a Developer ID signature and notarisation. macOS blocks unnotarised apps and
-  disk images downloaded from elsewhere. This repository does not notarise yet: notarise the disk image with Apple's
-  `notarytool` and staple the ticket before you hand it out.
+  disk images downloaded from elsewhere. See *Notarizing* below. For a bundled image it also needs the GPL source archive
+  (see *Licences* above and [RELEASING.md](RELEASING.md)).
+
+### Notarizing
+
+`scripts/notarize.sh` is a scaffold for that. **It has not been run.** If you have a Developer ID certificate, read it first and run it on that Mac. It needs
+two environment variables and refuses to run without them: `MSE_DEVELOPER_ID` (the `Developer ID Application: …` codesign
+identity) and `MSE_NOTARY_PROFILE` (a `notarytool` profile you made once with `xcrun notarytool store-credentials`; the
+script never sees or stores a credential). It builds and signs the app with the hardened runtime and a secure timestamp,
+has Apple notarize the app, staples it, packs it into `MySearch-<version>.dmg`, signs, notarizes and staples that, then
+prints the sha256 for the Homebrew cask.
+
+The hardened runtime is what notarization requires, and it needs two entitlement files (`scripts/entitlements/`):
+
+| File, applied to | Entitlement | Why |
+|---|---|---|
+| `MySearch.entitlements`, the app | `com.apple.security.automation.apple-events` | "Open in…" starts Terminal through Apple Events; the hardened runtime blocks that without it. |
+| `python-runtime.entitlements`, the bundled `python3.X` | `com.apple.security.cs.disable-library-validation` | Library validation makes a hardened process refuse libraries signed by another team. Every Mach-O file of the runtime is signed with the app's identity, so a Developer ID build should pass without this key (not tried). It is set because an ad-hoc signed runtime does not import numpy without it, and as the safety net for a wheel library that could not be re-signed. |
+
+Not set, on purpose: `allow-jit` and `allow-unsigned-executable-memory`. Add one only if a notarized build fails at run time
+with a code-signing or JIT error. Entitlements count on the main executable of a process, so only the interpreter carries
+them; the extension modules and libraries it loads are signed without.
+
+What has been checked, on this Mac, with an **ad-hoc** signature and the hardened runtime switched on for the interpreter:
+the entitlement files are accepted by `codesign` (the signing tools parse them strictly: a comment must not contain two
+hyphens in a row); with `disable-library-validation` the interpreter imports numpy, scipy, cv2, PIL, mlx, mlx_vlm, mlx_lm,
+transformers, cryptography and sqlite-vec, runs an MLX matmul and an 8-bit quantized matmul on the GPU, a ctypes callback, a
+cffi callback and an sqlite-vec nearest-neighbour query; without it, the import of numpy fails ("different Team IDs");
+`allow-jit` alone does not help. What has **not** been checked: any of this with a Developer ID signature, and whether
+Apple's service accepts the whole bundle. That is known only after the first real run; if it rejects a file,
+`xcrun notarytool log <id> --keychain-profile <profile>` names it.
 
 ## Updating
+
+For the disk-image install see *Updating* under "Install from the disk image". For a clone:
 
 ```sh
 cd ~/Developer/mysearch
@@ -154,7 +270,8 @@ Restart the service at any time with `uv run mse service restart`.
 
 ## Uninstalling
 
-Nothing here runs these commands for you. Run them yourself, in this order:
+For the disk-image install see its own section above. For a clone, nothing here runs these commands for you; run them yourself,
+in this order:
 
 ```sh
 cd ~/Developer/mysearch
@@ -188,5 +305,10 @@ Then:
 | Search answers do not reorder close calls | The re-ranker is not installed. See the table above. |
 | Keychain prompts after a helper rebuild | Allow the helper once, or store the provider keys again (see Updating). |
 | The app does not open on another Mac | It is ad-hoc signed, so it is for the Mac that built it. Distribution needs notarisation (see above). |
+| The assistant says the service is not running, or the app was moved | Open Settings > Mac App > *Open Setup Assistant…* and press *Start MySearch* (it installs the login item for the app where it is now). The log is `~/Library/Logs/MySearch/launchd.log`. |
+| The first open from the disk image is slow | macOS checks a new app the first time it runs, and this one holds about 20,000 files. On the build Mac the first start from a freshly mounted image took longer than 8 seconds; the next one took about a second. Copy the app to Applications first and open it from there. |
+| The assistant refuses to start the service ("disk image", "temporary copy") | Drag MySearch to Applications and open it from there. |
+| A model download failed or stopped | Press *Try Again* or *Resume Download*: finished files are kept. The reason is shown; the log is `~/Library/Logs/MySearch/setup-models.log`. |
+| "Update available" never shows, or you want no update check | Settings > Mac App > *Check for updates*. It is one request a day to api.github.com; *Check Now* looks once. |
 
 If something is not listed here, run `uv run mse doctor` and keep its output with the first error line.

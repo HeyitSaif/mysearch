@@ -20,7 +20,7 @@ import numpy as np
 
 import json
 
-from . import config, store
+from . import config, docmeta, store
 from .embedder import pool
 from .ignore import Matcher
 from .textutil import detect_lang, fold, fts_query, query_terms, snippet
@@ -74,8 +74,9 @@ _MONTH_RX = "|".join(sorted(MONTHS, key=len, reverse=True))
 _PREP = r"(?:in|from|during|since|of|im|vom|aus|seit|von)"
 
 
-def date_phrases(text: str, today=None) -> tuple[str, str | None, str | None]:
-    """'invoices from September', 'Rechnungen letzten Monat', 'notes last week' -> (remaining text, after, before)."""
+def date_phrases(text: str, today=None, alone_ok: bool = False) -> tuple[str, str | None, str | None]:
+    """'invoices from September', 'Rechnungen letzten Monat', 'notes last week' -> (remaining text, after, before).
+    A date that is the whole query is content ("2025"), unless `alone_ok`: a document filter (type:invoice ...) is active."""
     from datetime import date, timedelta
     today = today or date.today()
     t = text
@@ -120,7 +121,7 @@ def date_phrases(text: str, today=None) -> tuple[str, str | None, str | None]:
                 after, before = f"{y}-01-01", f"{y + 1}-01-01"
                 t = t[:m.start()] + t[m.end():]
     t = re.sub(r"\s+", " ", t).strip()
-    if after is None or not re.search(r"\w", t):
+    if after is None or (not alone_ok and not re.search(r"\w", t)):
         return text, None, None          # a date alone is content, not a filter
     return t, after, before
 
@@ -140,14 +141,38 @@ def parse(q: str) -> tuple[str, dict, list[str]]:
             phrases.append(t)
         words.append(t)
     text = " ".join(words).strip()
-    if "after" not in filters and "before" not in filters:
-        text2, after, before = date_phrases(text)
+    # A plain-language amount ("invoices over 500 EUR") becomes filters, only when it has a comparator (docmeta.nl_map), only
+    # when nothing but filler words is left of the query once the amount, the kind of document and a date are taken out
+    # (a question such as "when was the invoice over 500 EUR paid?" stays an ordinary search: Ask and the learning loop
+    # send their questions through here), not with quoted phrases, and never over an amount: filter the user typed.
+    if text and not phrases and "amount" not in filters:
+        text2, nl = docmeta.nl_map(text)
+        if nl:
+            t3, d_after, _ = date_phrases(text2, alone_ok=True)
+            if docmeta.only_filler(t3 if d_after else text2):
+                text = text2
+                for k, v in nl.items():
+                    filters.setdefault(k, []).extend(v)
+    meta_on = _meta_filters(filters)
+    if "after" not in filters and "before" not in filters and "docdate" not in filters:
+        text2, after, before = date_phrases(text, alone_ok=meta_on)
         if after:
             text = text2
-            filters["after"] = [after]
-            if before:
-                filters["before"] = [before]
+            if meta_on:       # a document filter is on: the date asked for is the document's own date
+                filters["docdate"] = [docmeta.range_to_docdate(after, before)]
+            else:
+                filters["after"] = [after]
+                if before:
+                    filters["before"] = [before]
+    if meta_on and docmeta.only_filler(text):
+        text = ""
     return text, filters, phrases
+
+
+def _meta_filters(filters: dict) -> bool:
+    """Whether the filters ask about what a document is (type: with a document type, doctype:, amount, currency, party, docdate)."""
+    return bool(any(k in filters for k in ("doctype", "amount", "currency", "party", "docdate"))
+                or docmeta.split_types(filters.get("type", []))[0])
 
 
 def folder_values(values) -> tuple[list[str], list[str]]:
@@ -181,8 +206,61 @@ def folder_prefixes(folders: list[str], root: str) -> list[str] | None:
     return out or None
 
 
+_MISSING = object()
+
+
+def _dm(f, key):
+    """A doc_meta value of a files row (dm_* columns); _MISSING when the row does not carry the column (a row that was not
+    joined cannot be proven to match). sqlite3.Row raises IndexError for an unknown column, a dict KeyError."""
+    try:
+        return f[key]
+    except (KeyError, IndexError):
+        return _MISSING
+
+
+def _values(filters: dict, key: str) -> list[str]:
+    return [p.strip() for v in filters.get(key, []) for p in str(v).split(",") if p.strip()]
+
+
+def meta_filter(filters: dict):
+    """The document-fact filters -> a predicate over a row with dm_* columns, or None when none is set.
+    type:/doctype: (invoice, receipt, ...), amount:>500 <100 100..200, currency:EUR, party:acme, docdate:2025[-03[-14]][..]."""
+    dtypes = docmeta.doctype_values(filters)
+    amounts = [docmeta.parse_amount(v) for v in filters.get("amount", []) if str(v).strip()]
+    currencies = set()
+    for v in _values(filters, "currency"):
+        c = docmeta.canon_currency(v) or (v.upper() if re.fullmatch(r"[A-Za-z]{3}", v) else None)
+        if not c:
+            raise ValueError(f"currency: '{v}' - use a code such as EUR, USD, GBP, CHF, JPY")
+        currencies.add(c)
+    parties = [fold(v) for v in _values(filters, "party")]
+    dates = [docmeta.parse_docdate(v) for v in _values(filters, "docdate")]
+    if not (dtypes or amounts or currencies or parties or dates):
+        return None
+
+    def ok(f) -> bool:
+        dt, amount, cur, party, dd = (_dm(f, k) for k in ("dm_doctype", "dm_amount", "dm_currency", "dm_counterparty", "dm_doc_date"))
+        if _MISSING in (dt, amount, cur, party, dd):
+            return False
+        if dtypes and dt not in dtypes:
+            return False
+        if amounts and not all(docmeta.amount_ok(amount, a) for a in amounts):
+            return False
+        if currencies and cur not in currencies:
+            return False
+        if parties and not (party and any(p in fold(party) for p in parties)):
+            return False
+        if dates and not any(docmeta.docdate_ok(dd, d) for d in dates):
+            return False
+        return True
+    return ok
+
+
 def file_filter(filters: dict):
-    kinds = {KIND_ALIASES.get(k.lower(), k.lower()) for k in filters.get("type", []) + filters.get("kind", [])}
+    # type: names a file kind / extension (pdf, image, md ...) or, for the names in docmeta (invoice, receipt, Rechnung ...),
+    # a document type; doctype: is the unambiguous spelling (and the only way to ask for `other`)
+    _, rest = docmeta.split_types(filters.get("type", []))
+    kinds = {KIND_ALIASES.get(k.lower(), k.lower()) for k in rest + _values(filters, "kind")}
     exts = {e.lower().lstrip(".") for e in filters.get("ext", [])}
     for k in list(kinds):
         if k not in ("pdf", "text", "office", "email", "image", "audio", "video", "other"):
@@ -196,6 +274,7 @@ def file_filter(filters: dict):
     under = [[p.lower() for p in g] for g in filters.get("_under", []) if g]
     split = lambda key: [_glob(p) for v in filters.get(key, []) for p in str(v).split(",") if p.strip()]
     inc, exc = Matcher(split("include")), Matcher(split("exclude"))
+    meta_ok = meta_filter(filters)
 
     def ok(f) -> bool:
         if kinds and f["kind"] not in kinds and not (exts and f["ext"] in exts):
@@ -216,9 +295,12 @@ def file_filter(filters: dict):
             return False
         if exc and exc.match(f["path"]):
             return False
+        if meta_ok is not None and not meta_ok(f):
+            return False
         return True
 
-    active = bool(kinds or exts or after or before or prefixes or under or inc or exc)
+    ok.needs_meta = meta_ok is not None          # allowed_files / the result query then join doc_meta
+    active = bool(kinds or exts or after or before or prefixes or under or inc or exc or meta_ok is not None)
     return ok, active
 
 
@@ -234,9 +316,69 @@ EXT_WORDS = {"md", "txt", "pdf", "json", "csv", "eml", "html", "xlsx", "docx", "
              "mp3", "m4a", "mp4", "mov", "wav", "py", "js", "ts", "yaml", "yml", "xml", "doc", "xls", "zip"}
 
 
+def _has_missing_col(conn) -> bool:
+    """Whether this database has files.missing_since (schema 3). A read-only connection never runs the migration, so a
+    database that no writer has opened since the upgrade lacks the column; no row in it can be missing then."""
+    return any(r[1] == "missing_since" for r in conn.execute("PRAGMA table_info(files)"))
+
+
+def _present(conn, alias: str = "") -> str:
+    """' AND <alias>missing_since IS NULL' (a file marked missing is not shown), or '' without the column.
+    Looked up on every call rather than cached: PRAGMA table_info costs microseconds on a connection whose schema is
+    already loaded, and a cached answer could go stale once a writer adds the column."""
+    return f" AND {alias}missing_since IS NULL" if _has_missing_col(conn) else ""
+
+
+def _hidden_items(conn, col: str) -> str:
+    """' AND <col> NOT IN (items of files marked missing)'. Keeps the chunks of a missing file out of keyword and vector
+    retrieval before the top-k cut, so the list still fills. The subquery reads the partial index files_missing, so it
+    costs about nothing while nothing is missing. '' without the column."""
+    if not _has_missing_col(conn):
+        return ""
+    return (f" AND {col} NOT IN (SELECT i.id FROM items i JOIN files f ON f.id = i.file_id"
+            " WHERE f.missing_since IS NOT NULL)")
+
+
+DM_COLS = (", dm.doctype AS dm_doctype, dm.amount AS dm_amount, dm.currency AS dm_currency,"
+           " dm.counterparty AS dm_counterparty, dm.doc_date AS dm_doc_date")
+DM_JOIN = " LEFT JOIN doc_meta dm ON dm.file_id = f.id"
+
+
 def allowed_files(conn, ok) -> set[int]:
-    """File ids that pass the filters — applied inside retrieval so narrow filters still fill the result list."""
-    return {r["id"] for r in conn.execute("SELECT id, path, kind, ext, doc_date FROM files") if ok(r)}
+    """File ids that pass the filters — applied inside retrieval so narrow filters still fill the result list.
+    Files marked missing are never allowed. doc_meta is joined only when a document filter needs it; a database
+    without that table (no writer has opened it since the upgrade) has no file that can match one."""
+    if getattr(ok, "needs_meta", False):
+        if not docmeta.has_table(conn):
+            return set()
+        return {r["id"] for r in conn.execute(
+            "SELECT f.id AS id, f.path AS path, f.kind AS kind, f.ext AS ext, f.doc_date AS doc_date" + DM_COLS
+            + " FROM files f" + DM_JOIN + " WHERE 1=1" + _present(conn, "f.")) if ok(r)}
+    return {r["id"] for r in conn.execute(
+        "SELECT id, path, kind, ext, doc_date FROM files WHERE 1=1" + _present(conn)) if ok(r)}
+
+
+BROWSE_MIN = 200            # a query with filters and no words lists at most this many documents (newest first) ...
+BROWSE_TIE = 1e-7           # ... all scored alike, so the relevance floor never cuts older ones
+
+
+def browse_files(conn, ok, cap: int) -> tuple[list[tuple], int]:
+    """The allowed files, newest document date first, for a query that is only filters: ([(sort key, file id, an item
+    of it)], how many files are allowed). The item is what the result shows (its first text)."""
+    if not docmeta.has_table(conn):
+        return [], 0
+    rows = [r for r in conn.execute(
+        "SELECT f.id AS id, f.path AS path, f.kind AS kind, f.ext AS ext, f.doc_date AS doc_date, f.mtime AS mtime" + DM_COLS
+        + " FROM files f" + DM_JOIN + " WHERE 1=1" + _present(conn, "f.")) if ok(r)]
+    rows.sort(key=lambda r: (r["dm_doc_date"] or "", r["mtime"] or 0), reverse=True)
+    top = rows[:cap]
+    if not top:
+        return [], len(rows)
+    rep = dict(conn.execute(
+        "SELECT file_id, id FROM (SELECT file_id, id, ROW_NUMBER() OVER (PARTITION BY file_id ORDER BY"
+        " CASE modality WHEN 'text' THEN 0 WHEN 'ocr' THEN 1 ELSE 2 END, ord) AS rn FROM items"
+        " WHERE file_id IN (SELECT value FROM json_each(?))) WHERE rn = 1", (json.dumps([r["id"] for r in top]),)).fetchall())
+    return [((r["dm_doc_date"] or "", r["mtime"] or 0), r["id"], rep[r["id"]]) for r in top if r["id"] in rep], len(rows)
 
 
 # ------------------------------------------------------------------ retrieval per collection
@@ -245,7 +387,8 @@ def _keyword(conn, fq: str, k: int, allowed: set[int] | None = None) -> list[int
     try:
         if allowed is None:
             return [r[0] for r in conn.execute(
-                "SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY bm25(fts, 4.0, 2.0, 1.0) LIMIT ?", (fq, k))]
+                "SELECT fts.rowid FROM fts WHERE fts MATCH ?" + _hidden_items(conn, "fts.rowid")
+                + " ORDER BY bm25(fts, 4.0, 2.0, 1.0) LIMIT ?", (fq, k))]
         return [r[0] for r in conn.execute(
             "SELECT fts.rowid FROM fts JOIN items i ON i.id = fts.rowid WHERE fts MATCH ?"
             " AND i.file_id IN (SELECT value FROM json_each(?)) ORDER BY bm25(fts, 4.0, 2.0, 1.0) LIMIT ?",
@@ -265,7 +408,8 @@ def _vectors(conn, qv: np.ndarray, group: str, k: int, mode: str, oversample: in
             "SELECT v.item_id, v.v FROM vectors v JOIN items i ON i.id = v.item_id WHERE v.modality = ?"
             " AND i.file_id IN (SELECT value FROM json_each(?))", (group, json.dumps(sorted(allowed)))).fetchall()
     elif mode == "exact":
-        rows = conn.execute("SELECT item_id, v FROM vectors WHERE modality=?", (group,)).fetchall()
+        rows = conn.execute("SELECT item_id, v FROM vectors WHERE modality=?" + _hidden_items(conn, "item_id"),
+                            (group,)).fetchall()
     else:
         want = min(k * oversample * (4 if allowed is not None else 1), VEC_KNN_MAX)
         cand = [r[0] for r in conn.execute(
@@ -273,6 +417,7 @@ def _vectors(conn, qv: np.ndarray, group: str, k: int, mode: str, oversample: in
             (store.to_bits(qv), want, group))]
         if not cand:
             return []
+        hidden = _hidden_items(conn, "item_id") if allowed is None else ""
         rows = []
         for i in range(0, len(cand), 900):
             part = cand[i:i + 900]
@@ -282,7 +427,8 @@ def _vectors(conn, qv: np.ndarray, group: str, k: int, mode: str, oversample: in
                     f"SELECT v.item_id, v.v, i.file_id FROM vectors v JOIN items i ON i.id = v.item_id"
                     f" WHERE v.item_id IN ({q})", part) if fid in allowed]
             else:
-                rows += conn.execute(f"SELECT item_id, v FROM vectors WHERE item_id IN ({q})", part).fetchall()
+                rows += conn.execute(f"SELECT item_id, v FROM vectors WHERE item_id IN ({q})" + hidden,
+                                     part).fetchall()
     if not rows:
         return []
     ids = np.array([r[0] for r in rows])
@@ -382,6 +528,12 @@ def search(q: str, collections: list[str] | None = None, limit: int | None = Non
             if unders.get(c["name"]) else (ok, filtered)
         oks[c["name"]] = (okc, fc)
     filtered_any = any(fc for _, fc in oks.values())
+    meta_filtering = any(getattr(okc, "needs_meta", False) for okc, _ in oks.values())
+    # Only filters, no words (type:invoice docdate:2025): nothing to rank, so list the matching documents, newest first.
+    # Never for similar() (it passes a vector) and only when a document filter is on, so a plain empty query is as before.
+    browse = bool(meta_filtering and not text and qvec is None)
+    browse_pool: list[tuple] = []
+    browse_total = 0
 
     def ok_any(f) -> bool:                    # the feedback code does not know the collection: it tags the row
         okc, fc = oks.get(f.get("_collection") if isinstance(f, dict) else None, (ok, filtered))
@@ -418,6 +570,11 @@ def search(q: str, collections: list[str] | None = None, limit: int | None = Non
             continue
         try:
             okc, filtered_c = oks[c["name"]]
+            if browse:
+                got, n_allowed = browse_files(conn, okc, max(BROWSE_MIN, limit * 3))
+                browse_pool += [(key, c["name"], iid) for key, _, iid in got]
+                browse_total += n_allowed
+                continue
             allowed = allowed_files(conn, okc) if filtered_c else None
             if allowed is not None and not allowed:
                 continue
@@ -441,6 +598,11 @@ def search(q: str, collections: list[str] | None = None, limit: int | None = Non
                     add(c["name"], [i for i, _ in hits], w, label, bonus=0.004 if group == "text" else 0)
         finally:
             conn.close()
+    if browse:
+        browse_pool.sort(key=lambda x: x[0], reverse=True)
+        for rank, (_, coll_name, iid) in enumerate(browse_pool[:max(BROWSE_MIN, limit * 3)]):
+            fused[(coll_name, iid)] = 1.0 / (RRF_K + 1) - rank * BROWSE_TIE
+            why[(coll_name, iid)].add("filter")
     timings["retrieve_ms"] = round((time.time() - t) * 1000)
 
     # ---- group by file
@@ -454,15 +616,18 @@ def search(q: str, collections: list[str] | None = None, limit: int | None = Non
     for coll, iids in by_coll.items():
         conn = store.connect(coll, readonly=True)
         has_hash = any(r[1] == "hash" for r in conn.execute("PRAGMA table_info(files)"))
+        has_dm = meta_filtering and docmeta.has_table(conn)
         try:
             for i in range(0, len(iids), 900):
                 part = iids[i:i + 900]
+                # the last guard: a file marked missing since retrieval is not hydrated, so it never reaches a result
                 rows = conn.execute(
                     "SELECT i.id, i.file_id, i.modality, i.page, i.t0, i.t1, i.heading, i.text,"
                     " f.path, f.name, f.ext, f.kind, f.size, f.mtime, f.doc_date, f.title, f.pages, f.duration,"
                     f" f.thumb, f.mode, f.docid, f.lang, {'f.hash' if has_hash else 'NULL'} AS hash"
-                    " FROM items i JOIN files f ON f.id = i.file_id"
-                    f" WHERE i.id IN ({','.join('?' * len(part))})", part).fetchall()
+                    + (DM_COLS if has_dm else "")
+                    + " FROM items i JOIN files f ON f.id = i.file_id" + (DM_JOIN if has_dm else "")
+                    + f" WHERE i.id IN ({','.join('?' * len(part))})" + _present(conn, "f."), part).fetchall()
                 for r in rows:
                     okc, filtered_c = oks[coll]
                     if filtered_c and not okc(r):
@@ -544,6 +709,7 @@ def search(q: str, collections: list[str] | None = None, limit: int | None = Non
             timings["rerank_ms"] = round((time.time() - t_r) * 1000)
         except Exception as e:
             timings["rerank_error"] = str(e)
+    _attach_meta(results, ccfg)
     # facets over every reasonable match (not just the page shown): folder, type, year
     floor = (results[0]["score"] * 0.2) if results else 0
     matched = [x for x in results if x["score"] >= floor]
@@ -551,8 +717,10 @@ def search(q: str, collections: list[str] | None = None, limit: int | None = Non
         "collection": dict(Counter(x["collection"] for x in matched).most_common()),
         "kind": dict(Counter(x["kind"] for x in matched).most_common()),
         "year": dict(sorted(Counter((x["date"] or "")[:4] for x in matched if x.get("date")).items(), reverse=True)),
+        "doctype": dict(Counter(x["meta"]["doctype"] for x in matched
+                                if x.get("meta") and x["meta"].get("doctype")).most_common()),
     }
-    total = len(matched)
+    total = browse_total if browse else len(matched)
     results = results[:limit]
     for x in results:
         if not opts.get("keep_rr"):      # finetune.py collects the exact text the re-ranker reads
@@ -572,7 +740,41 @@ def search(q: str, collections: list[str] | None = None, limit: int | None = Non
         "scope": {"collections": [c["name"] for c in scope], "label": scope_info["label"]},
         "bridge": {c: [b for b, _ in v] for c, v in bridged.items()},
         "results": results, "timings": timings, "facets": facets, "total": total, "feedback": fb,
+        "browse": browse,
     }
+
+
+META_KEYS = ("doctype", "confidence", "doc_date", "amount", "currency", "counterparty", "reference")
+
+
+def _attach_meta(results: list[dict], ccfg: dict) -> None:
+    """Every result gets `meta`: {doctype, confidence, doc_date, amount, currency, counterparty, reference}, or None when
+    the file has no stored facts (not classified yet, or a database without the table). One query per collection."""
+    by_coll: dict[str, list[dict]] = defaultdict(list)
+    for x in results:
+        x["meta"] = None
+        by_coll[x["collection"]].append(x)
+    for coll, xs in by_coll.items():
+        try:
+            conn = store.connect(coll, readonly=True)
+        except FileNotFoundError:
+            continue
+        try:
+            if not docmeta.has_table(conn):
+                continue
+            found: dict[str, dict] = {}
+            paths_ = sorted({x["path"] for x in xs})
+            for i in range(0, len(paths_), 900):
+                part = paths_[i:i + 900]
+                for r in conn.execute(
+                        "SELECT f.path AS path, dm.doctype, dm.confidence, dm.doc_date, dm.amount, dm.currency,"
+                        " dm.counterparty, dm.reference FROM files f JOIN doc_meta dm ON dm.file_id = f.id"
+                        f" WHERE f.path IN ({','.join('?' * len(part))})", part):
+                    found[r["path"]] = {k: r[k] for k in META_KEYS}
+            for x in xs:
+                x["meta"] = found.get(x["path"])
+        finally:
+            conn.close()
 
 
 def _apply_feedback(text, qvec, results, scope, ok, exclude, terms, opts) -> tuple[list[dict], dict]:
@@ -637,9 +839,10 @@ def find_file(coll_name: str | None, ref: str) -> tuple[dict, dict] | None:
             continue
         try:
             if ref.startswith("#") or re.fullmatch(r"[0-9a-f]{8}", ref):
-                r = conn.execute("SELECT * FROM files WHERE docid=?", (ref.lstrip("#"),)).fetchone()
+                r = conn.execute("SELECT * FROM files WHERE docid=?" + _present(conn),
+                                 (ref.lstrip("#"),)).fetchone()
             else:
-                r = conn.execute("SELECT * FROM files WHERE path=?", (ref,)).fetchone()
+                r = conn.execute("SELECT * FROM files WHERE path=?" + _present(conn), (ref,)).fetchone()
             if r:
                 return c, dict(r)
         finally:
@@ -656,6 +859,7 @@ def get_document(coll_name: str | None, ref: str, max_chars: int = 20000, page: 
                              "lang", "state", "error")}
     out.update(collection=c["name"], abs_path=str(Path(c["path"]) / f["path"]), context=context_for(c, f["path"]),
                metadata_only=f["mode"] == "meta")
+    _attach_meta([out], {c["name"]: c})
     if f["mode"] == "meta":
         out["text"] = None
         out["note"] = "metadata-only by this collection's rules: contents are not indexed"
@@ -687,7 +891,8 @@ def list_files(coll_name: str, prefix: str = "", limit: int = 200) -> list[dict]
     conn = store.connect(coll_name, readonly=True)
     try:
         rows = conn.execute("SELECT path, kind, size, doc_date, docid, mode FROM files WHERE path LIKE ? ESCAPE '\\'"
-                            " ORDER BY path LIMIT ?", (prefix.replace("%", "\\%").replace("_", "\\_") + "%", limit))
+                            + _present(conn) + " ORDER BY path LIMIT ?",
+                            (prefix.replace("%", "\\%").replace("_", "\\_") + "%", limit))
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -727,3 +932,22 @@ def similar(coll_name: str | None, ref: str, collections: list[str] | None = Non
                       if not (gk and r["collection"] == c["name"] and group_key(r["path"], None) == gk)][:limit]
     res.update(similar_to=f["path"], collection=c["name"], query=f"similar to {f['name']}")
     return res
+
+
+# ------------------------------------------------------------------ saved searches
+
+def validate_query(q: str) -> None:
+    """Raises ValueError when a query's filters are malformed, so a saved search never stores one that cannot run."""
+    _, filters, _ = parse(q or "")
+    file_filter(filters)
+
+
+def run_saved(saved: dict, limit: int | None = None, mode: str = "hybrid", opts: dict | None = None) -> dict:
+    """Run a saved search (config.saved_searches) as the search box would: its scope shortcut ("w: ...") wins over its
+    collection field; a collection that no longer exists is an error (ValueError), not an empty result."""
+    cfg = config.load()
+    tokens, query = config.split_scope(saved.get("query") or "", cfg)
+    colls = tokens or config.scope_tokens(saved.get("collection")) or None
+    if colls:
+        config.resolve_scope(cfg, colls)
+    return search(query, collections=colls, limit=limit, mode=mode, opts=opts)

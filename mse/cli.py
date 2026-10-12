@@ -588,11 +588,34 @@ def cmd_add(a):
     print(f"added {coll['name']} → {coll['path']}")
     if daemon_up():
         client()._call("POST", "/api/sync", body={"collection": coll["name"], "kind": "scan"})
-        print("scan queued (text is searchable right away; OCR, page images and media run tonight or on `mse sync`)")
+        print("searchable by name now; contents indexing in background (OCR, page images and media run tonight "
+              "or on `mse sync`)")
+    else:
+        print("the service is not running: start it and the folder is indexed by its next scan "
+              "(or run `mse sync " + coll["name"] + "` then)")
+    from . import indexer
+    print(_survey_text(indexer.survey(coll)))
     if a.agents:
         from . import agents_setup
         print("agents (locked to this folder's collection):")
         _print_files(agents_setup.install(coll["name"]), Path(coll["path"]))
+
+
+def _survey_text(s: dict) -> str:
+    """The counts `mse add` prints: what the first pass skips, and what it keeps by name only."""
+    lines = [f"  {s['entries']:,} files and folders found; {s['name_only']:,} are searchable by name only"]
+    if s["pruned_folders"]:
+        top = ", ".join(f"{n} {c:,}" for n, c in s["pruned"].items())
+        lines.append(f"  {s['pruned_folders']:,} folders skipped by rule ({top})")
+    if s["gitignored"]:
+        lines.append(f"  {s['gitignored']:,} entries left out by .gitignore")
+    if s["code_name_only"]:
+        lines.append(f"  {s['code_name_only']:,} code files by name (indexing.index_code is off)")
+    if s["content_name_only"]:
+        lines.append(f"  {s['content_name_only']:,} disk images, large logs and databases by name")
+    if s["bundles"]:
+        lines.append(f"  {s['bundles']:,} app bundles by name")
+    return "\n".join(lines)
 
 
 def cmd_remove(a):
@@ -644,7 +667,99 @@ def cmd_context(a):
         print(f"{k}: {v}")
 
 
+def cmd_reprocess(a):
+    """`mse sync <collection> --reocr | --retranscribe`: queue OCR (pdf, image) or transcription (audio, video) again for
+    the files that already have it. Nothing is read here: the marks wait for the night run, and --now queues a sync."""
+    from . import indexer
+    tokens = config.scope_tokens(a.collection)
+    names = config.resolve_scope(config.load(), tokens)["collections"] if tokens and tokens != ["all"] else []
+    if len(names) != 1:
+        sys.exit("name one collection with --reocr or --retranscribe (not 'all', a group or a list)")
+    name = names[0]
+    coll = config.get_collection(config.load(), name)
+    if not coll:
+        sys.exit(f"no collection named {name}")
+    known_types = {"pdf", "image", "audio", "video"}
+    wanted = {t.strip() for t in a.types.split(",") if t.strip()} if a.types else known_types
+    if wanted - known_types:
+        sys.exit(f"--types: unknown {', '.join(sorted(wanted - known_types))} (use pdf, image, audio, video)")
+    allowed = ({"pdf", "image"} if a.reocr else set()) | ({"audio", "video"} if a.retranscribe else set())
+    types = wanted & allowed
+    if not types:
+        sys.exit("nothing to do: --reocr redoes pdf and image, --retranscribe redoes audio and video")
+    prefix = None
+    if a.path:
+        root = Path(coll["path"]).resolve()
+        try:
+            rel = Path(a.path).expanduser().resolve().relative_to(root).as_posix()
+        except ValueError:
+            sys.exit(f"--path must be a folder inside {name}")
+        prefix = None if rel == "." else rel
+    res = indexer.mark_reprocess(name, types, prefix)
+    counts = ", ".join(f"{k} {v}" for k, v in sorted(res["by_type"].items())) or "none"
+    print(f"marked {res['marked']} file(s) in {name} ({counts}); {res['already_queued']} already queued, "
+          f"{res['nothing_to_redo']} with nothing to redo. Nothing was read.")
+    if not a.now:
+        print("the night run does the work; add --now to queue a sync instead")
+        return
+    if res["marked"] == 0:
+        print("nothing new to queue")
+        return
+    if not daemon_up():
+        sys.exit("marked, but the daemon is not running: start it, then run the same command with --now")
+    client()._call("POST", "/api/sync", body={"collection": name, "kind": "sync"})
+    print(f"queued a sync of {name}; the marked files are redone with it")
+
+
+def cmd_forget_missing(a):
+    """`mse forget-missing <collection> [--path <folder>] [--dry-run] [--yes]`: remove from the index the files that are gone
+    from disk and marked missing, with their text, vectors, thumbnails and favourites. Files on disk are never touched and
+    present files are never removed. The list is printed first; removal needs a typed yes, or --yes. It writes the index
+    directly, as `mse sync --reocr` does, so it works while the daemon runs an older version."""
+    from . import indexer
+    coll = config.get_collection(config.load(), a.collection)
+    if not coll:
+        sys.exit(f"no collection named {a.collection}")
+    name = coll["name"]
+    prefix = ""
+    if a.path:
+        root = Path(coll["path"]).resolve()
+        try:
+            rel = Path(a.path).expanduser().resolve().relative_to(root).as_posix()
+        except ValueError:
+            sys.exit(f"--path must be a folder inside {name} (absolute, or relative to the current folder)")
+        prefix = "" if rel == "." else rel
+    where = f" under {prefix}" if prefix else ""
+    listed = indexer.forget_missing(name, prefix, dry_run=True)
+    n = listed["count"]
+    if n == 0:
+        print(f"nothing to forget in {name}{where}: no missing files there")
+        return
+    print(f"{n:,} missing file(s) in {name}{where} would leave the index (rows, text, vectors, thumbnails, favourites):")
+    for p in listed["paths"]:
+        print(f"  {p}")
+    if n > len(listed["paths"]):
+        print(f"  ... and {n - len(listed['paths']):,} more")
+    if a.dry_run:
+        print("dry run: nothing was removed")
+        return
+    if not a.yes:
+        try:
+            answer = input(f"Remove these {n:,} rows from the index? Type yes to continue: ")
+        except EOFError:
+            answer = ""
+        if answer.strip().lower() != "yes":
+            sys.exit("not removed: type yes, or pass --yes")
+    done = indexer.forget_missing(name, prefix, dry_run=False, as_of=listed["as_of"])
+    print(f"removed {done['removed']:,} row(s) from {name}; favourites removed: {done['favourites_removed']}. "
+          "Nothing on disk was touched.")
+    if done.get("favourites_error"):
+        print(f"favourites not all cleaned: {done['favourites_error']}")
+
+
 def cmd_sync(a):
+    if a.reocr or a.retranscribe:
+        return cmd_reprocess(a)
     tokens = config.scope_tokens(a.collection)
     # a group / comma list syncs each member; "all" (or nothing) syncs every enabled collection
     names = [None] if not tokens or tokens == ["all"] or a.path else \
@@ -783,6 +898,8 @@ def cmd_setup(a):
         else:
             print("\n".join(setup_models.report_lines()))
         return
+    if a.events:     # the app's setup assistant starts this: one JSON line per event instead of text (setup_models.install_events)
+        sys.exit(setup_models.install_events("full" if a.full else "minimal"))
     setup_models.install("full" if a.full else "minimal", dry_run=a.dry_run)
 
 
@@ -874,9 +991,34 @@ def _files_manage(a, what: str, sub: str, args: list[str]):
                    if daemon_up() else " The service is not running; the change applies when it starts.")))
 
 
+FILES_EXCLUDE_ROOTS = ("exclude: folders the name search skips (a full path, ~/Folder, or a name such as node_modules).\n"
+                       "The built-in privacy rules cannot be changed. roots: where the search looks.")
+
+
+def _files_rule_chunks() -> list[str]:
+    """The query rules of `mse files --help`, copied from the module docstring of mse/filequery.py, where they are
+    written down. Read at run time so the help cannot drift from it; tests/test_ignore_newline.py checks that each chunk
+    is still in that docstring. Chunks: the query language table (globs and !exclude included), smart case, ranking."""
+    from . import filequery
+    doc = filequery.__doc__ or ""
+
+    def para(start: str) -> str:
+        i = doc.find(start)
+        if i < 0:
+            return ""
+        j = doc.find("\n\n", i)
+        return (doc[i:] if j < 0 else doc[i:j]).rstrip()
+
+    return [ch for ch in (para("    invoice acme"), para("Smart case:"), para("Ranking:")) if ch]
+
+
+def _files_query_rules() -> str:
+    return "\n\n".join(_files_rule_chunks() or ["See mse/filequery.py for the query rules."]) + "\n\n" + FILES_EXCLUDE_ROOTS
+
+
 def cmd_files(a):
     """File-name search over the whole Mac (instant, names only), its status, or a re-crawl.
-    mse files "<query>" [--scope mac|indexed] [-c folders] [--json]   mse files status   mse files crawl [--force]
+    mse files "<query>" [--scope mac|indexed] [-c folders] [--offset N] [--json]   mse files status   mse files crawl [--force]
     mse files exclude add|rm|list <folder>...   mse files roots add|rm|list <folder>...
     Piped output masks personal identifiers like every agent-facing output. In a session locked with MSE_LOCK only
     --scope indexed in the locked folder works. `mse files search exclude add` searches for those words."""
@@ -931,7 +1073,10 @@ def cmd_files(a):
         return
     query = " ".join(words).strip()
     if not query:
-        sys.exit("usage: mse files \"<query>\" [--scope mac|indexed] [-c folders] [--json] | status | crawl [--force]")
+        sys.exit("usage: mse files \"<query>\" [--scope mac|indexed] [-c folders] [--offset N] [--json] | status | crawl [--force]")
+    offset = getattr(a, "offset", None)                 # None: not given (a namespace built by a caller may leave it out)
+    if offset is not None and offset < 0:
+        sys.exit("--offset must not be negative")
     scope, names = a.scope, config.scope_tokens(a.collection)
     if lock is not None:
         if scope == "mac":
@@ -943,7 +1088,9 @@ def cmd_files(a):
         except PermissionError as e:
             sys.exit(str(e))
         scope, names = "indexed", [lock.name]
-    params = {"q": query, "scope": scope, "limit": a.limit}
+    params = {"q": query, "scope": scope, "limit": a.limit}     # the daemon answers in the paged shape: it gets limit
+    if offset is not None:
+        params["offset"] = offset
     if names:
         params["c"] = ",".join(names)
     try:
@@ -951,7 +1098,10 @@ def cmd_files(a):
             res = client()._call("GET", "/api/files/search", params)
         else:
             from . import server
-            res = server.files_search(query, scope, names, a.limit)
+            if offset is None:
+                res = server.files_search(query, scope, names, a.limit)
+            else:       # paged, so has_more and next_offset come back; without --offset the call stays as it was
+                res = server.files_search(query, scope, names, a.limit, offset, paged=True)
     except (ValueError, RuntimeError) as e:
         sys.exit(f"error: {e}")
     if a.json:
@@ -969,6 +1119,10 @@ def cmd_files(a):
         when = time.strftime("%Y-%m-%d", time.localtime(it["mtime"])) if it.get("mtime") else ""
         mark = c("1;34", it["path"] + "/") if it["is_dir"] else c("1", it["path"])
         print(agent_safe(f"{mark}  {c('2', ' · '.join(x for x in (it['kind'], size, when, it.get('collection') or '') if x))}"))
+    if res.get("has_more"):
+        import shlex
+        same = [f"-n {a.limit}"] + ([f"--scope {scope}"] if scope != "mac" else []) + ([f"-c {a.collection}"] if a.collection else [])
+        print(agent_safe(c("2", f"more: mse files {shlex.quote(query)} {' '.join(same)} --offset {res['next_offset']}")))
 
 
 def _scope(spec) -> list[str] | None:
@@ -1116,6 +1270,179 @@ def cmd_agents(a):
         _print_files(agents_setup.install(t) if a.action == "install" else agents_setup.remove(t), root)
 
 
+def _doc_collections(spec) -> list[str]:
+    """-c for `mse docs`: collections, groups, aliases and 'all' -> collection names (none = All)."""
+    return config.resolve_scope(config.load(), _scope(spec))["collections"]
+
+
+def _amounts(d: dict) -> str:
+    return "  ".join(f"{v:,.2f} {c}" for c, v in d.items())
+
+
+def cmd_docs(a):
+    """`mse docs facets|timeline|meta|reindex`: what the documents are (type, date, amount, counterparty), read from the
+    index. facets / timeline / meta read the databases directly; reindex goes through the daemon when it is running."""
+    from . import docmeta, search, store
+    if a.daction == "facets":
+        res = docmeta.facets(_doc_collections(a.collection), a.type)
+        if a.json:
+            print(agent_safe(json.dumps(res, ensure_ascii=False, indent=2)))
+            return
+        print(c("2", f"{res['classified']:,} of {res['files']:,} files classified · {res['undated']:,} without a document date"))
+        print(c("1", "types"))
+        for r in res["doctypes"]:
+            print(f"  {r['doctype']:15s} {r['count']:>6,}")
+        print(c("1", "most frequent counterparties"))
+        for r in res["counterparties"][:10]:
+            print(f"  {agent_safe(r['name']):40s} {r['count']:>6,}")
+        print(c("1", "per month"))
+        for r in res["months"][-12:]:
+            print(f"  {r['month']}  {r['count']:>6,}")
+        return
+    if a.daction == "timeline":
+        res = docmeta.timeline(_doc_collections(a.collection), a.type, a.from_, a.to)
+        if a.json:
+            print(agent_safe(json.dumps(res, ensure_ascii=False, indent=2)))
+            return
+        what = ", ".join(res["types"]) or "all documents"
+        print(c("2", f"{what} · {res['from'] or '-'} to {res['to'] or '-'} · {res['total']:,} dated, {res['undated']:,} undated"))
+        for b in res["buckets"]:
+            mark = c("33", "  none") if b["count"] == 0 else f"  {b['count']:>4,}  {_amounts(b['amounts'])}"
+            print(f"  {b['month']}{mark}")
+        if res["gaps"]:
+            print(c("1", f"months without: {', '.join(res['gaps'])}"))
+        return
+    if a.daction == "meta":
+        found = search.find_file(a.collection, a.ref)
+        if not found:
+            sys.exit(f"error: no file {a.ref}")
+        coll, f = found
+        conn = store.connect(coll["name"], readonly=True)
+        try:
+            row = docmeta.get(conn, f["id"])
+        finally:
+            conn.close()
+        out = {"docid": f["docid"], "path": f["path"], "collection": coll["name"],
+               "classified": bool(row and row.get("doctype")), "meta": row}
+        print(agent_safe(json.dumps(out, ensure_ascii=False, indent=2)))
+        return
+    # reindex
+    coll = config.get_collection(config.load(), a.collection)
+    if not coll:
+        sys.exit(f"error: no collection named {a.collection}")
+    name = coll["name"]
+    if daemon_up():
+        info = client()._call("POST", "/api/docs/reindex", body={"collection": name})
+        print(f"redoing the document facts of {name} in the daemon (batches of 200; the index stays usable)")
+        while info.get("state") == "running":
+            time.sleep(2)
+            info = client()._call("GET", "/api/docs/reindex", {"collection": name})
+            print(f"\r  {info.get('done', 0):,}/{info.get('total', 0):,}   ", end="", flush=True)
+        print()
+    else:
+        info = docmeta.reindex(name, progress=lambda d, t: print(f"\r  {d:,}/{t:,}   ", end="", flush=True))
+        print()
+    if info.get("state") == "error":
+        sys.exit(f"error: {info.get('error')}")
+    print(f"{info.get('state')}: {info.get('done', 0):,} of {info.get('total', 0):,} files")
+
+
+def _saved(ref: str) -> dict:
+    """A saved search by id or by exact (case-insensitive) name."""
+    items = config.saved_searches()
+    hit = next((s for s in items if s["id"] == ref), None) or next((s for s in items if s["name"].lower() == ref.lower()), None)
+    if not hit:
+        sys.exit(f"error: no saved search '{ref}' (see `mse saved list`)")
+    return hit
+
+
+def cmd_saved(a):
+    """`mse saved list|add|rm|run`: queries kept by name. rm removes the definition only, never a file."""
+    if a.saction == "add":
+        s = config.add_saved(a.name, a.query, a.collection)
+        print(f"saved {s['id']}: {s['name']} = {s['query']}" + (f"  [{s['collection']}]" if s["collection"] else ""))
+        print(c("2", f"run it: mse saved run {s['id']}"))
+        return
+    if a.saction == "rm":
+        s = _saved(a.ref)
+        config.remove_saved(s["id"])
+        print(f"removed the saved search '{s['name']}' (no file or index was touched)")
+        return
+    if a.saction == "run":
+        s = _saved(a.ref)
+        ns = argparse.Namespace(query=s["query"], collection=s["collection"], limit=a.limit, mode="hybrid", type=None, after=None,
+                                before=None, path=None, include=None, exclude=None, fast=a.fast, json=a.json, files=a.files)
+        return cmd_search(ns)
+    items = config.saved_searches()
+    if a.json:
+        print(agent_safe(json.dumps(items, ensure_ascii=False, indent=2)))
+        return
+    if not items:
+        print('no saved searches yet: `mse saved add "Big invoices" "type:invoice amount:>500"`')
+        return
+    for s in items:
+        print(f"{c('1;36', s['id'])}  {s['name']}  {c('2', s['query'])}" + (c("2", f"  [{s['collection']}]") if s["collection"] else ""))
+
+
+def cmd_disk(a):
+    """The whole-disk content index (mse/wholedisk.py): files found by what is IN them, e.g. "image of a zebra".
+    mse disk status [--json] | mse disk search "<query>" [--kind image|pdf|doc|video|audio|code|other] [-n N] [--offset N] [--json]
+    | mse disk rescan. Piped output masks personal identifiers like every agent-facing output. Not available in a session
+    locked with MSE_LOCK (an agent session limited to one folder)."""
+    import shlex
+    from . import wholedisk
+    lock = _files_locked()
+    if lock is not None:
+        sys.exit(f"whole-disk search is not available in a session locked to '{lock.name}' (MSE_LOCK)")
+    up = daemon_up()
+    if a.action == "status":
+        st = client()._call("GET", "/api/disk/status") if up else wholedisk.manager().status()
+        if a.json:
+            print(json.dumps(st, ensure_ascii=False, indent=2))
+            return
+        print(f"whole-disk index: {st['state']}" + (f" ({st['paused_reason']})" if st.get("paused_reason") else "")
+              + f" · {st['files_seen']:,} entries · {st['files_described']:,} described · {st['pending']:,} waiting")
+        print(f"  {st['images_labelled']:,} pictures labelled · {st['pdfs_described']:,} PDFs read · roots {', '.join(st['roots'])}"
+              + (f" · {st['rate_per_s']} per s" if st.get("rate_per_s") else "")
+              + (f" · about {st['eta_s'] // 60} min left" if st.get("eta_s") else ""))
+        if st.get("last_error"):
+            print(c("33", f"  last error: {agent_safe(str(st['last_error']))}"))
+        return
+    if a.action == "rescan":
+        if not up:
+            sys.exit("the service is not running: start it, then run mse disk rescan")
+        print(json.dumps(client()._call("POST", "/api/disk/rescan"), ensure_ascii=False))
+        return
+    query = " ".join(a.words).strip()
+    if not query:
+        sys.exit('usage: mse disk search "<query>" [--kind image|pdf|doc|video|audio|code|other] [-n N] [--offset N] [--json]')
+    params = {"q": query, "limit": a.limit, "offset": a.offset or 0}
+    if a.kind:
+        params["kind"] = a.kind
+    try:
+        if up:
+            res = client()._call("GET", "/api/disk/search", params)
+        else:
+            res = wholedisk.manager().search(query, a.kind, a.limit, a.offset or 0)
+    except (ValueError, RuntimeError) as e:
+        sys.exit(f"error: {e}")
+    if a.json:
+        print(agent_safe(json.dumps(res, ensure_ascii=False, indent=2)))
+        return
+    understood = " ".join("/".join(g) for g in res["query"]["words"]) or "no content words"
+    kinds = ",".join(res["query"]["kinds"])
+    print(c("2", f"{len(res['results'])} results · {res['took_ms']} ms · {understood}" + (f" · kind {kinds}" if kinds else "")))
+    for it in res["results"]:
+        when = time.strftime("%Y-%m-%d", time.localtime(it["mtime"])) if it.get("mtime") else ""
+        size = human_size(it["size"]) if it.get("size") else ""
+        meta = " · ".join(x for x in (it["kind"], size, when, ", ".join(it.get("labels") or [])[:80], it["why"]) if x)
+        print(agent_safe(f"{c('1', it['path'])}  {c('2', meta)}"))
+        if it.get("snippet"):
+            print(agent_safe("    " + c("2", it["snippet"][:200])))
+    if res.get("has_more"):
+        print(agent_safe(c("2", f"more: mse disk search {shlex.quote(query)} -n {a.limit} --offset {res['next_offset']}")))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="mse", description="MySearch — local multimodal search over your folders")
     ap.add_argument("--version", action="version", version=__version__)
@@ -1141,20 +1468,30 @@ def main(argv=None):
 
     s = sub.add_parser("files", help="find files by NAME anywhere on the Mac, instantly: mse files \"<query>\" | status | crawl | "
                                      "exclude add|rm|list <folder> | roots add|rm|list <folder>",
-                       epilog="Query: words (typos forgiven), 'exact, ^prefix, suffix$, !exclude, ext:pdf, type:image, "
-                              "size:>5mb, mtime:<7d, path:, re:, limit:, in:~/Folder. See mse/filequery.py. "
-                              "exclude: folders the name search skips (a full path, ~/Folder, or a name such as node_modules); "
-                              "the built-in privacy rules cannot be changed. roots: where the search looks.")
+                       epilog=_files_query_rules(), formatter_class=argparse.RawDescriptionHelpFormatter)
     s.add_argument("words", nargs="*", help="the query, or: status | crawl | search <query> | exclude|roots add|rm|list <folder>...")
     s.add_argument("--all", action="store_true", help="exclude list: also show the built-in rules")
     s.add_argument("--scope", choices=["mac", "indexed"], default="mac",
                    help="mac: every file under the configured roots (default); indexed: only your indexed folders")
     s.add_argument("-c", "--collection", help="with --scope indexed: folders, groups or aliases, comma separated")
-    s.add_argument("-n", "--limit", type=int, default=20)
+    s.add_argument("-n", "--limit", type=int, default=20, help="results per page (default 20)")
+    s.add_argument("--offset", type=int, default=None,
+                   help="skip the first N results: the next page. A page with more results ends with the command for it")
     s.add_argument("--force", action="store_true", help="crawl: start over instead of resuming")
     s.add_argument("--json", action="store_true")
     s.add_argument("--paths", action="store_true", help="print only paths")
     s.set_defaults(fn=cmd_files)
+
+    s = sub.add_parser("disk", help="files by what is IN them, across the Mac: mse disk search \"image of a zebra\" | "
+                                    "status | rescan")
+    s.add_argument("action", nargs="?", default="status", choices=["status", "search", "rescan"])
+    s.add_argument("words", nargs="*", help="the query for search, e.g. \"Rechnung Telekom\" or \"photo of a beach\"")
+    s.add_argument("--kind", choices=["image", "pdf", "doc", "video", "audio", "code", "other"],
+                   help="only this kind of file (image, pdf, doc, video, audio, code, other)")
+    s.add_argument("-n", "--limit", type=int, default=20, help="results per page (default 20)")
+    s.add_argument("--offset", type=int, default=None, help="skip the first N results: the next page")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_disk)
 
     s = sub.add_parser("ask", help="a short answer with citations from your documents (Ask must be switched on)")
     s.add_argument("question")
@@ -1332,10 +1669,25 @@ def main(argv=None):
 
     s = sub.add_parser("sync", help="index now (default: everything incl. OCR, media, embeddings)")
     s.add_argument("collection", nargs="?", help="a collection, a group, a comma list or 'all' (default: all)")
-    s.add_argument("--path", help="one file")
+    s.add_argument("--path", help="one file (with --reocr / --retranscribe: a folder inside the collection)")
     s.add_argument("--kind", choices=["scan", "sync", "embed", "vocab", "learn"], default="sync")
     s.add_argument("--wait", action="store_true")
+    s.add_argument("--reocr", action="store_true",
+                   help="redo OCR on the PDFs and images that already have it (marks only; the night run does the work)")
+    s.add_argument("--retranscribe", action="store_true",
+                   help="redo transcripts of the audio and video that already have them (marks only)")
+    s.add_argument("--types", help="pdf,image,audio,video: narrow what --reocr / --retranscribe redo")
+    s.add_argument("--now", action="store_true",
+                   help="with --reocr / --retranscribe: queue a sync now instead of waiting for the night run")
     s.set_defaults(fn=cmd_sync)
+
+    s = sub.add_parser("forget-missing", help="remove from the index the files that are gone from disk (held by the "
+                       "mass-vanish guard): mse forget-missing <collection> [--path <folder>] [--dry-run] [--yes]")
+    s.add_argument("collection", help="the collection to clean")
+    s.add_argument("--path", help="only under this folder (absolute, or relative to the current folder; it may be gone)")
+    s.add_argument("--dry-run", action="store_true", help="list what would be removed; remove nothing")
+    s.add_argument("--yes", action="store_true", help="remove without asking (the list is still printed first)")
+    s.set_defaults(fn=cmd_forget_missing)
 
     sub.add_parser("status", help="daemon, workers, jobs").set_defaults(fn=cmd_status)
     sub.add_parser("doctor", help="check the installation").set_defaults(fn=cmd_doctor)
@@ -1346,6 +1698,7 @@ def main(argv=None):
     t.add_argument("--minimal", action="store_true", help="text search (default)")
     t.add_argument("--full", action="store_true", help="also speech to text and the local Ask model")
     g.add_argument("--dry-run", action="store_true", help="print the plan; download and change nothing")
+    g.add_argument("--events", action="store_true", help=argparse.SUPPRESS)
     g = ss.add_parser("check", help="which models are installed, the app, the service, free disk (read-only)")
     g.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_setup)
@@ -1406,6 +1759,50 @@ def main(argv=None):
                    help="user-level configs: Claude Desktop, ~/.cursor, ~/.grok, ~/.codex, Antigravity")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_agents)
+
+    s = sub.add_parser("docs", help="what documents are: facets | timeline | meta | reindex (type, date, amount, counterparty)")
+    ds = s.add_subparsers(dest="daction", required=True)
+    g = ds.add_parser("facets", help="counts per document type, top counterparties, documents per month")
+    g.add_argument("-c", "--collection", help="collections, groups, aliases, or 'all' (default)")
+    g.add_argument("--type", help="only these document types, comma separated (invoice,receipt)")
+    g.add_argument("--json", action="store_true")
+    g.set_defaults(fn=cmd_docs)
+    g = ds.add_parser("timeline", help="documents per month with amount sums, and the months with none")
+    g.add_argument("-c", "--collection", help="collections, groups, aliases, or 'all' (default)")
+    g.add_argument("--type", help="document types, comma separated: mse docs timeline --type receipt")
+    g.add_argument("--from", dest="from_", help="first month: 2025 or 2025-03 (default: the first month with a document)")
+    g.add_argument("--to", help="last month: 2025 or 2025-12 (default: the last month with a document)")
+    g.add_argument("--json", action="store_true")
+    g.set_defaults(fn=cmd_docs)
+    g = ds.add_parser("meta", help="the stored facts of one document (#docid or path)")
+    g.add_argument("ref")
+    g.add_argument("-c", "--collection")
+    g.set_defaults(fn=cmd_docs)
+    g = ds.add_parser("reindex", help="redo the document facts of a collection (after an update of the rules, or to start over)")
+    g.add_argument("collection")
+    g.set_defaults(fn=cmd_docs)
+
+    s = sub.add_parser("saved", help="saved searches: list | add NAME QUERY | rm ID | run ID")
+    ss_ = s.add_subparsers(dest="saction", required=True)
+    g = ss_.add_parser("list", help="every saved search")
+    g.add_argument("--json", action="store_true")
+    g.set_defaults(fn=cmd_saved)
+    g = ss_.add_parser("add", help='keep a query by name: mse saved add "Big invoices" "type:invoice amount:>500" -c work')
+    g.add_argument("name")
+    g.add_argument("query")
+    g.add_argument("-c", "--collection", help="the folder, group or alias it searches (default: All)")
+    g.set_defaults(fn=cmd_saved)
+    g = ss_.add_parser("rm", help="remove a saved search (the definition only; no file is touched)")
+    g.add_argument("ref", help="its id or name")
+    g.set_defaults(fn=cmd_saved)
+    g = ss_.add_parser("run", help="run a saved search")
+    g.add_argument("ref", help="its id or name")
+    g.add_argument("-n", "--limit", type=int, default=10)
+    g.add_argument("--fast", action="store_true")
+    g.add_argument("--json", action="store_true")
+    g.add_argument("--files", action="store_true", help="print only absolute paths")
+    g.set_defaults(fn=cmd_saved)
+    s.set_defaults(fn=cmd_saved, saction="list", json=False)
 
     a = ap.parse_args(argv)
     try:

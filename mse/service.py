@@ -18,11 +18,35 @@ def _domain() -> str:
     return f"gui/{os.getuid()}"
 
 
+def own_app_executable() -> Path | None:
+    """The MySearch.app this code runs from, when it runs from the app's bundled runtime (the DMG install, no clone), or the
+    executable the app itself names in MSE_APP_EXECUTABLE. None for a clone with a venv."""
+    env = os.environ.get("MSE_APP_EXECUTABLE")
+    if env and Path(env).is_file():
+        return Path(env)
+    from .setup_models import app_bundle
+    bundle = app_bundle()
+    exe = bundle / "Contents" / "MacOS" / "MySearch" if bundle else None
+    return exe if exe and exe.is_file() else None
+
+
+def unstable_location(path: str | Path) -> str | None:
+    """Why a LaunchAgent must not point at this app: a mounted disk image goes away on eject, and a quarantined app is
+    run from a randomised read-only copy. None when the location is fine."""
+    p = str(path)
+    if p.startswith("/Volumes/"):
+        return "MySearch.app is running from a disk image or an external volume. Drag it to Applications first."
+    if "/AppTranslocation/" in p:
+        return "macOS is running MySearch.app from a temporary read-only copy. Move it to Applications, then open it again."
+    return None
+
+
 def plist(app_executable: str | Path | None = None) -> dict:
     """With MySearch.app installed, launchd starts the app's own executable in --daemon mode, which spawns the Python
     service as its child: macOS then attributes the service (and the helper's crawl) to MySearch.app, so one Full Disk
-    Access grant on the app covers them. Without the app, launchd runs the venv's Python directly (the old setup)."""
-    app = Path(app_executable) if app_executable else APP_EXECUTABLE
+    Access grant on the app covers them. Without the app, launchd runs the venv's Python directly (the old setup).
+    Run from the app's bundled runtime, the app that holds it is the one launchd starts, wherever it is installed."""
+    app = Path(app_executable) if app_executable else own_app_executable() or APP_EXECUTABLE
     python = str(paths.PROJECT / ".venv" / "bin" / "python")
     args = [str(app), "--daemon"] if app.exists() else [python, "-m", "mse", "serve"]
     return {
@@ -37,6 +61,11 @@ def plist(app_executable: str | Path | None = None) -> dict:
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": 15,
+        # A search is something the user is waiting for (Quick Search, the file-name list while typing); the default process
+        # type lets macOS schedule the service like a background job. Background work keeps its own low priority (the
+        # embedding worker and the fine-tune run under `nice -n 10`, the helper's crawl and OCR renice themselves).
+        # Takes effect when the agent is re-installed (`mse service install`); a running agent keeps its old plist.
+        "ProcessType": "Interactive",
         # launchd sends SIGKILL this long after SIGTERM. The supervisor waits up to 30 s for the service to stop (Daemon.swift),
         # so launchd must wait longer, or the supervisor dies first and the service is left running with the port.
         "ExitTimeOut": 45,
@@ -46,6 +75,9 @@ def plist(app_executable: str | Path | None = None) -> dict:
 
 
 def install(app_executable: str | Path | None = None) -> str:
+    where = unstable_location(app_executable or own_app_executable() or "")
+    if where:
+        raise RuntimeError(where)
     paths.ensure_dirs()
     PLIST.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(["launchctl", "bootout", f"{_domain()}/{LABEL}"], capture_output=True)

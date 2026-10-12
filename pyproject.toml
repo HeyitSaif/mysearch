@@ -1,6 +1,6 @@
 [project]
 name = "mysearch"
-version = "0.1.2"
+version = "0.1.3"
 license = "MIT"
 description = "Local multimodal search engine for your folders (EmbeddingGemma 2 on MLX, SQLite FTS5 + sqlite-vec)"
 requires-python = ">=3.12,<3.14"

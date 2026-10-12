@@ -173,7 +173,10 @@ struct SWAgentsView: View {
                 snippet("Claude Desktop, Cursor (JSON, inside mcpServers)", "\"mysearch\": { \"command\": \"\(bin)\", \"args\": [\"mcp\"] }")
                 snippet("Codex (~/.codex/config.toml)", "[mcp_servers.mysearch]\ncommand = \"\(bin)\"\nargs = [\"mcp\"]")
                 snippet("Shell-only agents", "mse search --json \"…\"\nmse get '#docid'")
-                Text("The HTTP route uses your access token. It is kept out of this window on purpose; Classic Settings can show it.").font(.caption).foregroundStyle(.secondary)
+                Text(m.classicOn
+                     ? "The HTTP route uses your access token. It is kept out of this window on purpose; Classic Settings can show it."
+                     : "The HTTP route uses your access token. It is kept out of this window on purpose.")
+                    .font(.caption).foregroundStyle(.secondary)
             }.padding(14)
         }.id("agents.snippets")
     }
@@ -207,7 +210,7 @@ struct SWPrivacyView: View {
                     SWNote(tone: .warn, text: "Masking is off: agents receive IBANs, passport and tax numbers as they are.",
                            actions: [SWAction(title: "Turn Masking On") { m.patch("agents", ["redact": true], err: "agents.redact") }])
                 }
-                Text("Masked: IBANs (kept as DE•••• 1234), passport, ID-card and residence-permit numbers, personal tax IDs, social-security numbers, UAE national ID and CNIC numbers, passport machine-readable lines and dates of birth. Company identifiers such as the commercial register number, company tax number and VAT ID stay readable.")
+                Text("Masked: IBANs (the country code and last four characters stay readable), passport, ID-card, residence-permit and other national ID numbers, tax IDs, social-security numbers, passport machine-readable lines and dates of birth. Company identifiers such as the commercial register number, company tax number and VAT ID stay readable.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 HStack { Text("Masking for cloud answers is set under Ask.").font(.caption).foregroundStyle(.secondary); Button("Go to Ask") { m.setSection(.ask) }.controlSize(.small) }
             } header: { Text("Agents") }
@@ -241,6 +244,17 @@ struct SWMacAppView: View {
     @EnvironmentObject var m: SWModel
     @State private var login = SMAppService.mainApp.status
     @State private var problem: String?
+    @State private var quick = HotKey.load()
+
+    /// Saves a shortcut the Quick Search row recorded (nil: the default) through AppDelegate, which registers it at once.
+    /// Returns the reason it is not used, or nil when it is saved.
+    private func changeQuickKey(_ key: HotKey?) -> String? {
+        guard let app = NSApp.delegate as? AppDelegate else { return "MySearch is not ready. Try again." }
+        if let refusal = app.applyQuickKey(key) { return refusal }
+        quick = key ?? .quickDefault
+        m.flashSaved()
+        return nil
+    }
 
     var body: some View {
         SWFormPage {
@@ -255,18 +269,17 @@ struct SWMacAppView: View {
                 if let problem { SWNote(tone: .bad, text: problem) }
             } header: { Text("Startup") }
             Section {
-                SWRow(id: "app.quick", title: "Quick Search shortcut", detail: "Opens the small search panel over any app, even full-screen ones. The default, ⌥Space, avoids ⌘Space, ⌃Space and ⌃⌥Space.") {
-                    HStack { Text(HotKey.load().label).font(.system(size: 14, design: .rounded).weight(.semibold)).padding(.horizontal, 10).padding(.vertical, 3)
-                        .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .quaternaryLabelColor).opacity(0.4)))
-                        Button("Change…") { m.openClassic?("app") }.controlSize(.small) }
+                SWRow(id: "app.quick", title: "Quick Search shortcut", detail: "Opens the small search panel over any app, even full-screen ones. Change…, then press the new keys. The default, ⌥Space, avoids ⌘Space, ⌃Space and ⌃⌥Space.") {
+                    ShortcutRecorder(current: quick) { key in changeQuickKey(key) }
                 }
                 SWRow(id: "app.main", title: "Main window shortcut", detail: "Shows or hides the main window.") {
                     Text(HotKey.main.label).font(.system(size: 14, design: .rounded).weight(.semibold)).padding(.horizontal, 10).padding(.vertical, 3)
                         .background(RoundedRectangle(cornerRadius: 6).fill(Color(nsColor: .quaternaryLabelColor).opacity(0.4)))
                 }
-                Text("Recording a new shortcut is still done in Classic Settings (Mac app).").font(.caption).foregroundStyle(.secondary)
             } header: { Text("Shortcuts") }
             SWLaunchersSection()
+            SWUpdatesSection()          // SettingsUpdates.swift
+            SWSetupSection()
         }
         .onAppear { login = SMAppService.mainApp.status }
     }
@@ -332,7 +345,35 @@ struct SWAboutView: View {
                 pathFact("Logs", "~/Library/Logs/MySearch")
                 pathFact("mse command", m.mseBin.isEmpty ? "unknown" : m.mseBin)
             } header: { Text("Where things are") }.id("about.paths")
+            Section {
+                LabeledContent("Notices and licence texts") {
+                    Button("Licences…") { openLicences() }
+                }
+                Text(Self.licencesFolderExists
+                     ? "THIRD_PARTY_NOTICES.md names the code MySearch is built from and bundles, including the GPL code (FFmpeg and others) in the self-contained build, and says where its source is. The Licenses folder holds the GPL and LGPL texts."
+                     : "THIRD_PARTY_NOTICES.md names the code MySearch is built from and the licence of each part.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } header: { Text("Licences") }.id("about.licences")
         }
+    }
+
+    /// A build with the bundled runtime has Contents/Resources/Licenses (scripts/bundle_runtime.sh); a plain build does not.
+    private static let licencesFolderExists: Bool = {
+        guard let res = Bundle.main.resourceURL else { return false }
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: res.appendingPathComponent("Licenses").path, isDirectory: &isDir) && isDir.boolValue
+    }()
+
+    /// Opens THIRD_PARTY_NOTICES.md with the system's default app for it and, when the build has one, shows the Licenses folder
+    /// in Finder. Not the app's own Markdown window: its Save would write into the signed app bundle.
+    private func openLicences() {
+        guard let res = Bundle.main.resourceURL else { m.say("This build has no Resources folder."); return }
+        let notices = res.appendingPathComponent("THIRD_PARTY_NOTICES.md")
+        let folder = res.appendingPathComponent("Licenses", isDirectory: true)
+        let haveNotices = FileManager.default.fileExists(atPath: notices.path)
+        if haveNotices { NSWorkspace.shared.open(notices) }
+        if Self.licencesFolderExists { NSWorkspace.shared.activateFileViewerSelecting([folder]) }
+        else if !haveNotices { m.say("The licence files are not in this build.") }
     }
 
     private func fact(_ k: String, _ v: String) -> some View {
