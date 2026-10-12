@@ -15,11 +15,13 @@ from unittest import mock
 os.environ.setdefault("MSE_HOME", tempfile.mkdtemp(prefix="mse-test-"))
 
 from mse import config, indexer, macindex, tree, watcher  # noqa: E402
+from tests import tmpdirs  # noqa: E402
 
 
 def _home() -> Path:
     """A fake home folder with a deck, a private key, a big .key, a deck the secret rules exclude, and a note."""
-    home = Path(tempfile.mkdtemp(prefix="mse-kn-home-"))
+    # a fake home must be somewhere the rules would index (the default macOS $TMPDIR is not; tests/tmpdirs.py)
+    home = Path(tmpdirs.mkdtemp(prefix="mse-kn-home-", indexable=True))
     work = home / "Work"
     work.mkdir()
     (work / "Talk.key").mkdir()

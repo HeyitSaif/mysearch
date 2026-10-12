@@ -24,13 +24,15 @@ from unittest import mock
 os.environ.setdefault("MSE_HOME", tempfile.mkdtemp(prefix="mse-test-"))
 
 from mse import ask, cli, config, filequery as fq, macindex as mi, mcp, search  # noqa: E402
+from tests import tmpdirs  # noqa: E402
 
-# The system temp folder (/private/var/folders) is private to the rules on purpose; test trees live under /tmp.
-TMP = os.path.realpath(os.environ.get("TMPDIR") or "/tmp")
+# The system temp folder (/private/var/folders) is private to the rules on purpose, so test trees live under $TMPDIR
+# only when the rules allow it and under /tmp otherwise (tests/tmpdirs.py). Always the real path.
+TMP = tmpdirs.indexable_tmp()
 
 
 def mkdtemp(prefix="mse-mi-"):
-    return tempfile.mkdtemp(prefix=prefix, dir=TMP)
+    return tmpdirs.mkdtemp(prefix=prefix, indexable=True)
 
 
 HOME = "/Users/alex"

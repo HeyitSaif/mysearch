@@ -9,7 +9,8 @@
 #       (HeyitSaif/mysearch) — the private development repository skips this, its audit runs in scripts/export_public.sh;
 #   (d) for a version tag (refs/tags/v*): scripts/build_dmg.sh --adhoc into a new mktemp folder, then the DMG path and its
 #       sha256 are printed so the maintainer uploads it by hand (gh release create ... <dmg>), see docs/RELEASING.md.
-# MSE_SKIP_HOOKS=1 bypasses every step (printed). The hook only creates folders under mktemp; it never deletes anything.
+# MSE_SKIP_HOOKS=1 bypasses every step (printed). The hook only creates folders under mktemp (the test sandbox under
+# /tmp, see (a)); it never deletes anything.
 set -u
 
 remote_name="${1:-}"
@@ -62,8 +63,13 @@ else
   fail "no .venv/bin/python and no uv; run scripts/setup.sh first"
 fi
 
-# (a) Tests, headless, in a sandbox that is new for this run.
-sandbox="$(mktemp -d "${TMPDIR:-/tmp}/mse-prepush-XXXXXX")" || fail "mktemp failed"
+# (a) Tests, headless, in a sandbox that is new for this run. It is made under /tmp, not under $TMPDIR, and used by its
+#     real path (/private/tmp/...): on macOS $TMPDIR is /var/folders/..., a symlink into /private/var, which the
+#     whole-Mac name search never indexes (mse/macindex.py HARD_ABS) — a home folder there cannot be a crawl root, and the
+#     tests compare paths the product has resolved. The tests cope with such a sandbox on their own as well
+#     (tests/__init__.py, tests/tmpdirs.py); the hook simply does not depend on that.
+sandbox="$(mktemp -d /tmp/mse-prepush-XXXXXX)" || fail "mktemp failed"
+sandbox="$(cd "$sandbox" && pwd -P)" || fail "could not resolve the sandbox path"
 mkdir -p "$sandbox/home" "$sandbox/tmp" "$sandbox/mse" || fail "could not create the sandbox under $sandbox"
 step "unit tests (sandbox: $sandbox)"
 if ! env HOME="$sandbox/home" TMPDIR="$sandbox/tmp" MSE_HOME="$sandbox/mse" \

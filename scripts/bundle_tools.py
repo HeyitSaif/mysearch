@@ -111,6 +111,12 @@ def rpaths(path: str) -> list[str]:
 
 def fix(root: str, site: str | None = None) -> list[str]:
     """Edit load commands in place. Returns one line per change. The caller signs the files again afterwards."""
+    # Both folders as real paths, once, at the boundary: a placeholder dependency is rewritten as @loader_path plus the
+    # relative path from the file to the target, and that path is only short when the file (walked under root) and the
+    # target (built under site) are measured in the same form. With root given through a symlink (macOS's $TMPDIR is
+    # /var/folders -> /private/var/folders) and site resolved, the relative path climbed to / and back and no longer
+    # fitted the load command's padding, so install_name_tool refused it.
+    root = os.path.realpath(root)
     site = os.path.realpath(site or root)
     changes = []
     for p in machos(root):

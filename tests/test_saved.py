@@ -20,6 +20,7 @@ from unittest import mock
 os.environ.setdefault("MSE_HOME", tempfile.mkdtemp(prefix="mse-test-"))
 
 from mse import cli, config, paths, search, server, store  # noqa: E402
+from tests import tmpdirs  # noqa: E402
 from tests.test_docmeta_index import M, add_doc  # noqa: E402
 
 
@@ -29,7 +30,9 @@ class _Base(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.folder = Path(tempfile.mkdtemp(prefix="mse-saved-"))
+        # the real path: `saved run --files` prints the paths the index stores, and those are resolved (macOS's
+        # $TMPDIR is a symlink into /private/var)
+        cls.folder = Path(tmpdirs.mkdtemp(prefix="mse-saved-"))
         cls.name = "sv" + uuid.uuid4().hex[:8]
         config.add_collection(str(cls.folder), cls.name)
         conn = store.connect(cls.name)

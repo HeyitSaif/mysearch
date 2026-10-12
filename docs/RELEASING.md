@@ -16,7 +16,7 @@ What the hook runs, and the same commands by hand:
 
 | Step | When | By hand |
 |---|---|---|
-| Unit tests, headless, in a fresh sandbox (no real data folder, Keychain item or service is touched) | every push | `s=$(mktemp -d); mkdir "$s/home" "$s/tmp" "$s/mse"; HOME="$s/home" TMPDIR="$s/tmp" MSE_HOME="$s/mse" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python -m unittest discover -s tests -t .` |
+| Unit tests, headless, in a fresh sandbox (no real data folder, Keychain item or service is touched) | every push | `s=$(mktemp -d /tmp/mse-tests-XXXXXX); mkdir "$s/home" "$s/tmp" "$s/mse"; HOME="$s/home" TMPDIR="$s/tmp" MSE_HOME="$s/mse" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 .venv/bin/python -m unittest discover -s tests -t .` — under `/tmp` on purpose: the default macOS `$TMPDIR` (`/var/folders`, really `/private/var/folders`) is a location the whole-Mac search never indexes, so a home folder there could not be a crawl root. A plain `mktemp -d` sandbox works too: `tests/__init__.py` moves such a HOME to a throw-away folder under `/tmp`, and the mac_index tests put their trees there (`tests/tmpdirs.py`). |
 | Golden snapshots of the app's views | `app/` or `tests/golden/` changed in the pushed commits | `scripts/snapshot_check.sh` (needs `swiftc`) |
 | Public-release audit, on a clean export of the pushed commit | the remote is the public repository `HeyitSaif/mysearch` | `python3 scripts/oss_audit.py <clean export>`; in the development repository the audit is part of `scripts/export_public.sh` |
 | Ad-hoc DMG build; the hook prints the image's path and sha256 | a `v*` tag is pushed | `scripts/build_dmg.sh --adhoc --out "$(mktemp -d)"` then `shasum -a 256 <dir>/MySearch.dmg` |

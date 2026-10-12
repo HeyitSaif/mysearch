@@ -555,7 +555,12 @@ class Excluder:
         return False
 
     def root_allowed(self, root: str) -> bool:
-        return not self.blocked(root.rstrip("/") or "/", soft=False)
+        # The given form and the real location are both checked, here, once, at the boundary every root passes
+        # (normalize_roots for a settings change, the crawl for the configured list). The hard rules name real folders
+        # (/private/var, /Volumes, ...) while a root can be typed through a symlink (/var is /private/var on macOS):
+        # without the second check a root written as /var/... slipped past a rule written for /private/var/....
+        r = root.rstrip("/") or "/"
+        return not (self.blocked(r, soft=False) or self.blocked(os.path.realpath(r), soft=False))
 
     def helper_args(self) -> list[str]:
         args = []

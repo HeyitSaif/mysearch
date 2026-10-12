@@ -28,6 +28,7 @@ from pathlib import Path
 os.environ.setdefault("MSE_HOME", tempfile.mkdtemp(prefix="mse-test-"))
 
 from mse import wholedisk as wd  # noqa: E402
+from tests import tmpdirs  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 FORBIDDEN_PORT = 8737                       # the owner's live service: never touched by a test
@@ -136,7 +137,9 @@ class RealService(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         assert FORBIDDEN_PORT != 0
-        cls.sandbox = Path(tempfile.mkdtemp(prefix="mse-contract-"))
+        # the child service gets this home as its default root, so it must lie where the rules would index
+        # (the default macOS $TMPDIR does not; tests/tmpdirs.py)
+        cls.sandbox = Path(tmpdirs.mkdtemp(prefix="mse-contract-", indexable=True))
         cls.home = cls.sandbox / "home"
         cls.mse_home = cls.sandbox / "msehome"
         cls.tmp = cls.sandbox / "tmp"
@@ -409,7 +412,7 @@ class Stop(unittest.TestCase):
     versions came from this path (server_close, the bounded freeze), so the whole-disk thread must not hold it up."""
 
     def test_sigterm_exits_zero_and_frees_the_port(self):
-        sandbox = Path(tempfile.mkdtemp(prefix="mse-contract-stop-"))
+        sandbox = Path(tmpdirs.mkdtemp(prefix="mse-contract-stop-", indexable=True))
         home, mse_home, tmp = sandbox / "home", sandbox / "msehome", sandbox / "tmp"
         for d in (home / "Documents", mse_home, tmp):
             d.mkdir(parents=True)

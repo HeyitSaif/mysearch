@@ -22,13 +22,16 @@ from unittest import mock
 os.environ.setdefault("MSE_HOME", tempfile.mkdtemp(prefix="mse-test-"))
 
 from mse import cli, config, ignore, macindex as mi  # noqa: E402
+from tests import tmpdirs  # noqa: E402
 
 H = "/Users/alex"
-TMP = os.path.realpath(os.environ.get("TMPDIR") or "/tmp")
+# Roots the tests add must be ones mac_index accepts: /private/var (the default macOS $TMPDIR) is never indexed, so the
+# trees go under /tmp when $TMPDIR is there (tests/tmpdirs.py). Always the real path.
+TMP = tmpdirs.indexable_tmp()
 
 
 def mkdtemp(prefix="mse-mx-"):
-    return tempfile.mkdtemp(prefix=prefix, dir=TMP)
+    return tmpdirs.mkdtemp(prefix=prefix, indexable=True)
 
 
 class Settings:
